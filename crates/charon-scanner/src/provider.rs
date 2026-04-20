@@ -1,49 +1,60 @@
 //! Per-chain RPC connection surface.
 //!
-//! For v0.1 we wrap a single chain's HTTP provider (one-shot reads such as
-//! `get_block_number` and multicall). The WebSocket provider for block
-//! subscriptions is added alongside the block listener in the next issue.
+//! Holds a WebSocket provider for a single chain. WebSocket is required for
+//! `subscribe_blocks` / `subscribe_logs` — the scanner's hot path depends on
+//! push events, not polling. One `ChainProvider` per configured chain;
+//! multi-chain support is a config-driven fan-out at the call site.
 
-use alloy::providers::{Provider, ProviderBuilder, RootProvider};
-use alloy::transports::BoxTransport;
+use alloy::providers::{Provider, ProviderBuilder, RootProvider, WsConnect};
+use alloy::pubsub::PubSubFrontend;
 use anyhow::{Context, Result};
 use charon_core::config::ChainConfig;
 use tracing::debug;
 
-/// Wraps the RPC connections for a single chain.
+/// WebSocket RPC wrapper for one chain.
 ///
-/// The struct is intentionally owned by name so logs and errors can refer
-/// to the chain by its config key (e.g. `"bnb"`).
+/// The `name` field matches the `[chain.<name>]` key from the config, so
+/// logs and errors can be attributed to the chain by its short name
+/// (e.g. `"bnb"`).
 pub struct ChainProvider {
-    /// Short name of the chain (matches the `[chain.<name>]` key in config).
+    /// Short name of the chain (matches the `[chain.<name>]` key).
     pub name: String,
-    /// HTTP provider — reliable for one-shot reads and multicall.
-    ///
-    /// `BoxTransport` erases the concrete transport type so we can swap
-    /// http / https / ws / wss behind one field via `on_builtin`.
-    http: RootProvider<BoxTransport>,
+    ws: RootProvider<PubSubFrontend>,
 }
 
 impl ChainProvider {
-    /// Connect to the chain's HTTP RPC.
+    /// Connect over WebSocket to the chain's RPC endpoint.
     ///
-    /// Accepts URL schemes `http(s)://` and `ws(s)://` — alloy's
-    /// `on_builtin` auto-selects the right transport.
+    /// Takes the chain's short name (for logging) and its [`ChainConfig`].
+    /// Fails with a contextualized error if the WS handshake does not
+    /// succeed — no panics, no silent fallbacks.
     pub async fn connect(name: impl Into<String>, config: &ChainConfig) -> Result<Self> {
         let name = name.into();
-        debug!(chain = %name, url = %config.http_url, "connecting http provider");
+        debug!(chain = %name, url = %config.ws_url, "connecting ws provider");
 
-        let http = ProviderBuilder::new()
-            .on_builtin(&config.http_url)
-            .await
-            .with_context(|| format!("chain '{name}': failed to connect to {}", config.http_url))?;
+        let ws = WsConnect::new(&config.ws_url);
+        let provider = ProviderBuilder::new().on_ws(ws).await.with_context(|| {
+            format!(
+                "chain '{name}': failed to connect over ws to {}",
+                config.ws_url
+            )
+        })?;
 
-        Ok(Self { name, http })
+        Ok(Self { name, ws: provider })
     }
 
-    /// Fetch the latest block number. Lightweight RPC health check.
+    /// Borrow the underlying pub-sub provider.
+    ///
+    /// Consumers (block listener, scanner, executor) use this to build
+    /// subscriptions and make one-shot reads without re-establishing a
+    /// connection.
+    pub fn provider(&self) -> &RootProvider<PubSubFrontend> {
+        &self.ws
+    }
+
+    /// Fetch the latest block number over WebSocket. Lightweight health check.
     pub async fn test_connection(&self) -> Result<u64> {
-        self.http
+        self.ws
             .get_block_number()
             .await
             .with_context(|| format!("chain '{}': get_block_number failed", self.name))
