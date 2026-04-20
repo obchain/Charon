@@ -1,0 +1,36 @@
+# Charon — v1 config (Venus on BNB Chain)
+#
+# Secrets (RPC URLs) are referenced via ${ENV_VAR} and substituted from
+# the environment at load time. See `.env.example` for the expected vars.
+
+[bot]
+# Drop opportunities below this USD profit threshold.
+min_profit_usd   = 5.0
+# Skip liquidations when gas price exceeds this (gwei).
+max_gas_gwei     = 10
+# Polling cadence for protocols without push events (ms).
+scan_interval_ms = 1000
+
+# ── Chains ────────────────────────────────────────────────────────────────
+[chain.bnb]
+chain_id  = 56
+ws_url    = "${BNB_WS_URL}"
+http_url  = "${BNB_HTTP_URL}"
+
+# ── Lending protocols ─────────────────────────────────────────────────────
+[protocol.venus]
+chain       = "bnb"
+# Venus Unitroller (main comptroller on BSC)
+comptroller = "0xfd36e2c2a6789db23113685031d7f16329158384"
+
+# ── Flash-loan sources ────────────────────────────────────────────────────
+[flashloan.aave_v3_bsc]
+chain = "bnb"
+# Aave V3 Pool on BSC (used for flashLoanSimple — 0.05% fee)
+pool  = "0x6807dc923806fe8fd134338eabca509979a7e0cb"
+
+# ── Deployed liquidator contracts ─────────────────────────────────────────
+[liquidator.bnb]
+chain            = "bnb"
+# Placeholder — replaced once CharonLiquidator.sol is deployed on BSC.
+contract_address = "0x0000000000000000000000000000000000000000"
