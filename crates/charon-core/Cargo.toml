@@ -1,0 +1,6 @@
+[package]
+name = "charon-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Shared types, traits, and config for Charon"

@@ -1,0 +1,10 @@
+[package]
+name = "charon-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Charon command-line entrypoint"
+
+[[bin]]
+name = "charon"
+path = "src/main.rs"
