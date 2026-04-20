@@ -8,3 +8,5 @@ description = "Shared types, traits, and config for Charon"
 [dependencies]
 alloy = { workspace = true }
 serde = { workspace = true }
+anyhow = { workspace = true }
+async-trait = { workspace = true }

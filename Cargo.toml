@@ -31,6 +31,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # Error handling
 anyhow = "1"
 
+# Async trait objects
+async-trait = "0.1"
+
 # CLI
 clap = { version = "4", features = ["derive"] }
 
