@@ -29,22 +29,14 @@ impl ChainProvider {
     ///
     /// Accepts URL schemes `http(s)://` and `ws(s)://` — alloy's
     /// `on_builtin` auto-selects the right transport.
-    pub async fn connect(
-        name: impl Into<String>,
-        config: &ChainConfig,
-    ) -> Result<Self> {
+    pub async fn connect(name: impl Into<String>, config: &ChainConfig) -> Result<Self> {
         let name = name.into();
         debug!(chain = %name, url = %config.http_url, "connecting http provider");
 
         let http = ProviderBuilder::new()
             .on_builtin(&config.http_url)
             .await
-            .with_context(|| {
-                format!(
-                    "chain '{name}': failed to connect to {}",
-                    config.http_url
-                )
-            })?;
+            .with_context(|| format!("chain '{name}': failed to connect to {}", config.http_url))?;
 
         Ok(Self { name, http })
     }
@@ -54,8 +46,6 @@ impl ChainProvider {
         self.http
             .get_block_number()
             .await
-            .with_context(|| {
-                format!("chain '{}': get_block_number failed", self.name)
-            })
+            .with_context(|| format!("chain '{}': get_block_number failed", self.name))
     }
 }

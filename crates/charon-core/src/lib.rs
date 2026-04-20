@@ -7,6 +7,5 @@ pub mod types;
 pub use config::Config;
 pub use traits::LendingProtocol;
 pub use types::{
-    FlashLoanSource, LiquidationOpportunity, LiquidationParams, Position,
-    ProtocolId, SwapRoute,
+    FlashLoanSource, LiquidationOpportunity, LiquidationParams, Position, ProtocolId, SwapRoute,
 };

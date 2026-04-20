@@ -26,24 +26,15 @@ pub trait LendingProtocol: Send + Sync {
     ///
     /// The scanner is responsible for maintaining the list of tracked
     /// borrowers; this method is a pure query over protocol state.
-    async fn fetch_positions(
-        &self,
-        borrowers: &[Address],
-    ) -> anyhow::Result<Vec<Position>>;
+    async fn fetch_positions(&self, borrowers: &[Address]) -> anyhow::Result<Vec<Position>>;
 
     /// Compute protocol-specific liquidation parameters for a position.
     ///
     /// Handles close-factor math (Aave's 50% cap, Compound's 100% absorb,
     /// etc.) and resolves any protocol-specific token addresses (e.g., Venus
     /// vToken addresses).
-    fn get_liquidation_params(
-        &self,
-        position: &Position,
-    ) -> anyhow::Result<LiquidationParams>;
+    fn get_liquidation_params(&self, position: &Position) -> anyhow::Result<LiquidationParams>;
 
     /// Encode the ABI calldata for `CharonLiquidator.executeLiquidation(...)`.
-    fn build_liquidation_calldata(
-        &self,
-        params: &LiquidationParams,
-    ) -> anyhow::Result<Vec<u8>>;
+    fn build_liquidation_calldata(&self, params: &LiquidationParams) -> anyhow::Result<Vec<u8>>;
 }

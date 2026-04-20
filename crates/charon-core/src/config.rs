@@ -99,8 +99,8 @@ fn substitute_env_vars(input: &str) -> anyhow::Result<String> {
             .find('}')
             .ok_or_else(|| anyhow!("unterminated `${{` in config"))?;
         let var_name = &after[..end];
-        let value = std::env::var(var_name)
-            .with_context(|| format!("env var `{var_name}` is not set"))?;
+        let value =
+            std::env::var(var_name).with_context(|| format!("env var `{var_name}` is not set"))?;
         output.push_str(&value);
         rest = &after[end + 1..];
     }

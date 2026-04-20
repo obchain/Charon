@@ -47,9 +47,7 @@ async fn main() -> Result<()> {
 
     // Structured logging. Override verbosity with RUST_LOG=debug etc.
     tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
-        )
+        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
         .init();
 
     let cli = Cli::parse();
@@ -74,9 +72,10 @@ async fn main() -> Result<()> {
             info!("listen: not wired up yet — scanner arrives across M1 issues");
         }
         Command::TestConnection { chain } => {
-            let chain_cfg = config.chain.get(&chain).with_context(|| {
-                format!("chain '{chain}' not found in config")
-            })?;
+            let chain_cfg = config
+                .chain
+                .get(&chain)
+                .with_context(|| format!("chain '{chain}' not found in config"))?;
             let provider = ChainProvider::connect(&chain, chain_cfg).await?;
             let block = provider.test_connection().await?;
             info!(chain = %chain, block = block, "connected — latest block");
