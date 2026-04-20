@@ -18,6 +18,7 @@ use alloy::primitives::{Address, U256};
 use alloy::providers::{Provider, RootProvider};
 use alloy::pubsub::PubSubFrontend;
 use alloy::sol;
+use alloy::sol_types::SolCall;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use charon_core::{LendingProtocol, LiquidationParams, Position, ProtocolId};
@@ -349,11 +350,106 @@ impl LendingProtocol for VenusAdapter {
         Ok(out)
     }
 
-    fn get_liquidation_params(&self, _position: &Position) -> Result<LiquidationParams> {
-        anyhow::bail!("Venus::get_liquidation_params lands in the next #8 commit")
+    fn get_liquidation_params(&self, position: &Position) -> Result<LiquidationParams> {
+        let collateral_vtoken = self
+            .underlying_to_vtoken
+            .get(&position.collateral_token)
+            .copied()
+            .with_context(|| {
+                format!(
+                    "Venus: no vToken mapped for collateral underlying {}",
+                    position.collateral_token
+                )
+            })?;
+        let debt_vtoken = self
+            .underlying_to_vtoken
+            .get(&position.debt_token)
+            .copied()
+            .with_context(|| {
+                format!(
+                    "Venus: no vToken mapped for debt underlying {}",
+                    position.debt_token
+                )
+            })?;
+
+        // Venus liquidation repay cap: `debt_amount × close_factor / 1e18`.
+        // Close factor on BSC Venus Diamond is 0.5e18 → repay half the debt.
+        let one_e18 = U256::from(10u64).pow(U256::from(18u64));
+        let repay_amount = position
+            .debt_amount
+            .checked_mul(self.close_factor_mantissa)
+            .context("Venus: repay-amount overflow")?
+            / one_e18;
+
+        if repay_amount.is_zero() {
+            anyhow::bail!("Venus: computed repay_amount is zero (debt or close_factor is zero)");
+        }
+
+        Ok(LiquidationParams::Venus {
+            borrower: position.borrower,
+            collateral_vtoken,
+            debt_vtoken,
+            repay_amount,
+        })
     }
 
-    fn build_liquidation_calldata(&self, _params: &LiquidationParams) -> Result<Vec<u8>> {
-        anyhow::bail!("Venus::build_liquidation_calldata lands in the next #8 commit")
+    fn build_liquidation_calldata(&self, params: &LiquidationParams) -> Result<Vec<u8>> {
+        encode_liquidate_borrow_calldata(params)
+    }
+}
+
+/// Encode the raw Venus `VToken.liquidateBorrow(borrower, repayAmount,
+/// vTokenCollateral)` call.
+///
+/// This is the inner calldata that `CharonLiquidator.sol` will re-emit
+/// toward the debt vToken inside its flash-loan callback; the outer
+/// wrapping into `CharonLiquidator.executeLiquidation(...)` is added
+/// when the on-chain contract is wired in (separate milestone).
+///
+/// Split out as a free function so unit tests can exercise the encoder
+/// without constructing a full `VenusAdapter` (which needs a live WS
+/// provider).
+fn encode_liquidate_borrow_calldata(params: &LiquidationParams) -> Result<Vec<u8>> {
+    let LiquidationParams::Venus {
+        borrower,
+        collateral_vtoken,
+        debt_vtoken: _,
+        repay_amount,
+    } = params;
+
+    let call = abi::IVToken::liquidateBorrowCall {
+        borrower: *borrower,
+        repayAmount: *repay_amount,
+        vTokenCollateral: *collateral_vtoken,
+    };
+    Ok(call.abi_encode())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloy::primitives::address;
+
+    #[test]
+    fn liquidate_borrow_calldata_has_correct_selector() {
+        let params = LiquidationParams::Venus {
+            borrower: address!("1111111111111111111111111111111111111111"),
+            collateral_vtoken: address!("2222222222222222222222222222222222222222"),
+            debt_vtoken: address!("3333333333333333333333333333333333333333"),
+            repay_amount: U256::from(42u64),
+        };
+        let data = encode_liquidate_borrow_calldata(&params).expect("encode");
+
+        // Selector = keccak256("liquidateBorrow(address,uint256,address)")[:4]
+        // == 0xf5e3c462. Alloy's generated SELECTOR constant is the
+        // canonical source; we pin against it to catch accidental ABI
+        // drift (wrong argument order, extra params, …).
+        assert_eq!(
+            &data[..4],
+            &abi::IVToken::liquidateBorrowCall::SELECTOR,
+            "selector mismatch — check ABI definition order"
+        );
+        // 4 bytes selector + 3 × 32-byte slots for the args.
+        assert_eq!(data.len(), 4 + 32 * 3);
     }
 }
