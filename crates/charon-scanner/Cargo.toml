@@ -4,3 +4,10 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 description = "Chain listener and health-factor scanner for Charon"
+
+[dependencies]
+charon-core = { workspace = true }
+alloy = { workspace = true }
+anyhow = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }

@@ -11,6 +11,7 @@ path = "src/main.rs"
 
 [dependencies]
 charon-core = { workspace = true }
+charon-scanner = { workspace = true }
 clap = { workspace = true }
 tokio = { workspace = true }
 anyhow = { workspace = true }
