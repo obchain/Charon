@@ -7,11 +7,18 @@
 //! into the shared `Position` type and encodes liquidation calls through
 //! `VToken.liquidateBorrow(borrower, repayAmount, vTokenCollateral)`.
 //!
-//! This file is a scaffold — the `LendingProtocol` impl lands alongside
-//! the provider wiring in the next commit.
+//! The `LendingProtocol` impl lands in the next commit — this file
+//! wires up the async constructor that snapshots market config from the
+//! Comptroller (markets, oracle, close factor, liquidation incentive).
 
-use alloy::primitives::Address;
+use std::sync::Arc;
+
+use alloy::primitives::{Address, U256};
+use alloy::providers::RootProvider;
+use alloy::pubsub::PubSubFrontend;
 use alloy::sol;
+use anyhow::{Context, Result};
+use tracing::{debug, info};
 
 /// On-chain ABI bindings used by the Venus adapter.
 ///
@@ -44,9 +51,6 @@ pub mod abi {
 
             /// Max fraction of debt liquidatable per call (scaled 1e18).
             function closeFactorMantissa() external view returns (uint256);
-
-            /// Bonus paid to liquidators (scaled 1e18, e.g. 1.1e18 = 10%).
-            function liquidationIncentiveMantissa() external view returns (uint256);
 
             /// Address of the Venus price oracle.
             function oracle() external view returns (address);
@@ -101,24 +105,85 @@ pub mod abi {
     }
 }
 
+/// Shared pub-sub provider — adapters are cheap to clone and keep their
+/// own `Arc` so the scanner can hand out multiple adapters without
+/// re-opening a WebSocket per protocol.
+pub type ChainProvider = Arc<RootProvider<PubSubFrontend>>;
+
 /// Venus adapter — see module docs.
-///
-/// Holds the Comptroller address for the chain it's running on. Further
-/// fields (pub-sub provider, cached vToken list, price oracle address)
-/// are added alongside the provider wiring in the next commit.
 #[derive(Debug, Clone)]
 pub struct VenusAdapter {
     /// Address of the Venus Unitroller (main Comptroller proxy).
     pub comptroller: Address,
+    /// Price oracle address, discovered from the Comptroller.
+    pub oracle: Address,
+    /// vToken markets registered on the Comptroller at connect time.
+    pub markets: Vec<Address>,
+    /// Close factor (1e18-scaled fraction of debt liquidatable per call).
+    pub close_factor_mantissa: U256,
+    /// Shared pub-sub provider for all downstream RPC calls.
+    provider: ChainProvider,
 }
 
 impl VenusAdapter {
-    /// Build an adapter pointing at the given Venus Comptroller.
+    /// Connect to the Venus Comptroller and snapshot its market config.
     ///
-    /// This is intentionally minimal for now; the async constructor that
-    /// also discovers vToken markets and the price oracle lands in the
-    /// next commit.
-    pub fn new(comptroller: Address) -> Self {
-        Self { comptroller }
+    /// Performs three read-only RPCs in sequence: `oracle`,
+    /// `getAllMarkets`, `closeFactorMantissa`. These values are static
+    /// enough over a bot's lifetime that caching them at connect time
+    /// saves one round-trip per block without meaningful staleness risk
+    /// (Venus governance updates are rare and observable).
+    ///
+    /// Per-market liquidation incentive is resolved lazily when a
+    /// liquidation is being built, because Venus's Diamond Comptroller
+    /// exposes it per-vToken rather than as a global constant.
+    pub async fn connect(provider: ChainProvider, comptroller: Address) -> Result<Self> {
+        debug!(%comptroller, "connecting Venus adapter");
+
+        let comp = abi::IVenusComptroller::new(comptroller, provider.clone());
+
+        let oracle = comp
+            .oracle()
+            .call()
+            .await
+            .context("Venus: Comptroller.oracle() failed")?
+            ._0;
+
+        let markets = comp
+            .getAllMarkets()
+            .call()
+            .await
+            .context("Venus: Comptroller.getAllMarkets() failed")?
+            ._0;
+
+        let close_factor_mantissa = comp
+            .closeFactorMantissa()
+            .call()
+            .await
+            .context("Venus: Comptroller.closeFactorMantissa() failed")?
+            ._0;
+
+        info!(
+            %comptroller,
+            %oracle,
+            market_count = markets.len(),
+            close_factor = %close_factor_mantissa,
+            "Venus adapter connected"
+        );
+
+        Ok(Self {
+            comptroller,
+            oracle,
+            markets,
+            close_factor_mantissa,
+            provider,
+        })
+    }
+
+    /// Borrow the shared provider — used by downstream call-builders
+    /// inside the `LendingProtocol` impl (next commit).
+    #[allow(dead_code)]
+    pub(crate) fn provider(&self) -> &ChainProvider {
+        &self.provider
     }
 }

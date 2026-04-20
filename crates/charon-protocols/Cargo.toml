@@ -11,3 +11,7 @@ alloy = { workspace = true }
 anyhow = { workspace = true }
 async-trait = { workspace = true }
 tracing = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+dotenvy = { workspace = true }
