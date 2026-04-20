@@ -34,6 +34,9 @@ anyhow = "1"
 # Async trait objects
 async-trait = "0.1"
 
+# Stream adapters (StreamExt for subscription streams)
+futures-util = "0.3"
+
 # CLI
 clap = { version = "4", features = ["derive"] }
 

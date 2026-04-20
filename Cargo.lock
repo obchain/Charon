@@ -1153,6 +1153,7 @@ dependencies = [
  "alloy",
  "anyhow",
  "charon-core",
+ "futures-util",
  "tokio",
  "tracing",
 ]

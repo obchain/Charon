@@ -11,3 +11,4 @@ alloy = { workspace = true }
 anyhow = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
+futures-util = { workspace = true }

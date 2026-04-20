@@ -9,10 +9,16 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use charon_core::Config;
-use charon_scanner::ChainProvider;
+use charon_scanner::{BlockListener, ChainEvent, ChainProvider};
 use clap::{Parser, Subcommand};
-use tracing::info;
+use tokio::sync::mpsc;
+use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
+
+/// Size of the fan-in channel from listeners to the scanner pipeline.
+/// One slot per ~5 blocks across all chains covers short stalls without
+/// back-pressuring the listener task.
+const CHAIN_EVENT_CHANNEL: usize = 1024;
 
 /// Charon — multi-chain flash-loan liquidation bot.
 #[derive(Parser, Debug)]
@@ -28,8 +34,10 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Command {
-    /// Listen to chain events and track positions.
-    /// (Scanner wiring lands across multiple M1 issues — currently a stub.)
+    /// Spawn one block listener per configured chain and print new blocks.
+    ///
+    /// Downstream pipeline (scanner → profit calc → executor) consumes
+    /// the same channel once those layers land.
     Listen,
 
     /// Connect to a configured chain and print its latest block number.
@@ -68,9 +76,7 @@ async fn main() -> Result<()> {
     );
 
     match cli.command {
-        Command::Listen => {
-            info!("listen: not wired up yet — scanner arrives across M1 issues");
-        }
+        Command::Listen => run_listen(config).await?,
         Command::TestConnection { chain } => {
             let chain_cfg = config
                 .chain
@@ -79,6 +85,53 @@ async fn main() -> Result<()> {
             let provider = ChainProvider::connect(&chain, chain_cfg).await?;
             let block = provider.test_connection().await?;
             info!(chain = %chain, block = block, "connected — latest block");
+        }
+    }
+
+    Ok(())
+}
+
+/// Spawn one `BlockListener` per configured chain, drain the shared
+/// `ChainEvent` channel, and exit on Ctrl-C.
+async fn run_listen(config: Config) -> Result<()> {
+    if config.chain.is_empty() {
+        anyhow::bail!("no chains configured — nothing to listen to");
+    }
+
+    let (tx, mut rx) = mpsc::channel::<ChainEvent>(CHAIN_EVENT_CHANNEL);
+
+    for (name, chain_cfg) in config.chain {
+        let listener = BlockListener::new(name.clone(), chain_cfg, tx.clone());
+        tokio::spawn(async move {
+            if let Err(err) = listener.run().await {
+                warn!(chain = %name, error = ?err, "listener terminated");
+            }
+        });
+    }
+    // Drop our sender so the channel closes when every listener exits.
+    drop(tx);
+
+    info!("listen: draining chain events (Ctrl-C to stop)");
+
+    tokio::select! {
+        _ = async {
+            while let Some(event) = rx.recv().await {
+                match event {
+                    ChainEvent::NewBlock { chain, number, timestamp } => {
+                        tracing::debug!(
+                            chain = %chain,
+                            block = number,
+                            timestamp = timestamp,
+                            "cli drained event"
+                        );
+                    }
+                }
+            }
+        } => {
+            info!("all listeners exited");
+        }
+        _ = tokio::signal::ctrl_c() => {
+            info!("ctrl-c received, shutting down");
         }
     }
 
