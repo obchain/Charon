@@ -37,6 +37,9 @@ async-trait = "0.1"
 # CLI
 clap = { version = "4", features = ["derive"] }
 
+# .env loader
+dotenvy = "0.15"
+
 # Internal crates
 charon-core = { path = "crates/charon-core" }
 charon-scanner = { path = "crates/charon-scanner" }
