@@ -1,0 +1,22 @@
+# Rust build artifacts
+/target/
+**/*.rs.bk
+
+# Environment / secrets
+.env
+.env.local
+
+# macOS
+.DS_Store
+
+# Editor
+.idea/
+.vscode/
+
+# Logs
+*.log
+
+# Local-only dev notes and editor configs
+.claude/
+docs/context.md
+NOTES.md
