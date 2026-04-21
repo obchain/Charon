@@ -9,12 +9,14 @@
 //! signs it with the bot's hot wallet, and runs an `eth_call`
 //! simulation gate before any broadcast can happen.
 
+pub mod batcher;
 pub mod builder;
 pub mod gas;
 pub mod nonce;
 pub mod simulation;
 pub mod submit;
 
+pub use batcher::{Batcher, LiquidationBatch, MAX_BATCH_SIZE};
 pub use builder::{ICharonLiquidator, TxBuilder};
 pub use gas::{GasOracle, GasParams, gas_cost_usd_cents};
 pub use nonce::NonceManager;

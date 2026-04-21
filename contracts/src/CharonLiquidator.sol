@@ -26,10 +26,10 @@ import { IERC20 } from "./interfaces/IERC20.sol";
 //   - executeOperation is only callable by the Aave Pool.
 //   - initiator must equal address(this) — prevents a malicious pool from
 //     invoking our callback with forged parameters.
-//   - Reentrancy guard on executeLiquidation (nonReentrant).
+//   - Reentrancy guard on executeLiquidation and batchExecute (nonReentrant).
 //   - executeOperation NOT guarded with nonReentrant: it is called by Aave mid-
-//     flash-loan, re-entering executeLiquidation's guard frame. The msg.sender
-//     == AAVE_POOL gate is the equivalent protection for the callback.
+//     flash-loan, re-entering the guard frame. The msg.sender == AAVE_POOL gate
+//     is the equivalent protection for the callback.
 //   - Lingering approvals zeroed after each consume point (vToken, SwapRouter).
 //   - No tx.origin usage. No delegatecall. No assembly. No upgradeability.
 //   - No external library imports — all interfaces are inline/local.
@@ -39,7 +39,8 @@ import { IERC20 } from "./interfaces/IERC20.sol";
 /// @notice On-chain executor for flash-loan-backed liquidations across DeFi protocols.
 ///         v0.1 supports Venus Protocol on BNB Chain.
 /// @dev Implements IFlashLoanSimpleReceiver for the Aave V3 flash-loan callback.
-///      The bot (hot wallet = owner) is the sole authorized caller of executeLiquidation.
+///      The bot (hot wallet = owner) is the sole authorized caller of executeLiquidation
+///      and batchExecute.
 contract CharonLiquidator is IFlashLoanSimpleReceiver {
     // ─────────────────────────────────────────────────────────────────────────
     // Protocol ID constants — must mirror the Rust `ProtocolId` enum order.
@@ -47,6 +48,11 @@ contract CharonLiquidator is IFlashLoanSimpleReceiver {
 
     /// @dev ProtocolId::Venus = 3 in the Rust enum (0-indexed: Aave=0, Compound=1, ...).
     uint8 internal constant PROTOCOL_VENUS = 3;
+
+    /// @dev Absolute ceiling on the number of liquidations in a single batchExecute call.
+    ///      The Rust batcher uses 3 by default; 10 gives headroom for future tuning.
+    ///      Prevents a compromised owner key from burning unbounded gas in one tx.
+    uint256 internal constant MAX_BATCH_SIZE = 10;
 
     // ─────────────────────────────────────────────────────────────────────────
     // Reentrancy guard — simple two-state lock.
@@ -119,6 +125,10 @@ contract CharonLiquidator is IFlashLoanSimpleReceiver {
     /// @param amount The amount transferred.
     event Rescued(address indexed token, address indexed to, uint256 amount);
 
+    /// @notice Emitted at the end of a successful batchExecute call.
+    /// @param count The number of liquidations initiated in the batch.
+    event BatchExecuted(uint256 count);
+
     // ─────────────────────────────────────────────────────────────────────────
     // Modifiers
     // ─────────────────────────────────────────────────────────────────────────
@@ -129,11 +139,13 @@ contract CharonLiquidator is IFlashLoanSimpleReceiver {
         _;
     }
 
-    /// @dev Prevents reentrant calls into executeLiquidation.
+    /// @dev Prevents reentrant calls into executeLiquidation and batchExecute.
     ///      Uses 1/2 rather than 0/1 to avoid cold-write SSTORE costs on every call.
     ///      NOT applied to executeOperation — that function is called by Aave mid-
     ///      flash-loan and is already protected by the msg.sender == AAVE_POOL gate.
     ///      Applying nonReentrant to executeOperation would deadlock the flash loan.
+    ///      NOT applied to _initiateFlashLoan — it is an internal helper called with
+    ///      the guard already held by the outer entry point.
     modifier nonReentrant() {
         require(_entered == 1, "reentrant");
         _entered = 2;
@@ -160,16 +172,15 @@ contract CharonLiquidator is IFlashLoanSimpleReceiver {
     }
 
     // ─────────────────────────────────────────────────────────────────────────
-    // External — owner entry point
+    // External — owner entry points
     // ─────────────────────────────────────────────────────────────────────────
 
     /// @notice Initiates a flash-loan-backed liquidation of a Venus borrower.
-    /// @dev Called exclusively by the off-chain bot (owner). Encodes `params` and
-    ///      requests a flash loan from Aave V3; the actual liquidation logic executes
-    ///      atomically inside the executeOperation() callback.
+    /// @dev Called exclusively by the off-chain bot (owner). Delegates to
+    ///      _initiateFlashLoan after acquiring the reentrancy lock.
     ///
     ///      Flow:
-    ///        1. Validate inputs.
+    ///        1. Validate inputs (inside _initiateFlashLoan).
     ///        2. ABI-encode params to bytes.
     ///        3. Call IAaveV3Pool.flashLoanSimple — Aave transfers debtToken to this
     ///           contract then immediately calls executeOperation().
@@ -179,30 +190,32 @@ contract CharonLiquidator is IFlashLoanSimpleReceiver {
     ///
     /// @param params All parameters describing the Venus liquidation opportunity.
     function executeLiquidation(LiquidationParams calldata params) external onlyOwner nonReentrant {
-        // ── Input validation ──────────────────────────────────────────────────
-        require(params.protocolId == PROTOCOL_VENUS, "!protocolId");
-        require(params.borrower != address(0), "!borrower");
-        require(params.debtToken != address(0), "!debtToken");
-        require(params.collateralToken != address(0), "!collateralToken");
-        require(params.debtVToken != address(0), "!debtVToken");
-        require(params.collateralVToken != address(0), "!collateralVToken");
-        require(params.repayAmount > 0, "!repayAmount");
+        _initiateFlashLoan(params);
+    }
 
-        // ── Encode params and request the flash loan ──────────────────────────
-        // Aave forwards `encoded` verbatim to executeOperation as the `data`
-        // argument; we decode it there to recover the liquidation parameters.
-        bytes memory encoded = abi.encode(params);
+    /// @notice Initiates multiple flash-loan-backed liquidations in a single transaction.
+    /// @dev Called exclusively by the off-chain bot (owner). Iterates over `items` and
+    ///      calls _initiateFlashLoan for each. A revert in any iteration reverts the
+    ///      entire batch atomically — there is no partial execution.
+    ///
+    ///      The nonReentrant guard is held for the full duration of the loop. Each
+    ///      _initiateFlashLoan invocation calls Aave's flashLoanSimple, which re-enters
+    ///      executeOperation within the _entered == 2 window; that is the expected and
+    ///      safe path. A malicious pool attempting to re-enter batchExecute mid-loop
+    ///      would hit the nonReentrant guard and revert.
+    ///
+    /// @param items Array of LiquidationParams, one per borrower to liquidate.
+    ///              Must be non-empty and no longer than MAX_BATCH_SIZE.
+    function batchExecute(LiquidationParams[] calldata items) external onlyOwner nonReentrant {
+        uint256 n = items.length;
+        require(n > 0, "!items");
+        require(n <= MAX_BATCH_SIZE, "batch too large");
 
-        IAaveV3Pool(AAVE_POOL)
-            .flashLoanSimple(
-                address(this), // receiver — this contract implements the callback
-                params.debtToken, // asset   — the token we need to repay Venus with
-                params.repayAmount, // amount  — exact principal to borrow
-                encoded, // params  — forwarded to executeOperation
-                0 // referralCode — no referral
-            );
-        // Aave has pulled amount + premium via the allowance set in executeOperation.
-        // Nothing further to do in this frame.
+        for (uint256 i = 0; i < n; i++) {
+            _initiateFlashLoan(items[i]);
+        }
+
+        emit BatchExecuted(n);
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -230,15 +243,15 @@ contract CharonLiquidator is IFlashLoanSimpleReceiver {
     ///        l. Return true.
     ///
     ///      NOTE: nonReentrant is intentionally NOT applied here. Applying it would
-    ///      deadlock the flash loan because executeLiquidation already holds the lock
-    ///      (_entered == 2) when Aave re-enters this callback within the same tx.
-    ///      The msg.sender == AAVE_POOL gate is the equivalent protection.
+    ///      deadlock the flash loan because executeLiquidation / batchExecute already
+    ///      holds the lock (_entered == 2) when Aave re-enters this callback within
+    ///      the same tx. The msg.sender == AAVE_POOL gate is the equivalent protection.
     ///
     /// @param asset     The flash-loaned ERC-20 token (must equal p.debtToken).
     /// @param amount    The flash-loan principal (must equal p.repayAmount).
     /// @param premium   The Aave fee owed on top of `amount`.
     /// @param initiator The address that initiated the flash loan (must be address(this)).
-    /// @param data      ABI-encoded LiquidationParams forwarded from executeLiquidation.
+    /// @param data      ABI-encoded LiquidationParams forwarded from _initiateFlashLoan.
     /// @return True on success; Aave reverts the entire tx if false is returned.
     function executeOperation(
         address asset,
@@ -387,6 +400,48 @@ contract CharonLiquidator is IFlashLoanSimpleReceiver {
         }
 
         emit Rescued(token, to, amount);
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Internal — shared flash-loan initiator
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// @notice Validates `p`, encodes it, and requests a flashLoanSimple from Aave.
+    /// @dev Called by both executeLiquidation and batchExecute. Must NOT be decorated
+    ///      with nonReentrant — the caller already holds the lock. Adding nonReentrant
+    ///      here would deadlock the flash loan because Aave re-enters executeOperation
+    ///      (which runs inside _entered == 2) before this function returns.
+    ///
+    ///      The seven require guards here are identical to those that previously lived
+    ///      in executeLiquidation and are the single canonical validation point for any
+    ///      liquidation initiated by this contract.
+    ///
+    /// @param p The fully-populated LiquidationParams for one liquidation.
+    function _initiateFlashLoan(LiquidationParams memory p) internal {
+        // ── Input validation ──────────────────────────────────────────────────
+        require(p.protocolId == PROTOCOL_VENUS, "!protocolId");
+        require(p.borrower != address(0), "!borrower");
+        require(p.debtToken != address(0), "!debtToken");
+        require(p.collateralToken != address(0), "!collateralToken");
+        require(p.debtVToken != address(0), "!debtVToken");
+        require(p.collateralVToken != address(0), "!collateralVToken");
+        require(p.repayAmount > 0, "!repayAmount");
+
+        // ── Encode params and request the flash loan ──────────────────────────
+        // Aave forwards `encoded` verbatim to executeOperation as the `data`
+        // argument; we decode it there to recover the liquidation parameters.
+        bytes memory encoded = abi.encode(p);
+
+        IAaveV3Pool(AAVE_POOL)
+            .flashLoanSimple(
+                address(this), // receiver — this contract implements the callback
+                p.debtToken, // asset   — the token we need to repay Venus with
+                p.repayAmount, // amount  — exact principal to borrow
+                encoded, // params  — forwarded to executeOperation
+                0 // referralCode — no referral
+            );
+        // Aave has pulled amount + premium via the allowance set in executeOperation.
+        // Nothing further to do in this frame.
     }
 
     // ─────────────────────────────────────────────────────────────────────────

@@ -320,4 +320,81 @@ contract CharonLiquidatorTest is Test {
     function test_executeLiquidation_endToEndOnFork() public {
         vm.skip(true);
     }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // F. batchExecute — access control, bounds, and atomicity (no fork)
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// @dev Non-owner calling batchExecute must revert with "!owner".
+    ///      No pool mock needed — onlyOwner fires before any other logic.
+    function test_batchExecute_revertsWhenNotOwner() public {
+        CharonLiquidator.LiquidationParams[] memory items =
+            new CharonLiquidator.LiquidationParams[](1);
+        items[0] = _validParams();
+
+        vm.prank(alice);
+        vm.expectRevert(bytes("!owner"));
+        liquidator.batchExecute(items);
+    }
+
+    /// @dev An empty array must revert with "!items".
+    ///      The owner calls with zero-length items; the bound check fires immediately.
+    function test_batchExecute_revertsOnEmptyItems() public {
+        CharonLiquidator.LiquidationParams[] memory items =
+            new CharonLiquidator.LiquidationParams[](0);
+
+        vm.expectRevert(bytes("!items"));
+        liquidator.batchExecute(items);
+    }
+
+    /// @dev An array of length 11 (> MAX_BATCH_SIZE = 10) must revert with "batch too large".
+    ///      All items are valid; the ceiling check fires before the loop.
+    function test_batchExecute_revertsWhenTooLarge() public {
+        // Build 11 valid items — the batch size ceiling fires before any iteration.
+        CharonLiquidator.LiquidationParams[] memory items =
+            new CharonLiquidator.LiquidationParams[](11);
+        for (uint256 i = 0; i < 11; i++) {
+            items[i] = _validParams();
+        }
+
+        vm.expectRevert(bytes("batch too large"));
+        liquidator.batchExecute(items);
+    }
+
+    /// @dev A two-item batch where item[0] has a zero borrower must revert with "!borrower".
+    ///      The entire batch reverts atomically — item[1] is never processed.
+    ///
+    ///      item[1] is valid and would reach flashLoanSimple if item[0] passed.
+    ///      We mock STUB_POOL.flashLoanSimple to be a no-op so that if the validation
+    ///      logic were ever incorrectly skipped and the call reached the pool, the test
+    ///      would not revert for the wrong reason.  The expected revert is "!borrower"
+    ///      from _initiateFlashLoan's validation of item[0].
+    function test_batchExecute_revertsOnFirstItemValidation() public {
+        CharonLiquidator.LiquidationParams[] memory items =
+            new CharonLiquidator.LiquidationParams[](2);
+
+        // item[0]: invalid — zero borrower triggers "!borrower" inside _initiateFlashLoan.
+        items[0] = _validParams();
+        items[0].borrower = address(0);
+
+        // item[1]: fully valid — would reach flashLoanSimple if iteration 0 were skipped.
+        items[1] = _validParams();
+
+        // Stub STUB_POOL.flashLoanSimple to succeed silently for item[1] in case
+        // validation is incorrectly bypassed.  The real assertion is the revert below.
+        bytes memory flashLoanSig = abi.encodeWithSignature(
+            "flashLoanSimple(address,address,uint256,bytes,uint16)",
+            address(liquidator),
+            items[1].debtToken,
+            items[1].repayAmount,
+            abi.encode(items[1]),
+            uint16(0)
+        );
+        vm.mockCall(STUB_POOL, flashLoanSig, abi.encode());
+
+        // Expect the batch to revert with "!borrower" from item[0]'s validation.
+        // No state from item[1] survives — the revert is atomic.
+        vm.expectRevert(bytes("!borrower"));
+        liquidator.batchExecute(items);
+    }
 }
