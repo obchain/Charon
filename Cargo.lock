@@ -1149,6 +1149,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "charon-executor"
+version = "0.1.0"
+dependencies = [
+ "alloy",
+ "anyhow",
+ "charon-core",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "charon-flashloan"
 version = "0.1.0"
 dependencies = [
