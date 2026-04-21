@@ -24,6 +24,11 @@ pub struct Config {
     pub flashloan: HashMap<String, FlashLoanConfig>,
     /// Deployed liquidator contracts keyed by chain name.
     pub liquidator: HashMap<String, LiquidatorConfig>,
+    /// Chainlink feed addresses per chain, keyed by asset symbol
+    /// (e.g. `chainlink.bnb.BNB = "0x…"`). Missing key = no feed
+    /// configured, scanner falls back to protocol oracle.
+    #[serde(default)]
+    pub chainlink: HashMap<String, HashMap<String, Address>>,
 }
 
 /// Bot-level knobs — thresholds and intervals.

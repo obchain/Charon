@@ -1169,6 +1169,7 @@ dependencies = [
  "anyhow",
  "charon-core",
  "dashmap",
+ "dotenvy",
  "futures-util",
  "tokio",
  "tracing",

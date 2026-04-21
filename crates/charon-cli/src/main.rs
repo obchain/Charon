@@ -14,7 +14,9 @@ use alloy::providers::{ProviderBuilder, WsConnect};
 use anyhow::{Context, Result};
 use charon_core::{Config, LendingProtocol};
 use charon_protocols::VenusAdapter;
-use charon_scanner::{BlockListener, ChainEvent, ChainProvider, HealthScanner};
+use charon_scanner::{
+    BlockListener, ChainEvent, ChainProvider, DEFAULT_MAX_AGE, HealthScanner, PriceCache,
+};
 use clap::{Parser, Subcommand};
 use tokio::sync::mpsc;
 use tracing::{info, warn};
@@ -129,12 +131,34 @@ async fn run_listen(config: Config, borrowers: Vec<Address>) -> Result<()> {
         config.bot.near_liq_threshold,
     )?);
 
+    // Chainlink price cache — feeds are configured per chain under
+    // `[chainlink.<chain>]`. Empty map = no feeds configured, cache
+    // stays idle and downstream stages fall back to protocol oracle.
+    let price_feeds = config.chainlink.get("bnb").cloned().unwrap_or_default();
+    let price_cache_ws = ProviderBuilder::new()
+        .on_ws(WsConnect::new(&bnb.ws_url))
+        .await
+        .context("price cache: failed to connect over ws")?;
+    let prices = Arc::new(PriceCache::new(
+        Arc::new(price_cache_ws),
+        price_feeds,
+        DEFAULT_MAX_AGE,
+    ));
+    prices.refresh_all().await;
+    let fresh_feeds: Vec<String> = prices.symbols().map(str::to_string).collect();
+    for sym in &fresh_feeds {
+        if let Some(p) = prices.get(sym) {
+            info!(symbol = %sym, price = %p.price, decimals = p.decimals, "chainlink feed");
+        }
+    }
+
     info!(
         borrower_count = borrowers.len(),
         market_count = adapter.markets.len(),
+        feed_count = fresh_feeds.len(),
         liquidatable_threshold = config.bot.liquidatable_threshold,
         near_liq_threshold = config.bot.near_liq_threshold,
-        "venus adapter + scanner ready"
+        "venus adapter + scanner + price cache ready"
     );
 
     // 2. Block listeners — one per configured chain, fan-in to a shared

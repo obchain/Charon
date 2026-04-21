@@ -13,3 +13,6 @@ tokio = { workspace = true }
 tracing = { workspace = true }
 futures-util = { workspace = true }
 dashmap = { workspace = true }
+
+[dev-dependencies]
+dotenvy = { workspace = true }
