@@ -22,6 +22,10 @@ ws_url             = "${BNB_WS_URL}"
 http_url           = "${BNB_HTTP_URL}"
 # Validator-friendly tip on BSC; raise during congestion.
 priority_fee_gwei  = 1
+# Optional private-RPC endpoint (bloxroute / blocknative). When set,
+# tx submission bypasses the public mempool. Leave unset to fall back
+# to `http_url`.
+private_rpc_url    = "${BSC_PRIVATE_RPC_URL}"
 
 # ── Lending protocols ─────────────────────────────────────────────────────
 [protocol.venus]

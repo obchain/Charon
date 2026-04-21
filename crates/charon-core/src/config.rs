@@ -70,6 +70,13 @@ pub struct ChainConfig {
     /// validator-friendly tip is ~1 gwei whereas L2 tips run sub-gwei.
     #[serde(default = "default_priority_fee_gwei")]
     pub priority_fee_gwei: u64,
+    /// Optional private-RPC endpoint for transaction submission
+    /// (bloxroute / blocknative on BSC, sequencer endpoints on L2s).
+    /// When set, the submitter posts `eth_sendRawTransaction` here
+    /// instead of the public `http_url` so pending txs skip the
+    /// public mempool and front-runners.
+    #[serde(default)]
+    pub private_rpc_url: Option<String>,
 }
 
 fn default_priority_fee_gwei() -> u64 {
