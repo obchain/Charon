@@ -10,7 +10,9 @@
 //! simulation gate before any broadcast can happen.
 
 pub mod builder;
+pub mod gas;
 pub mod simulation;
 
 pub use builder::{ICharonLiquidator, TxBuilder};
+pub use gas::{GasOracle, GasParams, gas_cost_usd_cents};
 pub use simulation::Simulator;

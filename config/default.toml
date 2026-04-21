@@ -17,9 +17,11 @@ near_liq_threshold     = 1.05
 
 # ── Chains ────────────────────────────────────────────────────────────────
 [chain.bnb]
-chain_id  = 56
-ws_url    = "${BNB_WS_URL}"
-http_url  = "${BNB_HTTP_URL}"
+chain_id           = 56
+ws_url             = "${BNB_WS_URL}"
+http_url           = "${BNB_HTTP_URL}"
+# Validator-friendly tip on BSC; raise during congestion.
+priority_fee_gwei  = 1
 
 # ── Lending protocols ─────────────────────────────────────────────────────
 [protocol.venus]

@@ -66,6 +66,14 @@ pub struct ChainConfig {
     pub chain_id: u64,
     pub ws_url: String,
     pub http_url: String,
+    /// EIP-1559 priority fee (tip) in gwei. Per chain because BSC's
+    /// validator-friendly tip is ~1 gwei whereas L2 tips run sub-gwei.
+    #[serde(default = "default_priority_fee_gwei")]
+    pub priority_fee_gwei: u64,
+}
+
+fn default_priority_fee_gwei() -> u64 {
+    1
 }
 
 /// Address and metadata for a lending protocol on a specific chain.
