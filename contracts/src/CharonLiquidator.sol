@@ -2,6 +2,9 @@
 pragma solidity ^0.8.24;
 
 import { IFlashLoanSimpleReceiver } from "./interfaces/IFlashLoanSimpleReceiver.sol";
+import { IAaveV3Pool } from "./interfaces/IAaveV3Pool.sol";
+import { IVToken } from "./interfaces/IVToken.sol";
+import { ISwapRouter } from "./interfaces/ISwapRouter.sol";
 import { IERC20 } from "./interfaces/IERC20.sol";
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -13,20 +16,23 @@ import { IERC20 } from "./interfaces/IERC20.sol";
 //   3. Aave calls back executeOperation(); inside we:
 //        a. Approve Venus vToken to spend the debt asset.
 //        b. Call vToken.liquidateBorrow() — repay debt, seize collateral vTokens.
-//        c. Call vToken.redeemUnderlying() — convert seized vTokens to underlying.
+//        c. Call vToken.redeem() — convert ALL seized vTokens to underlying.
 //        d. Swap collateral → debt asset via PancakeSwap V3.
-//        e. Repay Aave (amount + premium).
-//        f. Transfer profit to owner.
-//   Steps (a–f) are NOT implemented in this skeleton — bodies revert loudly.
+//        e. Sweep profit to owner.
+//        f. Approve Aave for repayment (amount + premium); Aave pulls it after return.
 //
-// Security invariants (enforced even in skeleton):
+// Security invariants:
 //   - Only owner may trigger liquidations or rescue funds.
 //   - executeOperation is only callable by the Aave Pool.
 //   - initiator must equal address(this) — prevents a malicious pool from
 //     invoking our callback with forged parameters.
+//   - Reentrancy guard on executeLiquidation (nonReentrant).
+//   - executeOperation NOT guarded with nonReentrant: it is called by Aave mid-
+//     flash-loan, re-entering executeLiquidation's guard frame. The msg.sender
+//     == AAVE_POOL gate is the equivalent protection for the callback.
+//   - Lingering approvals zeroed after each consume point (vToken, SwapRouter).
 //   - No tx.origin usage. No delegatecall. No assembly. No upgradeability.
-//   - No external imports — all interfaces are inline/local for zero-dependency
-//     forge build in the skeleton phase.
+//   - No external library imports — all interfaces are inline/local.
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// @title CharonLiquidator
@@ -34,7 +40,6 @@ import { IERC20 } from "./interfaces/IERC20.sol";
 ///         v0.1 supports Venus Protocol on BNB Chain.
 /// @dev Implements IFlashLoanSimpleReceiver for the Aave V3 flash-loan callback.
 ///      The bot (hot wallet = owner) is the sole authorized caller of executeLiquidation.
-///      All liquidation and swap logic is stubbed — see issue #12.
 contract CharonLiquidator is IFlashLoanSimpleReceiver {
     // ─────────────────────────────────────────────────────────────────────────
     // Protocol ID constants — must mirror the Rust `ProtocolId` enum order.
@@ -42,6 +47,15 @@ contract CharonLiquidator is IFlashLoanSimpleReceiver {
 
     /// @dev ProtocolId::Venus = 3 in the Rust enum (0-indexed: Aave=0, Compound=1, ...).
     uint8 internal constant PROTOCOL_VENUS = 3;
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Reentrancy guard — simple two-state lock.
+    // Stored as uint256 rather than bool to match the Solidity optimizer's
+    // preferred SSTORE encoding and avoid zero→non-zero cold-write gas cost
+    // on the first call (storage slot is initialized to 1 at deploy time).
+    // ─────────────────────────────────────────────────────────────────────────
+
+    uint256 private _entered = 1;
 
     // ─────────────────────────────────────────────────────────────────────────
     // Immutable configuration — set once at construction, never changed.
@@ -110,11 +124,21 @@ contract CharonLiquidator is IFlashLoanSimpleReceiver {
     // ─────────────────────────────────────────────────────────────────────────
 
     /// @dev Restricts a function to the deploying hot wallet (owner).
-    ///      Uses a string revert for maximum compatibility with off-chain tooling
-    ///      that parses revert reasons at this stage of the skeleton.
     modifier onlyOwner() {
         require(msg.sender == owner, "!owner");
         _;
+    }
+
+    /// @dev Prevents reentrant calls into executeLiquidation.
+    ///      Uses 1/2 rather than 0/1 to avoid cold-write SSTORE costs on every call.
+    ///      NOT applied to executeOperation — that function is called by Aave mid-
+    ///      flash-loan and is already protected by the msg.sender == AAVE_POOL gate.
+    ///      Applying nonReentrant to executeOperation would deadlock the flash loan.
+    modifier nonReentrant() {
+        require(_entered == 1, "reentrant");
+        _entered = 2;
+        _;
+        _entered = 1;
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -140,20 +164,22 @@ contract CharonLiquidator is IFlashLoanSimpleReceiver {
     // ─────────────────────────────────────────────────────────────────────────
 
     /// @notice Initiates a flash-loan-backed liquidation of a Venus borrower.
-    /// @dev Called exclusively by the off-chain bot (owner). The function encodes
-    ///      `params` and requests a flash loan from Aave; the actual liquidation
-    ///      logic executes inside executeOperation().
+    /// @dev Called exclusively by the off-chain bot (owner). Encodes `params` and
+    ///      requests a flash loan from Aave V3; the actual liquidation logic executes
+    ///      atomically inside the executeOperation() callback.
     ///
-    ///      Checks performed here (skeleton phase):
-    ///        - Caller is owner (onlyOwner modifier).
-    ///        - protocolId == PROTOCOL_VENUS.
-    ///        - Key addresses are non-zero.
-    ///        - repayAmount > 0.
+    ///      Flow:
+    ///        1. Validate inputs.
+    ///        2. ABI-encode params to bytes.
+    ///        3. Call IAaveV3Pool.flashLoanSimple — Aave transfers debtToken to this
+    ///           contract then immediately calls executeOperation().
+    ///        4. After executeOperation returns true, Aave pulls amount + premium
+    ///           using the allowance set inside the callback. No further state work
+    ///           is required here.
     ///
-    ///      BODY NOT IMPLEMENTED — see issue #12.
     /// @param params All parameters describing the Venus liquidation opportunity.
-    function executeLiquidation(LiquidationParams calldata params) external onlyOwner {
-        // Input validation — performed even in skeleton so the deployed shape is correct.
+    function executeLiquidation(LiquidationParams calldata params) external onlyOwner nonReentrant {
+        // ── Input validation ──────────────────────────────────────────────────
         require(params.protocolId == PROTOCOL_VENUS, "!protocolId");
         require(params.borrower != address(0), "!borrower");
         require(params.debtToken != address(0), "!debtToken");
@@ -162,7 +188,21 @@ contract CharonLiquidator is IFlashLoanSimpleReceiver {
         require(params.collateralVToken != address(0), "!collateralVToken");
         require(params.repayAmount > 0, "!repayAmount");
 
-        revert("CharonLiquidator: executeLiquidation not yet implemented");
+        // ── Encode params and request the flash loan ──────────────────────────
+        // Aave forwards `encoded` verbatim to executeOperation as the `data`
+        // argument; we decode it there to recover the liquidation parameters.
+        bytes memory encoded = abi.encode(params);
+
+        IAaveV3Pool(AAVE_POOL)
+            .flashLoanSimple(
+                address(this), // receiver — this contract implements the callback
+                params.debtToken, // asset   — the token we need to repay Venus with
+                params.repayAmount, // amount  — exact principal to borrow
+                encoded, // params  — forwarded to executeOperation
+                0 // referralCode — no referral
+            );
+        // Aave has pulled amount + premium via the allowance set in executeOperation.
+        // Nothing further to do in this frame.
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -171,37 +211,140 @@ contract CharonLiquidator is IFlashLoanSimpleReceiver {
 
     /// @notice Aave V3 flash-loan callback. Called by the Pool immediately after
     ///         transferring `amount` of `asset` to this contract.
-    /// @dev Two security gates are checked before any logic runs:
+    /// @dev Security gates (preserved from skeleton):
     ///        1. msg.sender == AAVE_POOL  — only the genuine Aave Pool may call this.
     ///        2. initiator == address(this) — only flash loans we ourselves initiated.
-    ///      Both checks together prevent any external actor from using our callback
-    ///      as a weapon (e.g., to drain approved allowances).
     ///
-    ///      Full implementation (decode params, liquidate Venus, swap, repay):
-    ///      see issue #12.
+    ///      Full liquidation flow:
+    ///        a. Decode LiquidationParams from `data`.
+    ///        b. Sanity-check asset/amount match decoded params.
+    ///        c. Approve debtVToken and call liquidateBorrow on Venus.
+    ///        d. Zero out debtVToken approval (consumed).
+    ///        e. Redeem all seized collateral vTokens for underlying.
+    ///        f. Swap collateral underlying → debt token via PancakeSwap V3.
+    ///        g. Zero out SwapRouter approval (consumed).
+    ///        h. Verify post-swap balance covers totalOwed.
+    ///        i. Sweep profit to owner.
+    ///        j. Emit LiquidationExecuted.
+    ///        k. Approve Aave Pool for totalOwed (Aave pulls this after we return).
+    ///        l. Return true.
     ///
-    /// @dev Parameters: (asset, amount, premium, initiator, data) — see IFlashLoanSimpleReceiver.
-    ///      `asset`, `amount`, `premium`, and `data` are unnamed in this skeleton to suppress
-    ///      unused-variable compiler warnings; they will be named and consumed in issue #12.
-    ///      `initiator` is named because the security gate reads it.
-    /// @return True on success (unreachable in skeleton — revert fires first).
+    ///      NOTE: nonReentrant is intentionally NOT applied here. Applying it would
+    ///      deadlock the flash loan because executeLiquidation already holds the lock
+    ///      (_entered == 2) when Aave re-enters this callback within the same tx.
+    ///      The msg.sender == AAVE_POOL gate is the equivalent protection.
+    ///
+    /// @param asset     The flash-loaned ERC-20 token (must equal p.debtToken).
+    /// @param amount    The flash-loan principal (must equal p.repayAmount).
+    /// @param premium   The Aave fee owed on top of `amount`.
+    /// @param initiator The address that initiated the flash loan (must be address(this)).
+    /// @param data      ABI-encoded LiquidationParams forwarded from executeLiquidation.
+    /// @return True on success; Aave reverts the entire tx if false is returned.
     function executeOperation(
-        address, /* asset     — flash-loaned ERC-20; used in issue #12 */
-        uint256, /* amount    — flash-loan principal; used in issue #12 */
-        uint256, /* premium   — Aave fee; used in issue #12 */
+        address asset,
+        uint256 amount,
+        uint256 premium,
         address initiator,
-        bytes calldata /* data — ABI-encoded LiquidationParams; used in issue #12 */
-    )
-        external
-        override
-        returns (bool)
-    {
-        // Security gate 1: only the real Aave Pool can invoke this callback.
+        bytes calldata data
+    ) external override returns (bool) {
+        // ── Security gates (from skeleton — do not remove) ────────────────────
+        // Gate 1: only the real Aave Pool can invoke this callback.
         require(msg.sender == AAVE_POOL, "!pool");
-        // Security gate 2: we only process flash loans we ourselves requested.
+        // Gate 2: we only process flash loans we ourselves requested.
         require(initiator == address(this), "!initiator");
 
-        revert("CharonLiquidator: executeOperation not yet implemented");
+        // ── Step 1: decode parameters ─────────────────────────────────────────
+        LiquidationParams memory p = abi.decode(data, (LiquidationParams));
+
+        // ── Step 2: sanity — confirm Aave gave us exactly what we asked for ───
+        // These checks catch any pool-side discrepancy and validate that the
+        // encoded params are consistent with the actual flash-loan terms.
+        require(asset == p.debtToken, "asset/debt mismatch");
+        require(amount == p.repayAmount, "amount/repay mismatch");
+
+        // ── Step 3: liquidate on Venus ────────────────────────────────────────
+        // Approve the debt vToken to spend exactly repayAmount of the debt asset.
+        // Venus pulls this during liquidateBorrow; approval is zeroed immediately
+        // after to eliminate lingering allowances.
+        IERC20(p.debtToken).approve(p.debtVToken, p.repayAmount);
+
+        uint256 liqErr = IVToken(p.debtVToken)
+            .liquidateBorrow(
+                p.borrower,
+                p.repayAmount,
+                p.collateralVToken // seized vTokens land in address(this)
+            );
+        require(liqErr == 0, "venus liquidate failed");
+
+        // Zero out vToken approval — liquidateBorrow has consumed it.
+        // Protects against a malicious or re-upgraded vToken contract
+        // attempting a second pull in future calls.
+        IERC20(p.debtToken).approve(p.debtVToken, 0);
+
+        // ── Step 4: redeem seized collateral vTokens for underlying ───────────
+        // balanceOf gives us the exact vToken units seized by liquidateBorrow.
+        // We use redeem(vTokenAmount) rather than redeemUnderlying(underlyingAmount)
+        // to drain the full balance in one call without rounding loss.
+        uint256 vBal = IVToken(p.collateralVToken).balanceOf(address(this));
+        require(vBal > 0, "no collateral seized");
+
+        uint256 redeemErr = IVToken(p.collateralVToken).redeem(vBal);
+        require(redeemErr == 0, "venus redeem failed");
+
+        // ── Step 5: swap collateral underlying → debt token via PancakeSwap V3 ─
+        // Read the full collateral balance just redeemed; use it as exact amountIn.
+        uint256 collateralBal = IERC20(p.collateralToken).balanceOf(address(this));
+
+        // Approve the router for the exact amount we are about to swap.
+        IERC20(p.collateralToken).approve(SWAP_ROUTER, collateralBal);
+
+        ISwapRouter(SWAP_ROUTER)
+            .exactInputSingle(
+                ISwapRouter.ExactInputSingleParams({
+                    tokenIn: p.collateralToken,
+                    tokenOut: p.debtToken,
+                    fee: 3000, // 0.30 % pool — most liquid tier on PCS V3 for major pairs
+                    recipient: address(this),
+                    deadline: block.timestamp,
+                    amountIn: collateralBal,
+                    amountOutMinimum: p.minSwapOut, // router reverts if output < this
+                    sqrtPriceLimitX96: 0 // no price limit — slippage floor above is enough
+                })
+            );
+
+        // Zero out router approval — exactInputSingle has consumed it.
+        IERC20(p.collateralToken).approve(SWAP_ROUTER, 0);
+
+        // ── Step 6: verify post-swap balance covers repayment ─────────────────
+        uint256 totalOwed = amount + premium;
+        uint256 finalBal = IERC20(p.debtToken).balanceOf(address(this));
+
+        // Defensive check on top of the router's amountOutMinimum guard:
+        // ensures the contract cannot accidentally under-repay Aave even if
+        // minSwapOut was set below totalOwed by the caller.
+        require(finalBal >= totalOwed, "swap output below repayment");
+
+        // ── Step 7: sweep profit to owner ─────────────────────────────────────
+        // Profit must leave this contract before we approve Aave, otherwise Aave
+        // could theoretically pull more than totalOwed if the token has quirks.
+        uint256 profit = finalBal - totalOwed;
+        if (profit > 0) {
+            // transfer return value not checked: owner is a trusted address set at
+            // construction; a failure here reverts the whole tx (excess funds stay
+            // in the contract until rescued). Standard ERC-20s revert on failure.
+            IERC20(p.debtToken).transfer(owner, profit);
+        }
+
+        // ── Step 8: emit before the final approval so logs reflect the full state ─
+        emit LiquidationExecuted(p.borrower, p.debtToken, p.repayAmount, profit);
+
+        // ── Step 9: approve Aave to pull totalOwed ────────────────────────────
+        // Aave pulls amount + premium from this contract after executeOperation
+        // returns true. We set approval here; Aave consumes it entirely, so
+        // there is no practical way to zero it out post-return in this call frame.
+        IERC20(p.debtToken).approve(AAVE_POOL, totalOwed);
+
+        return true;
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -217,8 +360,8 @@ contract CharonLiquidator is IFlashLoanSimpleReceiver {
     ///        - onlyOwner: only the hot wallet can pull funds.
     ///        - `to` is validated non-zero to prevent burning.
     ///        - Uses IERC20.transfer directly (no SafeERC20) because this is a
-    ///          skeleton with no OZ dependency; full impl (#12) should assess
-    ///          whether fee-on-transfer tokens need special handling here.
+    ///          no-external-dependency build; fee-on-transfer tokens may transfer
+    ///          less than `amount` — that edge case is acceptable in rescue context.
     ///        - Native transfer uses Solidity's `transfer` which forwards 2300 gas
     ///          and reverts on failure — appropriate for a trusted owner address.
     ///
