@@ -14,7 +14,7 @@ use alloy::providers::{ProviderBuilder, WsConnect};
 use anyhow::{Context, Result};
 use charon_core::{Config, LendingProtocol};
 use charon_protocols::VenusAdapter;
-use charon_scanner::{BlockListener, ChainEvent, ChainProvider};
+use charon_scanner::{BlockListener, ChainEvent, ChainProvider, HealthScanner};
 use clap::{Parser, Subcommand};
 use tokio::sync::mpsc;
 use tracing::{info, warn};
@@ -124,10 +124,17 @@ async fn run_listen(config: Config, borrowers: Vec<Address>) -> Result<()> {
     let adapter =
         Arc::new(VenusAdapter::connect(Arc::new(adapter_ws), venus_cfg.comptroller).await?);
 
+    let scanner = Arc::new(HealthScanner::new(
+        config.bot.liquidatable_threshold,
+        config.bot.near_liq_threshold,
+    )?);
+
     info!(
         borrower_count = borrowers.len(),
         market_count = adapter.markets.len(),
-        "venus adapter ready"
+        liquidatable_threshold = config.bot.liquidatable_threshold,
+        near_liq_threshold = config.bot.near_liq_threshold,
+        "venus adapter + scanner ready"
     );
 
     // 2. Block listeners — one per configured chain, fan-in to a shared
@@ -154,12 +161,18 @@ async fn run_listen(config: Config, borrowers: Vec<Address>) -> Result<()> {
                         let start = std::time::Instant::now();
                         match adapter.fetch_positions(&borrowers).await {
                             Ok(positions) => {
+                                let returned = positions.len();
+                                scanner.upsert(positions);
+                                let counts = scanner.bucket_counts();
                                 info!(
                                     chain = %chain,
                                     block = number,
                                     timestamp = timestamp,
                                     tracked = borrowers.len(),
-                                    returned = positions.len(),
+                                    returned,
+                                    healthy = counts.healthy,
+                                    near_liq = counts.near_liquidation,
+                                    liquidatable = counts.liquidatable,
                                     scan_ms = start.elapsed().as_millis() as u64,
                                     "venus scan"
                                 );

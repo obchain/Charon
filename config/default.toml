@@ -10,6 +10,10 @@ min_profit_usd   = 5.0
 max_gas_gwei     = 10
 # Polling cadence for protocols without push events (ms).
 scan_interval_ms = 1000
+# Health factor at or below which a position is liquidatable (1e18 = 1.0).
+liquidatable_threshold = 1.0
+# Upper bound of the near-liquidation watch band.
+near_liq_threshold     = 1.05
 
 # ── Chains ────────────────────────────────────────────────────────────────
 [chain.bnb]

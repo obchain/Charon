@@ -35,6 +35,24 @@ pub struct BotConfig {
     pub max_gas_gwei: u64,
     /// Polling interval for protocols that don't push events.
     pub scan_interval_ms: u64,
+    /// Health factor at or below which a position becomes liquidatable.
+    /// Stored as a float for readability (e.g. `1.0`); the scanner
+    /// scales it to a 1e18-fixed `U256` internally.
+    #[serde(default = "default_liquidatable_threshold")]
+    pub liquidatable_threshold: f64,
+    /// Upper bound of the near-liquidation watch band. Positions in
+    /// `[liquidatable_threshold, near_liq_threshold)` are pre-cached so
+    /// the bot can fire immediately on the next adverse price move.
+    #[serde(default = "default_near_liq_threshold")]
+    pub near_liq_threshold: f64,
+}
+
+fn default_liquidatable_threshold() -> f64 {
+    1.0
+}
+
+fn default_near_liq_threshold() -> f64 {
+    1.05
 }
 
 /// RPC endpoints for a single chain.
