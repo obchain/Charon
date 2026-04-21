@@ -1,0 +1,17 @@
+[package]
+name = "charon-flashloan"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Flash-loan source adapters and router for Charon"
+
+[dependencies]
+charon-core = { workspace = true }
+alloy = { workspace = true }
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+dotenvy = { workspace = true }
