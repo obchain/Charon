@@ -137,7 +137,7 @@ impl TxBuilder {
     /// by the caller (typically a multiple of `eth_estimateGas` plus a
     /// safety buffer). Fee fields are passed through; producing them
     /// is the gas oracle's job, not the builder's.
-    pub async fn build_tx<P>(
+    pub async fn build_tx<P, T>(
         &self,
         provider: &P,
         calldata: Bytes,
@@ -146,7 +146,8 @@ impl TxBuilder {
         gas_limit: u64,
     ) -> Result<TransactionRequest>
     where
-        P: Provider,
+        P: Provider<T>,
+        T: alloy::transports::Transport + Clone,
     {
         let from = self.signer.address();
         let nonce = provider

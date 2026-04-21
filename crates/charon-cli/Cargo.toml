@@ -11,6 +11,8 @@ path = "src/main.rs"
 
 [dependencies]
 charon-core = { workspace = true }
+charon-executor = { workspace = true }
+charon-flashloan = { workspace = true }
 charon-protocols = { workspace = true }
 charon-scanner = { workspace = true }
 alloy = { workspace = true }

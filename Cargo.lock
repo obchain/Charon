@@ -1128,6 +1128,8 @@ dependencies = [
  "alloy",
  "anyhow",
  "charon-core",
+ "charon-executor",
+ "charon-flashloan",
  "charon-protocols",
  "charon-scanner",
  "clap",

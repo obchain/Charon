@@ -38,9 +38,10 @@ impl Simulator {
     /// The gas oracle isn't involved — we let the node use its
     /// default for `eth_call`, which is high enough that a real
     /// `eth_estimateGas` rarely disagrees.
-    pub async fn simulate<P>(&self, provider: &P, calldata: Bytes) -> Result<()>
+    pub async fn simulate<P, T>(&self, provider: &P, calldata: Bytes) -> Result<()>
     where
-        P: Provider,
+        P: Provider<T>,
+        T: alloy::transports::Transport + Clone,
     {
         let req = TransactionRequest::default()
             .from(self.sender)
