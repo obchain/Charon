@@ -7,5 +7,7 @@
 //! multi-chain expansion.
 
 pub mod aave;
+pub mod router;
 
 pub use aave::AaveFlashLoan;
+pub use router::FlashLoanRouter;
