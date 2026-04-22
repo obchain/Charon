@@ -14,7 +14,9 @@ use alloy::providers::{ProviderBuilder, WsConnect};
 use anyhow::{Context, Result};
 use charon_core::{Config, LendingProtocol};
 use charon_protocols::VenusAdapter;
-use charon_scanner::{BlockListener, ChainEvent, ChainProvider, HealthScanner};
+use charon_scanner::{
+    BlockListener, ChainEvent, ChainProvider, HealthScanner, PositionBucket, ScanScheduler,
+};
 use clap::{Parser, Subcommand};
 use tokio::sync::mpsc;
 use tracing::{info, warn};
@@ -125,15 +127,23 @@ async fn run_listen(config: Config, borrowers: Vec<Address>) -> Result<()> {
         Arc::new(VenusAdapter::connect(Arc::new(adapter_ws), venus_cfg.comptroller).await?);
 
     let scanner = Arc::new(HealthScanner::new(
-        config.bot.liquidatable_threshold,
-        config.bot.near_liq_threshold,
+        config.bot.liquidatable_threshold_bps,
+        config.bot.near_liq_threshold_bps,
     )?);
+    let sched = ScanScheduler::new(
+        config.bot.hot_scan_blocks,
+        config.bot.warm_scan_blocks,
+        config.bot.cold_scan_blocks,
+    );
 
     info!(
         borrower_count = borrowers.len(),
         market_count = adapter.markets.len(),
-        liquidatable_threshold = config.bot.liquidatable_threshold,
-        near_liq_threshold = config.bot.near_liq_threshold,
+        liquidatable_bps = config.bot.liquidatable_threshold_bps,
+        near_liq_bps = config.bot.near_liq_threshold_bps,
+        hot_blocks = sched.hot,
+        warm_blocks = sched.warm,
+        cold_blocks = sched.cold,
         "venus adapter + scanner ready"
     );
 
@@ -152,23 +162,51 @@ async fn run_listen(config: Config, borrowers: Vec<Address>) -> Result<()> {
 
     info!("listen: draining chain events (Ctrl-C to stop)");
 
-    // 3. Drain loop: on every new block, run one Venus scan.
+    // 3. Drain loop: on every new block, run one Venus scan scoped to the
+    //    buckets whose cadence fires this block. Seed list is used on the
+    //    very first block; thereafter the scheduler scans each bucket's
+    //    tracked borrowers on its own cadence.
+    let mut first_block = true;
     tokio::select! {
         _ = async {
             while let Some(event) = rx.recv().await {
                 match event {
                     ChainEvent::NewBlock { chain, number, timestamp } => {
                         let start = std::time::Instant::now();
-                        match adapter.fetch_positions(&borrowers).await {
+                        let scan_set: Vec<Address> = if first_block {
+                            first_block = false;
+                            borrowers.clone()
+                        } else {
+                            let mut v = Vec::new();
+                            for b in [
+                                PositionBucket::Liquidatable,
+                                PositionBucket::NearLiquidation,
+                                PositionBucket::Healthy,
+                            ] {
+                                if sched.should_scan(b, number) {
+                                    v.extend(scanner.borrowers_in_bucket(b));
+                                }
+                            }
+                            v
+                        };
+                        if scan_set.is_empty() {
+                            continue;
+                        }
+                        match adapter.fetch_positions(&scan_set).await {
                             Ok(positions) => {
                                 let returned = positions.len();
-                                scanner.upsert(positions);
+                                scanner.upsert(positions.clone());
+                                scanner.prune(&positions);
                                 let counts = scanner.bucket_counts();
+                                metrics::histogram!(
+                                    "charon_scanner_scan_duration_seconds"
+                                )
+                                .record(start.elapsed().as_secs_f64());
                                 info!(
                                     chain = %chain,
                                     block = number,
                                     timestamp = timestamp,
-                                    tracked = borrowers.len(),
+                                    tracked = scan_set.len(),
                                     returned,
                                     healthy = counts.healthy,
                                     near_liq = counts.near_liquidation,

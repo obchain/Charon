@@ -41,6 +41,9 @@ futures-util = "0.3"
 # Lock-free concurrent hashmap for scanner state
 dashmap = "6"
 
+# Prometheus-style metrics recorder facade
+metrics = "0.24"
+
 # CLI
 clap = { version = "4", features = ["derive"] }
 

@@ -13,3 +13,4 @@ tokio = { workspace = true }
 tracing = { workspace = true }
 futures-util = { workspace = true }
 dashmap = { workspace = true }
+metrics = { workspace = true }
