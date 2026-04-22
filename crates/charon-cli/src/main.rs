@@ -150,14 +150,13 @@ async fn run_listen(config: Config, borrowers: Vec<Address>) -> Result<()> {
         .protocol
         .get("venus")
         .context("protocol 'venus' not configured — required for v0.1")?;
-    let aave_cfg = config
-        .flashloan
-        .get("aave_v3_bsc")
-        .context("flashloan 'aave_v3_bsc' not configured — required for v0.1")?;
-    let liquidator_cfg = config
-        .liquidator
-        .get("bnb")
-        .context("liquidator 'bnb' not configured — required for v0.1")?;
+    // Flash-loan source + deployed liquidator are OPTIONAL — profiles
+    // targeting chains with no flash-loan venue (e.g. BSC testnet, where
+    // Aave V3 is not deployed) omit both, and the bot runs in
+    // read-only mode: listener + scanner + metrics stay live, but the
+    // opportunity-processing arm short-circuits.
+    let aave_cfg = config.flashloan.get("aave_v3_bsc");
+    let liquidator_cfg = config.liquidator.get("bnb");
 
     // Single shared pub-sub provider — adapter, price cache, flash-loan
     // adapter, and tx builder all hang off it. Cuts WS connection
@@ -190,55 +189,68 @@ async fn run_listen(config: Config, borrowers: Vec<Address>) -> Result<()> {
     }
 
     // ── Flash-loan router (#13) ──
-    // Liquidator address may be the placeholder zero — adapter still
-    // builds, but `executeOperation` on a zero-address receiver would
-    // never be reached because no broadcast happens here.
-    let aave = Arc::new(
-        AaveFlashLoan::connect(
-            provider.clone(),
-            aave_cfg.pool,
-            liquidator_cfg.contract_address,
-        )
-        .await?,
-    );
-    let router = Arc::new(FlashLoanRouter::new(vec![aave.clone()]));
-
-    // ── Tx builder + simulator (#14) ──
-    // Both gracefully degrade if `BOT_SIGNER_KEY` is unset — encoding
-    // and simulation can still run, but signing is skipped.
-    let tx_builder: Option<Arc<TxBuilder>> = match std::env::var("BOT_SIGNER_KEY") {
-        Ok(key) => match key.parse::<PrivateKeySigner>() {
-            Ok(signer) => {
-                let chain_id = adapter.chain_id;
-                info!(
-                    signer = %signer.address(),
-                    liquidator = %liquidator_cfg.contract_address,
-                    chain_id,
-                    "tx builder ready"
-                );
-                Some(Arc::new(TxBuilder::new(
-                    signer,
-                    chain_id,
-                    liquidator_cfg.contract_address,
-                )))
-            }
-            Err(err) => {
-                warn!(error = ?err, "BOT_SIGNER_KEY set but unparseable — tx builder disabled");
-                None
-            }
-        },
-        Err(_) => {
-            info!("BOT_SIGNER_KEY not set — pipeline runs read-only (no tx signing/sim)");
-            None
+    // Built only when both a flash-loan source AND a deployed
+    // liquidator are configured. Connecting the Aave adapter hits the
+    // pool's `FLASHLOAN_PREMIUM_TOTAL()` view, so placeholder addresses
+    // aren't an option — omit the sections instead.
+    let (router, liquidator_address): (Option<Arc<FlashLoanRouter>>, Option<Address>) = match (
+        aave_cfg,
+        liquidator_cfg,
+    ) {
+        (Some(aave), Some(liq)) => {
+            let adapter =
+                AaveFlashLoan::connect(provider.clone(), aave.pool, liq.contract_address).await?;
+            (
+                Some(Arc::new(FlashLoanRouter::new(vec![Arc::new(adapter)]))),
+                Some(liq.contract_address),
+            )
+        }
+        _ => {
+            info!(
+                aave_configured = aave_cfg.is_some(),
+                liquidator_configured = liquidator_cfg.is_some(),
+                "flashloan / liquidator not fully configured — opportunity path disabled (scanner + metrics still active)"
+            );
+            (None, None)
         }
     };
 
-    let simulator = tx_builder.as_ref().map(|b| {
-        Arc::new(Simulator::new(
-            b.signer_address(),
-            liquidator_cfg.contract_address,
-        ))
-    });
+    // ── Tx builder + simulator (#14) ──
+    // Requires a signer key AND a known liquidator address. If either
+    // is missing the pipeline runs read-only — encoding and simulation
+    // are both skipped.
+    let tx_builder: Option<Arc<TxBuilder>> =
+        match (liquidator_address, std::env::var("BOT_SIGNER_KEY")) {
+            (Some(liq_addr), Ok(key)) => match key.parse::<PrivateKeySigner>() {
+                Ok(signer) => {
+                    let chain_id = adapter.chain_id;
+                    info!(
+                        signer = %signer.address(),
+                        liquidator = %liq_addr,
+                        chain_id,
+                        "tx builder ready"
+                    );
+                    Some(Arc::new(TxBuilder::new(signer, chain_id, liq_addr)))
+                }
+                Err(err) => {
+                    warn!(error = ?err, "BOT_SIGNER_KEY set but unparseable — tx builder disabled");
+                    None
+                }
+            },
+            (None, _) => {
+                info!("liquidator not configured — tx builder disabled");
+                None
+            }
+            (Some(_), Err(_)) => {
+                info!("BOT_SIGNER_KEY not set — pipeline runs read-only (no tx signing/sim)");
+                None
+            }
+        };
+
+    let simulator = tx_builder
+        .as_ref()
+        .zip(liquidator_address)
+        .map(|(b, liq_addr)| Arc::new(Simulator::new(b.signer_address(), liq_addr)));
 
     // ── Profit-ordered queue ──
     let queue = Arc::new(tokio::sync::Mutex::new(OpportunityQueue::with_default_ttl()));
@@ -248,7 +260,7 @@ async fn run_listen(config: Config, borrowers: Vec<Address>) -> Result<()> {
         market_count = adapter.markets.len(),
         liquidatable_threshold = config.bot.liquidatable_threshold,
         near_liq_threshold = config.bot.near_liq_threshold,
-        flash_sources = router.providers().len(),
+        flash_sources = router.as_deref().map(|r| r.providers().len()).unwrap_or(0),
         signer_present = tx_builder.is_some(),
         "pipeline ready (scan-only, no broadcast)"
     );
@@ -308,7 +320,7 @@ async fn process_block(
     borrowers: &[Address],
     adapter: Arc<VenusAdapter>,
     scanner: Arc<HealthScanner>,
-    router: Arc<FlashLoanRouter>,
+    router: Option<Arc<FlashLoanRouter>>,
     tx_builder: Option<Arc<TxBuilder>>,
     simulator: Option<Arc<Simulator>>,
     queue: Arc<tokio::sync::Mutex<OpportunityQueue>>,
@@ -337,28 +349,33 @@ async fn process_block(
     charon_metrics::set_position_bucket(&chain, bucket::LIQUIDATABLE, counts.liquidatable as u64);
 
     // 3. Per-liquidatable: route flash loan, calc profit, build, simulate, queue.
+    //    Skipped entirely when the router is absent (read-only / testnet
+    //    mode) — scanner + metrics still run so the operator can watch
+    //    position health evolve without a flash-loan venue.
     let liquidatable = scanner.liquidatable();
     let mut queued = 0usize;
-    for pos in liquidatable {
-        match process_opportunity(
-            &chain,
-            &pos,
-            adapter.as_ref(),
-            router.as_ref(),
-            tx_builder.as_deref(),
-            simulator.as_deref(),
-            provider.as_ref(),
-            min_profit_usd,
-            block,
-            queue.clone(),
-        )
-        .await
-        {
-            Ok(true) => queued += 1,
-            Ok(false) => {}
-            Err(err) => {
-                charon_metrics::record_opportunity_dropped(&chain, drop_stage::BUILD);
-                debug!(borrower = %pos.borrower, error = ?err, "opportunity dropped");
+    if let Some(router) = router.as_deref() {
+        for pos in liquidatable {
+            match process_opportunity(
+                &chain,
+                &pos,
+                adapter.as_ref(),
+                router,
+                tx_builder.as_deref(),
+                simulator.as_deref(),
+                provider.as_ref(),
+                min_profit_usd,
+                block,
+                queue.clone(),
+            )
+            .await
+            {
+                Ok(true) => queued += 1,
+                Ok(false) => {}
+                Err(err) => {
+                    charon_metrics::record_opportunity_dropped(&chain, drop_stage::BUILD);
+                    debug!(borrower = %pos.borrower, error = ?err, "opportunity dropped");
+                }
             }
         }
     }

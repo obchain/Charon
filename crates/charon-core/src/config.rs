@@ -22,8 +22,17 @@ pub struct Config {
     /// Lending protocols keyed by short name (e.g. `"venus"`).
     pub protocol: HashMap<String, ProtocolConfig>,
     /// Flash-loan sources keyed by short name (e.g. `"aave_v3_bsc"`).
+    /// Optional so profiles targeting chains without a deployed
+    /// flash-loan venue (e.g. BSC testnet / Chapel, where Aave V3 is
+    /// not live) can omit the section entirely. Missing map ⇒ bot runs
+    /// read-only: block listener + scanner populate, but the executor
+    /// path short-circuits because no opportunity can be routed.
+    #[serde(default)]
     pub flashloan: HashMap<String, FlashLoanConfig>,
-    /// Deployed liquidator contracts keyed by chain name.
+    /// Deployed liquidator contracts keyed by chain name. Optional for
+    /// the same reason as `flashloan` — testnet profiles have no
+    /// liquidator deployed yet.
+    #[serde(default)]
     pub liquidator: HashMap<String, LiquidatorConfig>,
     /// Chainlink feed addresses per chain, keyed by asset symbol
     /// (e.g. `chainlink.bnb.BNB = "0x…"`). Missing key = no feed
