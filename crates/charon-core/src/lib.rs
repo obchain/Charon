@@ -4,7 +4,7 @@ pub mod config;
 pub mod traits;
 pub mod types;
 
-pub use config::Config;
+pub use config::{Config, ConfigError};
 pub use traits::LendingProtocol;
 pub use types::{
     FlashLoanSource, LiquidationOpportunity, LiquidationParams, Position,
