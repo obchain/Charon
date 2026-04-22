@@ -5,12 +5,16 @@
 
 use alloy::primitives::{Address, U256};
 use serde::{Deserialize, Serialize};
+use std::cmp::Ordering;
 
 /// Which lending protocol a position belongs to.
 ///
 /// Only `Venus` for v1. Additional variants are added as adapters are
-/// implemented (AaveV3, CompoundV3, Morpho, …).
+/// implemented (AaveV3, CompoundV3, Morpho, …). Marked `#[non_exhaustive]`
+/// so adding variants in future is not a semver-breaking change for
+/// downstream exhaustive matches.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[non_exhaustive]
 pub enum ProtocolId {
     Venus,
 }
@@ -22,56 +26,99 @@ pub enum ProtocolId {
 /// profitable it would be.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Position {
+    /// Which lending protocol produced this snapshot.
     pub protocol: ProtocolId,
+    /// EVM chain id (e.g. BSC mainnet = 56).
     pub chain_id: u64,
+    /// Borrower account whose health is being tracked.
     pub borrower: Address,
+    /// Collateral asset address in the underlying-token space (not vToken/aToken).
     pub collateral_token: Address,
+    /// Debt asset address in the underlying-token space.
     pub debt_token: Address,
+    /// Collateral balance in the underlying token's base units (wei-equivalent).
     pub collateral_amount: U256,
+    /// Outstanding debt in the debt token's base units (wei-equivalent).
     pub debt_amount: U256,
     /// Health factor scaled by 1e18 (Aave-style fixed point).
     /// `health_factor < 1e18` means the position is liquidatable.
     pub health_factor: U256,
     /// Liquidation bonus in basis points (e.g. 500 = 5%).
+    /// Sourced per-market from the protocol (Venus `liquidationIncentiveMantissa`,
+    /// Aave `LiquidationBonus`, etc.). Never hardcoded.
     pub liquidation_bonus_bps: u16,
 }
 
 /// Where the flash loan capital comes from for a liquidation.
 ///
-/// Router picks cheapest available: Balancer (0%) → Aave (0.05%) → Uniswap (pool fee).
+/// Router picks cheapest available. BSC sources only for v0.1.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub enum FlashLoanSource {
-    /// Balancer V2 Vault — 0% fee.
-    BalancerV2,
-    /// Aave V3 Pool — 0.05% fee via `flashLoanSimple`.
+    /// Aave V3 Pool on BSC — 0.05% fee via `flashLoanSimple`.
     AaveV3,
-    /// Uniswap V3 flash swap — pool fee tier applies.
-    UniswapV3,
+    /// PancakeSwap V3 flash-swap — pool fee tier applies (100 / 500 / 2500 / 10000 bps).
+    PancakeSwapV3,
 }
 
 /// A planned swap: seized collateral → debt token, used to repay the flash loan.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SwapRoute {
+    /// Token being sold (typically seized collateral).
     pub token_in: Address,
+    /// Token being bought (typically the flash-loaned debt token).
     pub token_out: Address,
+    /// Amount of `token_in` swapped, in its base units.
     pub amount_in: U256,
-    /// Slippage-protected minimum output. Tx reverts if DEX returns less.
+    /// Slippage-protected minimum output. Tx reverts if the DEX returns less.
     pub min_amount_out: U256,
-    /// Uniswap V3 pool fee tier (500 / 3000 / 10000). 0 = not applicable.
-    pub pool_fee: u32,
+    /// PancakeSwap V3 pool fee tier in hundredths of a bip (100 / 500 / 2500 / 10000).
+    /// `None` for fee-less routes (e.g. Balancer V2, Curve stable pool).
+    pub pool_fee: Option<u32>,
 }
 
 /// A profitable liquidation that has passed all off-chain gates and is
 /// ready to be built into a transaction.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[must_use]
 pub struct LiquidationOpportunity {
+    /// Underlying position being liquidated.
     pub position: Position,
-    /// How much of the debt to repay (Aave: up to 50%, Compound/Morpho: 100%).
+    /// How much of the debt to repay in debt-token base units
+    /// (Aave: up to 50%, Compound/Venus: up to close_factor × debt).
     pub debt_to_repay: U256,
-    /// Expected collateral seized after liquidation bonus.
+    /// Expected collateral seized after liquidation bonus, in collateral-token base units.
     pub expected_collateral_out: U256,
+    /// Flash-loan source selected by the router.
     pub flash_source: FlashLoanSource,
+    /// Pre-computed swap route for collateral → debt token.
     pub swap_route: SwapRoute,
-    /// Estimated net profit in USD cents, after gas + flash fee + slippage.
-    pub net_profit_usd_cents: u64,
+    /// Estimated net profit in debt-token base units (wei), after gas, flash fee,
+    /// and slippage. Token-native to avoid f64 / USD-cent precision loss; USD
+    /// display is a reporting-layer concern only.
+    pub net_profit_wei: U256,
 }
+
+impl Ord for LiquidationOpportunity {
+    /// Ranks opportunities by `net_profit_wei` ascending so that a
+    /// `BinaryHeap<LiquidationOpportunity>` pops the highest-profit entry first.
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.net_profit_wei.cmp(&other.net_profit_wei)
+    }
+}
+
+impl PartialOrd for LiquidationOpportunity {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl PartialEq for LiquidationOpportunity {
+    fn eq(&self, other: &Self) -> bool {
+        self.net_profit_wei == other.net_profit_wei
+            && self.position.borrower == other.position.borrower
+            && self.position.chain_id == other.position.chain_id
+    }
+}
+
+impl Eq for LiquidationOpportunity {}
