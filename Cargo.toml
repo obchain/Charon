@@ -37,6 +37,12 @@ async-trait = "0.1"
 # Stream adapters (StreamExt for subscription streams)
 futures-util = "0.3"
 
+# Backoff jitter
+rand = "0.8"
+
+# Prometheus-style metrics recorder facade
+metrics = "0.24"
+
 # CLI
 clap = { version = "4", features = ["derive"] }
 

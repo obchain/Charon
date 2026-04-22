@@ -99,14 +99,12 @@ async fn run_listen(config: Config) -> Result<()> {
     }
 
     let (tx, mut rx) = mpsc::channel::<ChainEvent>(CHAIN_EVENT_CHANNEL);
+    let mut listeners: tokio::task::JoinSet<(String, Result<()>)> =
+        tokio::task::JoinSet::new();
 
     for (name, chain_cfg) in config.chain {
         let listener = BlockListener::new(name.clone(), chain_cfg, tx.clone());
-        tokio::spawn(async move {
-            if let Err(err) = listener.run().await {
-                warn!(chain = %name, error = ?err, "listener terminated");
-            }
-        });
+        listeners.spawn(async move { (name, listener.run().await) });
     }
     // Drop our sender so the channel closes when every listener exits.
     drop(tx);
@@ -117,23 +115,52 @@ async fn run_listen(config: Config) -> Result<()> {
         _ = async {
             while let Some(event) = rx.recv().await {
                 match event {
-                    ChainEvent::NewBlock { chain, number, timestamp } => {
+                    ChainEvent::NewBlock { chain, number, timestamp, backfill } => {
                         tracing::debug!(
                             chain = %chain,
                             block = number,
                             timestamp = timestamp,
+                            backfill,
                             "cli drained event"
                         );
                     }
+                    _ => {}
                 }
             }
         } => {
             info!("all listeners exited");
         }
+        _ = supervise(&mut listeners) => {
+            info!("all listener tasks terminated");
+        }
         _ = tokio::signal::ctrl_c() => {
             info!("ctrl-c received, shutting down");
+            listeners.shutdown().await;
         }
     }
 
     Ok(())
+}
+
+/// Drain a `JoinSet` of listener tasks and surface panics / errors per chain.
+/// Returns when every listener has exited so the caller can shut down.
+async fn supervise(
+    listeners: &mut tokio::task::JoinSet<(String, Result<()>)>,
+) {
+    while let Some(joined) = listeners.join_next().await {
+        match joined {
+            Ok((name, Ok(()))) => {
+                info!(chain = %name, "listener exited cleanly");
+            }
+            Ok((name, Err(err))) => {
+                warn!(chain = %name, error = ?err, "listener terminated with error");
+            }
+            Err(err) if err.is_panic() => {
+                warn!(error = ?err, "listener panicked");
+            }
+            Err(err) => {
+                warn!(error = ?err, "listener join error");
+            }
+        }
+    }
 }
