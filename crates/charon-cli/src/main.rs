@@ -126,7 +126,7 @@ async fn run_listen(config: Config, borrowers: Vec<Address>) -> Result<()> {
 
     info!(
         borrower_count = borrowers.len(),
-        market_count = adapter.markets.len(),
+        market_count = adapter.markets().await.len(),
         "venus adapter ready"
     );
 
