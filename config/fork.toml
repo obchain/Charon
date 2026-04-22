@@ -1,0 +1,66 @@
+# Charon — local anvil fork profile (BSC mainnet state, local host).
+#
+# Pair with `scripts/anvil_fork.sh`. The fork process exposes HTTP+WS
+# on 127.0.0.1:8545 and mirrors every mainnet address the default
+# profile uses, so addresses here match `config/default.toml` exactly.
+#
+# Why a separate file instead of reusing `default.toml`:
+# - RPC URLs point at localhost, not production endpoints.
+# - `private_rpc_url` is left empty — no private relay for a local
+#   fork; the local anvil IS the submission surface.
+# - `min_profit_usd` is lowered so synthetic / partial positions the
+#   operator stages manually aren't filtered out during demos.
+
+[bot]
+# Lower gate for demo staging — real ops should use default.toml.
+min_profit_usd         = 0.01
+max_gas_gwei           = 20
+scan_interval_ms       = 1000
+liquidatable_threshold = 1.0
+near_liq_threshold     = 1.05
+
+# ── Chains ────────────────────────────────────────────────────────────────
+[chain.bnb]
+# BSC mainnet chain id preserved by `anvil --chain-id 56`. Signed
+# transactions remain valid across operator/fork boundaries as long as
+# this matches what the script passes.
+chain_id          = 56
+ws_url            = "ws://127.0.0.1:8545"
+http_url          = "http://127.0.0.1:8545"
+priority_fee_gwei = 1
+# No private relay on a local fork.
+# private_rpc_url   = ""
+
+# ── Lending protocols ─────────────────────────────────────────────────────
+[protocol.venus]
+chain       = "bnb"
+comptroller = "0xfd36e2c2a6789db23113685031d7f16329158384"
+
+# ── Flash-loan sources ────────────────────────────────────────────────────
+# Aave V3 IS on BSC mainnet, so the fork inherits a real pool.
+[flashloan.aave_v3_bsc]
+chain = "bnb"
+pool  = "0x6807dc923806fe8fd134338eabca509979a7e0cb"
+
+# ── Deployed liquidator contracts ─────────────────────────────────────────
+# Fork demo can run read-only (no liquidator deployed); once the
+# operator deploys `CharonLiquidator.sol` into the fork via forge,
+# replace the zero with the deployed address to exercise the
+# full route.
+[liquidator.bnb]
+chain            = "bnb"
+contract_address = "0x0000000000000000000000000000000000000000"
+
+# ── Prometheus metrics exporter ───────────────────────────────────────────
+[metrics]
+enabled = true
+bind    = "0.0.0.0:9091"
+
+# ── Chainlink price feeds (per chain, per asset symbol) ───────────────────
+# Mainnet feed addresses resolve against the fork.
+[chainlink.bnb]
+BNB  = "0x0567F2323251f0Aab15c8dFb1967E4e8A7D42aeE"
+BTCB = "0x264990fbd0A4796A3E3d8E37C4d5F87a3aCa5Ebf"
+ETH  = "0x9ef1B8c0E4F7dc8bF5719Ea496883DC6401d5b2e"
+USDT = "0xB97Ad0E74fa7d920791E90258A6E2085088b4320"
+USDC = "0x51597f405303C4377E36123cBc172b13269EA163"

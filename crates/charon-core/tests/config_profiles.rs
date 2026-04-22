@@ -47,6 +47,23 @@ fn default_profile_parses() {
 }
 
 #[test]
+fn fork_profile_parses_and_targets_localhost() {
+    // No env substitution needed — the fork profile hard-codes localhost.
+    let path = workspace_root().join("config/fork.toml");
+    let cfg = Config::load(&path).expect("fork.toml should parse");
+
+    assert_eq!(cfg.chain["bnb"].chain_id, 56);
+    assert!(
+        cfg.chain["bnb"].ws_url.starts_with("ws://127.0.0.1"),
+        "fork profile must point at the local anvil instance"
+    );
+    assert!(
+        cfg.flashloan.contains_key("aave_v3_bsc"),
+        "fork profile keeps Aave V3 — mainnet state inherited by the fork"
+    );
+}
+
+#[test]
 fn testnet_profile_parses_and_omits_flashloan() {
     set_env(&[
         ("BNB_TESTNET_WS_URL", "wss://example/chapel"),
