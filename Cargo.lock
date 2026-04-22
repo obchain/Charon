@@ -1152,6 +1152,7 @@ version = "0.1.0"
 dependencies = [
  "alloy",
  "anyhow",
+ "async-trait",
  "charon-core",
  "tokio",
  "tracing",

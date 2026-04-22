@@ -9,5 +9,6 @@ description = "Chain listener and health-factor scanner for Charon"
 charon-core = { workspace = true }
 alloy = { workspace = true }
 anyhow = { workspace = true }
+async-trait = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }

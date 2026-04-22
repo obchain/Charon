@@ -2,4 +2,4 @@
 
 pub mod provider;
 
-pub use provider::ChainProvider;
+pub use provider::{ChainProvider, ChainProviderT, MockChainProvider};
