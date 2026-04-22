@@ -1,0 +1,49 @@
+# Charon — BSC testnet (Chapel, chainId 97) profile.
+#
+# Purpose: run the scanner + Prometheus exporter against a live but
+# non-production chain so the Grafana demo can show real block activity
+# without touching mainnet keys or capital.
+#
+# Scope caveat — flash-loan and liquidator sections are intentionally
+# OMITTED. Aave V3 is NOT deployed on BSC testnet, so there is no
+# flash-loan venue for Charon to route through; omitting the sections
+# makes the bot run read-only on this profile (listener + scanner +
+# metrics active; opportunity-processing arm short-circuits).
+#
+# Environment variables below (dollar-sign + braces) are substituted at
+# load time — see `.env.example` for the full list of expected vars.
+
+[bot]
+# Low threshold so any testnet-scale opportunity can cross the gate.
+min_profit_usd         = 0.01
+max_gas_gwei           = 20
+scan_interval_ms       = 1000
+liquidatable_threshold = 1.0
+near_liq_threshold     = 1.05
+
+# ── Chains ────────────────────────────────────────────────────────────────
+[chain.bnb]
+chain_id          = 97
+ws_url            = "${BNB_TESTNET_WS_URL}"
+http_url          = "${BNB_TESTNET_HTTP_URL}"
+priority_fee_gwei = 1
+# No private RPC on testnet — leave unset.
+# private_rpc_url   = ""
+
+# ── Lending protocols ─────────────────────────────────────────────────────
+[protocol.venus]
+chain = "bnb"
+# Venus Unitroller on Chapel (Core Pool comptroller proxy).
+# Source: github.com/VenusProtocol/venus-protocol/deployments/bsctestnet
+comptroller = "0x94d1820b2D1c7c7452A163983Dc888CEC546b77D"
+
+# ── Prometheus metrics exporter ───────────────────────────────────────────
+[metrics]
+enabled = true
+bind    = "0.0.0.0:9091"
+
+# ── Chainlink price feeds (per chain, per asset symbol) ───────────────────
+# Chainlink has a limited feed set on BSC testnet; leave empty to fall
+# back to Venus's ResilientOracle for the demo. Populate once a
+# testnet-specific feed map is needed.
+[chainlink.bnb]
