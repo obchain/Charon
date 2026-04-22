@@ -10,6 +10,7 @@ use alloy::primitives::Address;
 use anyhow::{Context, anyhow};
 use serde::Deserialize;
 use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::path::Path;
 
 /// Top-level Charon config loaded from `config/default.toml`.
@@ -29,6 +30,41 @@ pub struct Config {
     /// configured, scanner falls back to protocol oracle.
     #[serde(default)]
     pub chainlink: HashMap<String, HashMap<String, Address>>,
+    /// Prometheus exporter configuration. Missing `[metrics]` block ⇒
+    /// defaults from [`MetricsConfig::default`] (enabled, port 9091).
+    #[serde(default)]
+    pub metrics: MetricsConfig,
+}
+
+/// Prometheus exporter configuration.
+#[derive(Debug, Clone, Deserialize)]
+pub struct MetricsConfig {
+    /// Start the exporter at bot startup. Set to `false` to run charon
+    /// with zero metrics overhead (e.g. one-shot debug runs).
+    #[serde(default = "default_metrics_enabled")]
+    pub enabled: bool,
+    /// Bind address for the `/metrics` HTTP listener. `0.0.0.0:9091`
+    /// keeps it off the Prometheus-server default port (`9090`) so a
+    /// local compose stack doesn't collide.
+    #[serde(default = "default_metrics_bind")]
+    pub bind: SocketAddr,
+}
+
+impl Default for MetricsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_metrics_enabled(),
+            bind: default_metrics_bind(),
+        }
+    }
+}
+
+fn default_metrics_enabled() -> bool {
+    true
+}
+
+fn default_metrics_bind() -> SocketAddr {
+    "0.0.0.0:9091".parse().expect("valid default metrics bind")
 }
 
 /// Bot-level knobs — thresholds and intervals.

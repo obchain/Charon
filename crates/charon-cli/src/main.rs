@@ -19,6 +19,7 @@ use charon_core::{
 };
 use charon_executor::{Simulator, TxBuilder};
 use charon_flashloan::{AaveFlashLoan, FlashLoanRouter};
+use charon_metrics::{bucket, drop_stage, sim_result};
 use charon_protocols::VenusAdapter;
 use charon_scanner::{
     BlockListener, ChainEvent, ChainProvider, DEFAULT_MAX_AGE, HealthScanner, PriceCache,
@@ -102,6 +103,20 @@ async fn main() -> Result<()> {
         min_profit_usd = config.bot.min_profit_usd,
         "config loaded"
     );
+
+    // Prometheus exporter — install the global recorder before any
+    // subsystem records a metric. Disabled by the operator via
+    // `[metrics] enabled = false` turns the bot into a zero-overhead
+    // one-shot, which is handy for `test-connection` smoke runs.
+    if config.metrics.enabled {
+        charon_metrics::init(config.metrics.bind).await?;
+        charon_metrics::set_build_info(
+            env!("CARGO_PKG_VERSION"),
+            option_env!("CHARON_GIT_SHA").unwrap_or("unknown"),
+        );
+    } else {
+        info!("metrics disabled via config");
+    }
 
     match cli.command {
         Command::Listen { borrowers } => run_listen(config, borrowers).await?,
@@ -302,6 +317,8 @@ async fn process_block(
 ) {
     let start = std::time::Instant::now();
 
+    charon_metrics::record_block_scanned(&chain);
+
     // 1. Adapter — fetch raw positions for the tracked borrower list.
     let positions = match adapter.fetch_positions(borrowers).await {
         Ok(p) => p,
@@ -315,11 +332,16 @@ async fn process_block(
     scanner.upsert(positions);
     let counts = scanner.bucket_counts();
 
+    charon_metrics::set_position_bucket(&chain, bucket::HEALTHY, counts.healthy as u64);
+    charon_metrics::set_position_bucket(&chain, bucket::NEAR_LIQ, counts.near_liquidation as u64);
+    charon_metrics::set_position_bucket(&chain, bucket::LIQUIDATABLE, counts.liquidatable as u64);
+
     // 3. Per-liquidatable: route flash loan, calc profit, build, simulate, queue.
     let liquidatable = scanner.liquidatable();
     let mut queued = 0usize;
     for pos in liquidatable {
         match process_opportunity(
+            &chain,
             &pos,
             adapter.as_ref(),
             router.as_ref(),
@@ -334,7 +356,10 @@ async fn process_block(
         {
             Ok(true) => queued += 1,
             Ok(false) => {}
-            Err(err) => debug!(borrower = %pos.borrower, error = ?err, "opportunity dropped"),
+            Err(err) => {
+                charon_metrics::record_opportunity_dropped(&chain, drop_stage::BUILD);
+                debug!(borrower = %pos.borrower, error = ?err, "opportunity dropped");
+            }
         }
     }
 
@@ -342,6 +367,9 @@ async fn process_block(
     let q = queue.lock().await;
     let queue_len = q.len();
     drop(q);
+
+    charon_metrics::set_queue_depth(queue_len as u64);
+    charon_metrics::observe_block_duration(&chain, start.elapsed().as_secs_f64());
 
     info!(
         chain = %chain,
@@ -364,6 +392,7 @@ async fn process_block(
 /// failures.
 #[allow(clippy::too_many_arguments)]
 async fn process_opportunity(
+    chain: &str,
     pos: &charon_core::Position,
     adapter: &VenusAdapter,
     router: &FlashLoanRouter,
@@ -381,6 +410,7 @@ async fn process_opportunity(
 
     // b. Router: pick cheapest flash-loan source.
     let Some(quote) = router.route(pos.debt_token, repay).await else {
+        charon_metrics::record_opportunity_dropped(chain, drop_stage::ROUTER);
         return Ok(false);
     };
 
@@ -400,6 +430,7 @@ async fn process_opportunity(
     let net = match calculate_profit(&profit_inputs, min_profit_usd) {
         Ok(n) => n,
         Err(err) => {
+            charon_metrics::record_opportunity_dropped(chain, drop_stage::PROFIT);
             debug!(borrower = %pos.borrower, error = ?err, "profit gate dropped");
             return Ok(false);
         }
@@ -429,15 +460,22 @@ async fn process_opportunity(
     //    alone so dry-runs still surface ranked candidates.
     if let (Some(builder), Some(sim)) = (tx_builder, simulator) {
         let calldata = builder.encode_calldata(&opp, &params)?;
-        if let Err(err) = sim.simulate(provider, calldata).await {
-            debug!(borrower = %pos.borrower, error = ?err, "simulation gate dropped");
-            return Ok(false);
+        match sim.simulate(provider, calldata).await {
+            Ok(()) => charon_metrics::record_simulation(chain, sim_result::OK),
+            Err(err) => {
+                charon_metrics::record_simulation(chain, sim_result::REVERT);
+                charon_metrics::record_opportunity_dropped(chain, drop_stage::SIMULATION);
+                debug!(borrower = %pos.borrower, error = ?err, "simulation gate dropped");
+                return Ok(false);
+            }
         }
     }
 
     // f. Push to the profit-ordered queue.
+    let profit_cents = opp.net_profit_usd_cents;
     let mut q = queue.lock().await;
     q.push(opp, queued_at_block);
+    charon_metrics::record_opportunity_queued(chain, profit_cents);
     Ok(true)
 }
 

@@ -45,6 +45,13 @@ chain            = "bnb"
 # Placeholder — replaced once CharonLiquidator.sol is deployed on BSC.
 contract_address = "0x0000000000000000000000000000000000000000"
 
+# ── Prometheus metrics exporter ───────────────────────────────────────────
+# Exposes `/metrics` in Prometheus text format for Grafana / Grafana
+# Cloud scraping. Port 9091 avoids the Prometheus-server default (9090).
+[metrics]
+enabled = true
+bind    = "0.0.0.0:9091"
+
 # ── Chainlink price feeds (per chain, per asset symbol) ───────────────────
 # Only feeds listed here are polled by the PriceCache. Add more as new
 # Venus markets become relevant. Feed addresses from docs.chain.link.

@@ -4,6 +4,7 @@ members = [
     "crates/charon-core",
     "crates/charon-executor",
     "crates/charon-flashloan",
+    "crates/charon-metrics",
     "crates/charon-protocols",
     "crates/charon-scanner",
     "crates/charon-cli",
@@ -53,5 +54,6 @@ dotenvy = "0.15"
 charon-core = { path = "crates/charon-core" }
 charon-executor = { path = "crates/charon-executor" }
 charon-flashloan = { path = "crates/charon-flashloan" }
+charon-metrics = { path = "crates/charon-metrics" }
 charon-protocols = { path = "crates/charon-protocols" }
 charon-scanner = { path = "crates/charon-scanner" }
