@@ -20,3 +20,10 @@
 .claude/
 docs/context.md
 NOTES.md
+
+# Markdown policy: only README.md is ever pushed; everything else is local-only.
+*.md
+!README.md
+
+# Reference docs copied from backups — local-only, not pushed.
+docs/*.html
