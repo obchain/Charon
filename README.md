@@ -80,6 +80,16 @@ Key series (full list: [`crates/charon-metrics/src/lib.rs`](crates/charon-metric
 
 The exporter binds `:9091` (not `:9090`) so it doesn't collide with a co-located Prometheus server.
 
+### Grafana dashboard
+
+A ready-to-import dashboard lives at [`deploy/grafana/charon.json`](deploy/grafana/charon.json). Three steps to load it into Grafana or Grafana Cloud:
+
+1. Add a Prometheus data source that scrapes `http://<charon-host>:9091/metrics` (every ~10 s is fine).
+2. In Grafana, **Dashboards → New → Import → Upload JSON file** and pick the file above.
+3. On the import screen, select the Prometheus data source you created and click **Import**.
+
+Dashboard UID is `charon-v0` and tags are `charon`, `liquidation`, `defi` — re-importing over an existing copy replaces it rather than duplicating. Variables (`Chain`, `Instance`) auto-populate from label values once metrics start flowing.
+
 ## Repository layout
 
 ```
