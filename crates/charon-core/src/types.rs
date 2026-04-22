@@ -66,8 +66,14 @@ pub struct SwapRoute {
 /// Every lending protocol has its own quirks (Aave allows partial liquidation,
 /// Compound absorbs 100%, Venus uses vToken addresses, etc.). Each variant
 /// captures exactly the fields its protocol needs — no shared bag of options.
+///
+/// Marked `#[non_exhaustive]` at both enum and variant level so adding new
+/// variants (AaveV3, Compound, …) or new fields on existing variants is not
+/// a semver-breaking change for downstream exhaustive matches.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub enum LiquidationParams {
+    #[non_exhaustive]
     Venus {
         borrower: Address,
         /// vToken of the collateral asset (the token seized).
