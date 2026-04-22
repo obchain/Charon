@@ -1,0 +1,79 @@
+# Charon — single-host deploy target.
+#
+# Designed for a Hetzner CX22 (2 vCPU / 4 GB RAM / 40 GB disk) or
+# any equivalent box. Two services:
+#   - charon : the bot binary (Dockerfile at repo root)
+#   - alloy  : Grafana Alloy sidecar; scrapes charon:9091 locally and
+#              forwards the series to Grafana Cloud via remote_write
+#
+# We ship Alloy rather than a local Prometheus server because the
+# Grafana Cloud free tier is the intended visualisation surface; a
+# local Prom would just be another thing to tune on a 4 GB box.
+#
+# Usage:
+#   cp .env.example .env          # fill in RPC + Grafana Cloud creds
+#   docker compose up -d --build
+#
+# Secrets:
+#   `.env` is git-ignored and read by both services via `env_file`.
+#   Do not commit it. The `.env.example` in this directory is the
+#   canonical list of required variables.
+
+services:
+  charon:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    image: charon:local
+    restart: unless-stopped
+    env_file:
+      - ./.env
+    volumes:
+      # Config is read-only from the host so rotating a profile
+      # (mainnet → testnet → fork) doesn't require an image rebuild.
+      - ../../config:/app/config:ro
+    networks:
+      - charon_net
+    # `:9091` stays on the internal compose network. Alloy talks to it
+    # by DNS name, so the metrics endpoint never hits the public
+    # internet — one less public-facing port on the Hetzner box.
+    expose:
+      - "9091"
+    # Keep the container from hogging a 4 GB box if the bot spins;
+    # these limits match typical steady-state plus headroom.
+    deploy:
+      resources:
+        limits:
+          cpus: "1.5"
+          memory: 1G
+
+  alloy:
+    image: grafana/alloy:v1.4.3
+    restart: unless-stopped
+    # `run` subcommand and the default server port (12345) are enough
+    # for a scrape + remote_write topology; we don't expose the UI.
+    command:
+      - "run"
+      - "--server.http.listen-addr=0.0.0.0:12345"
+      - "--storage.path=/var/lib/alloy/data"
+      - "/etc/alloy/config.alloy"
+    env_file:
+      - ./.env
+    volumes:
+      - ./alloy-config.alloy:/etc/alloy/config.alloy:ro
+      - alloy_data:/var/lib/alloy/data
+    networks:
+      - charon_net
+    depends_on:
+      - charon
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 256M
+
+networks:
+  charon_net: {}
+
+volumes:
+  alloy_data: {}
