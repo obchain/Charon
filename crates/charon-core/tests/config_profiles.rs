@@ -1,6 +1,15 @@
 //! Profile smoke-tests: every shipped `config/*.toml` must parse
 //! cleanly once its referenced environment variables are populated.
 //!
+//! These tests are pure deserialization — they exercise only
+//! `Config::load` (TOML parse + `${ENV_VAR}` substitution + struct
+//! validation) and never open a socket, never construct a
+//! `ChainProvider`, and never call any RPC method. That is a hard
+//! invariant so `cargo test --workspace` stays green on clean CI
+//! checkouts that have no live Chapel/BSC endpoint (see #258). Any
+//! test that would touch live IO belongs behind `#[ignore]` with an
+//! env-var guard (e.g. `CHARON_INTEGRATION_TEST=1`), not here.
+//!
 //! Env vars are set inside the test process via `std::env::set_var`,
 //! which is `unsafe` under Rust 2024 — the safety contract ("no other
 //! thread is reading env at the same time") holds because `cargo test`
