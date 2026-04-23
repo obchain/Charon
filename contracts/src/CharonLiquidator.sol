@@ -6,6 +6,7 @@ import { IAaveV3Pool } from "./interfaces/IAaveV3Pool.sol";
 import { IVToken } from "./interfaces/IVToken.sol";
 import { ISwapRouter } from "./interfaces/ISwapRouter.sol";
 import { IERC20 } from "./interfaces/IERC20.sol";
+import { IWETH } from "./interfaces/IWETH.sol";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // CharonLiquidator — multi-chain flash-loan liquidation engine, v0.1
@@ -17,6 +18,7 @@ import { IERC20 } from "./interfaces/IERC20.sol";
 //        a. Approve Venus vToken to spend the debt asset.
 //        b. Call vToken.liquidateBorrow() — repay debt, seize collateral vTokens.
 //        c. Call vToken.redeem() — convert ALL seized vTokens to underlying.
+//           Special case: vBNB returns native BNB, which we wrap into WBNB.
 //        d. Swap collateral → debt asset via PancakeSwap V3.
 //        e. Sweep profit to the COLD wallet — hot wallet (owner) holds gas only.
 //        f. Approve Aave for repayment (amount + premium); Aave pulls it after return.
@@ -50,6 +52,22 @@ contract CharonLiquidator is IFlashLoanSimpleReceiver {
 
     /// @dev ProtocolId::Venus = 3 in the Rust enum (0-indexed: Aave=0, Compound=1, ...).
     uint8 internal constant PROTOCOL_VENUS = 3;
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // BNB Chain canonical addresses — hard-coded for the v0.1 BSC-only scope.
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// @notice Venus vBNB market — the only vToken whose underlying is native BNB.
+    ///         Venus `redeem()` on this market transfers native BNB to msg.sender
+    ///         rather than calling `IERC20.transfer`, so the standard ERC-20
+    ///         balance read used for every other vToken returns zero here.
+    ///         Mainnet: https://bscscan.com/address/0xA07c5b74C9B40447a954e1466938b865b6BBea36
+    address internal constant VBNB = 0xA07c5b74C9B40447a954e1466938b865b6BBea36;
+
+    /// @notice Canonical Wrapped BNB (WBNB). PancakeSwap V3 pools are quoted in WBNB,
+    ///         so any vBNB-seized position must be wrapped before the swap leg.
+    ///         Mainnet: https://bscscan.com/address/0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c
+    address internal constant WBNB = 0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c;
 
     // ─────────────────────────────────────────────────────────────────────────
     // Reentrancy guard — simple two-state lock.
@@ -97,7 +115,9 @@ contract CharonLiquidator is IFlashLoanSimpleReceiver {
         address borrower;
         /// @dev Underlying ERC-20 token that the borrower owes (e.g., USDT).
         address debtToken;
-        /// @dev Underlying ERC-20 token posted as collateral (e.g., BNB/WBNB).
+        /// @dev Underlying ERC-20 token posted as collateral (e.g., WBNB for vBNB).
+        ///      For the vBNB path this MUST be WBNB — the contract wraps the
+        ///      native BNB returned by Venus into WBNB before the swap.
         address collateralToken;
         /// @dev Venus vToken representing the debt side (e.g., vUSDT).
         address debtVToken;
@@ -208,6 +228,13 @@ contract CharonLiquidator is IFlashLoanSimpleReceiver {
         require(params.debtVToken != address(0), "!debtVToken");
         require(params.collateralVToken != address(0), "!collateralVToken");
         require(params.repayAmount > 0, "!repayAmount");
+        // On the vBNB path the underlying returned by Venus is native BNB, which
+        // the contract wraps into WBNB before swapping. Enforce that the caller
+        // declared WBNB as collateralToken so the swap leg routes through a real
+        // pool and post-swap balance checks read the correct token.
+        if (params.collateralVToken == VBNB) {
+            require(params.collateralToken == WBNB, "vBNB requires WBNB");
+        }
 
         // ── Encode params and request the flash loan ──────────────────────────
         // Aave forwards `encoded` verbatim to executeOperation as the `data`
@@ -242,6 +269,7 @@ contract CharonLiquidator is IFlashLoanSimpleReceiver {
     ///        c. Approve debtVToken and call liquidateBorrow on Venus.
     ///        d. Zero out debtVToken approval (consumed).
     ///        e. Redeem all seized collateral vTokens for underlying.
+    ///           If the seized vToken is vBNB, wrap the returned native BNB into WBNB.
     ///        f. Swap collateral underlying → debt token via PancakeSwap V3.
     ///        g. Zero out SwapRouter approval (consumed).
     ///        h. Verify post-swap balance covers totalOwed.
@@ -312,8 +340,20 @@ contract CharonLiquidator is IFlashLoanSimpleReceiver {
         uint256 redeemErr = IVToken(p.collateralVToken).redeem(vBal);
         require(redeemErr == 0, "venus redeem failed");
 
+        // vBNB returns NATIVE BNB, not an ERC-20. Wrap the full native balance
+        // into WBNB so the swap leg can treat it uniformly with every other
+        // vToken underlying. Reading IERC20(vBNB-underlying).balanceOf would
+        // return zero and the swap would revert. Wrapping before the balance
+        // read ensures `collateralBal` picks up the full seized amount.
+        if (p.collateralVToken == VBNB) {
+            uint256 nativeBal = address(this).balance;
+            require(nativeBal > 0, "no native BNB redeemed");
+            IWETH(WBNB).deposit{ value: nativeBal }();
+        }
+
         // ── Step 5: swap collateral underlying → debt token via PancakeSwap V3 ─
-        // Read the full collateral balance just redeemed; use it as exact amountIn.
+        // Read the full collateral balance just redeemed (or wrapped, for vBNB);
+        // use it as exact amountIn.
         uint256 collateralBal = IERC20(p.collateralToken).balanceOf(address(this));
 
         // Approve the router for the exact amount we are about to swap.
