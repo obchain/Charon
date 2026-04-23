@@ -397,4 +397,61 @@ contract CharonLiquidatorTest is Test {
         vm.expectRevert(bytes("!borrower"));
         liquidator.batchExecute(items);
     }
+
+    /// @dev Mid-batch atomicity: item[0] is fully valid (flashLoanSimple stubbed to
+    ///      no-op so the loop can advance), item[1].borrower == address(0). The
+    ///      inner require on item[1] must revert with "!borrower" and, because the
+    ///      revert is atomic, no state from item[0] — including a BatchExecuted
+    ///      emission — must survive.
+    ///
+    ///      This locks in the NatSpec guarantee that BatchExecuted is emitted only
+    ///      on full-batch success: a 2-item batch that reverts on item[1] must not
+    ///      emit it. `vm.recordLogs` captures every event emitted during the call;
+    ///      after the revert the VM keeps the recorder state, and a scan over the
+    ///      captured topics confirms the BatchExecuted signature never appeared.
+    function test_batchExecute_revertsOnSecondItemValidation() public {
+        CharonLiquidator.LiquidationParams[] memory items =
+            new CharonLiquidator.LiquidationParams[](2);
+
+        // item[0]: fully valid — would reach flashLoanSimple if the loop runs.
+        items[0] = _validParams();
+
+        // item[1]: invalid — zero borrower triggers "!borrower" on iteration 1.
+        items[1] = _validParams();
+        items[1].borrower = address(0);
+
+        // Stub STUB_POOL.flashLoanSimple so item[0]'s _initiateFlashLoan succeeds
+        // silently and the loop actually advances to item[1]. Without this stub
+        // the pool call would revert on EmptyCode and we could not distinguish
+        // "loop never advanced" from "validation on item[1] caught it".
+        bytes memory flashLoanSig = abi.encodeWithSignature(
+            "flashLoanSimple(address,address,uint256,bytes,uint16)",
+            address(liquidator),
+            items[0].debtToken,
+            items[0].repayAmount,
+            abi.encode(items[0]),
+            uint16(0)
+        );
+        vm.mockCall(STUB_POOL, flashLoanSig, abi.encode());
+
+        // Start event recording before the call. vm.recordLogs captures all logs
+        // emitted during the tx even if it ultimately reverts; combined with the
+        // expectRevert this lets us assert both "reverted with the right reason"
+        // and "no BatchExecuted snuck out before the revert point".
+        vm.recordLogs();
+
+        vm.expectRevert(bytes("!borrower"));
+        liquidator.batchExecute(items);
+
+        Vm.Log[] memory entries = vm.getRecordedLogs();
+        bytes32 batchExecutedSig = keccak256("BatchExecuted(uint256)");
+        for (uint256 i = 0; i < entries.length; i++) {
+            if (entries[i].topics.length > 0) {
+                assertTrue(
+                    entries[i].topics[0] != batchExecutedSig,
+                    "BatchExecuted must NOT be emitted on mid-batch revert"
+                );
+            }
+        }
+    }
 }

@@ -126,6 +126,10 @@ contract CharonLiquidator is IFlashLoanSimpleReceiver {
     event Rescued(address indexed token, address indexed to, uint256 amount);
 
     /// @notice Emitted at the end of a successful batchExecute call.
+    /// @dev Emitted only on full-batch success. If any item in the batch reverts,
+    ///      the entire transaction reverts atomically and this event is NOT emitted.
+    ///      Observers can therefore treat a BatchExecuted emission as proof that all
+    ///      `count` flash loans initiated by this call completed successfully.
     /// @param count The number of liquidations initiated in the batch.
     event BatchExecuted(uint256 count);
 
@@ -197,6 +201,14 @@ contract CharonLiquidator is IFlashLoanSimpleReceiver {
     /// @dev Called exclusively by the off-chain bot (owner). Iterates over `items` and
     ///      calls _initiateFlashLoan for each. A revert in any iteration reverts the
     ///      entire batch atomically — there is no partial execution.
+    ///
+    ///      **Atomicity contract.** Execution is EVM-atomic. If any item reverts — on
+    ///      input validation inside _initiateFlashLoan, on the Aave flashLoanSimple
+    ///      call, inside executeOperation's Venus / PancakeSwap path, or on the final
+    ///      Aave repayment pull — all prior items in the same batch are also reverted
+    ///      and no state change from this call survives. BatchExecuted is emitted only
+    ///      on full-batch success; observers must NOT treat the absence of a revert
+    ///      event as partial progress.
     ///
     ///      The nonReentrant guard is held for the full duration of the loop. Each
     ///      _initiateFlashLoan invocation calls Aave's flashLoanSimple, which re-enters
