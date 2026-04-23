@@ -32,12 +32,24 @@ import { IERC20 } from "../src/interfaces/IERC20.sol";
 ///           mock only has to succeed; post-swap balance comes from a
 ///           pre-seeded deal of the debt token.
 ///
-///         Fork block is unpinned (`vm.createSelectFork("bnb")`) so the
-///         suite runs against whatever head the operator's archive RPC
-///         exposes. Pinning can be reintroduced via `BSC_FORK_BLOCK`
-///         if reproducibility against a specific Aave state version
-///         becomes important.
+///         Fork block is pinned to `FORK_BLOCK` below — set to a BSC
+///         mainnet block taken on 2026-04-23 when every Aave V3 reserve
+///         and every Venus vToken in the suite is known-active. The
+///         pin makes CI deterministic: identical reserve state,
+///         identical vToken exchange rates, identical token balances
+///         across runs. Bump the constant in a dedicated, reviewed
+///         commit when refreshing against a newer on-chain state.
+///         `BSC_FORK_BLOCK` env var overrides for ad-hoc
+///         investigations without touching the source.
 contract CharonLiquidatorForkTest is Test {
+    // ─── Fork pin ─────────────────────────────────────────────────────────
+    // BSC mainnet block used by every fork test. Captured on 2026-04-23;
+    // Aave V3 reserves for USDT/USDC/BTCB/ETH and every referenced vToken
+    // are live at this height. Overridable at runtime via the
+    // `BSC_FORK_BLOCK` env var for ad-hoc debugging (see `setUp`). Bump
+    // in a dedicated commit when refreshing against newer on-chain state.
+    uint256 internal constant FORK_BLOCK = 94_000_000;
+
     // ─── BSC mainnet addresses ────────────────────────────────────────────
     // Aave V3 Pool proxy. Same address used in `config/default.toml`.
     address internal constant AAVE_V3_POOL = 0x6807dc923806fE8Fd134338EABCA509979a7e0cB;
@@ -138,7 +150,12 @@ contract CharonLiquidatorForkTest is Test {
 
     function setUp() public {
         // `bnb` is aliased to `${BNB_HTTP_URL}` in `contracts/foundry.toml`.
-        vm.createSelectFork("bnb");
+        // Fork pinned to `FORK_BLOCK` for deterministic state; operators
+        // can override per-invocation with `BSC_FORK_BLOCK=<number> forge
+        // test` when investigating a regression against a different
+        // height (no value = use the pin).
+        uint256 forkBlock = vm.envOr("BSC_FORK_BLOCK", FORK_BLOCK);
+        vm.createSelectFork("bnb", forkBlock);
 
         owner = address(this);
         borrower = makeAddr("borrower");
