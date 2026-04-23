@@ -1,15 +1,17 @@
 //! Prometheus-compatible metrics surface for Charon.
 //!
 //! The exporter listens on a configurable `SocketAddr` (default
-//! `0.0.0.0:9091`) and serves a `/metrics` endpoint in the Prometheus
-//! text format. All metric names are kept as `const &str` constants in
-//! [`names`] so call sites and dashboard JSON stay in lock-step with a
-//! single source of truth.
+//! `127.0.0.1:9091`, loopback-only; see `MetricsConfig` in
+//! `charon-core` for the validation rules that block non-loopback
+//! binds without a shared auth token) and serves a `/metrics`
+//! endpoint in the Prometheus text format. All metric names are kept
+//! as `const &str` constants in [`names`] so call sites and dashboard
+//! JSON stay in lock-step with a single source of truth.
 //!
 //! ```no_run
 //! use charon_metrics::{init, names, record_block_scanned};
 //! # async fn demo() -> anyhow::Result<()> {
-//! init("0.0.0.0:9091".parse()?).await?;
+//! init("127.0.0.1:9091".parse()?).await?;
 //! record_block_scanned("bnb");
 //! # Ok(())
 //! # }
