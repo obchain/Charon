@@ -43,18 +43,31 @@ chain = "bnb"
 pool  = "0x6807dc923806fe8fd134338eabca509979a7e0cb"
 
 # ── Deployed liquidator contracts ─────────────────────────────────────────
-# Fork demo can run read-only (no liquidator deployed); once the
-# operator deploys `CharonLiquidator.sol` into the fork via forge,
-# replace the zero with the deployed address to exercise the
-# full route.
-[liquidator.bnb]
-chain            = "bnb"
-contract_address = "0x0000000000000000000000000000000000000000"
+# Liquidator section intentionally omitted — no CharonLiquidator is
+# deployed on the fork by default. A placeholder address(0) here would
+# let the scanner produce opportunities that then fail inside TxBuilder
+# with an opaque encoding error the moment the executor tries to build
+# calldata (#252). Omission flips the CLI onto the read-only arm in
+# `run_listen` (scanner + metrics only), matching the pattern that
+# `config/testnet.toml` uses for Chapel.
+#
+# After running `forge create` against the local anvil, add a
+# `[liquidator.bnb]` section pointing at the deployed address to
+# exercise the full route:
+#
+#   [liquidator.bnb]
+#   chain            = "bnb"
+#   contract_address = "0x<forge-create-output>"
 
 # ── Prometheus metrics exporter ───────────────────────────────────────────
+# Loopback-only bind: the fork profile is a local-only demo surface,
+# the exporter has no auth, and operators routinely run the fork from a
+# laptop on public Wi-Fi. `0.0.0.0` would silently publish /metrics
+# (scanner state, wallet balances, gas oracle reads) to the LAN —
+# loopback is the only responsible default (#249, cross-ref #213).
 [metrics]
 enabled = true
-bind    = "0.0.0.0:9091"
+bind    = "127.0.0.1:9091"
 
 # ── Chainlink price feeds (per chain, per asset symbol) ───────────────────
 # Mainnet feed addresses resolve against the fork.
