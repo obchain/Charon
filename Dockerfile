@@ -4,7 +4,11 @@
 # `rust:1-slim` pairs with a slim Debian runtime below and keeps the
 # final image < 150 MB — well under Hetzner CX22's 40 GB disk budget
 # even after repeated rebuilds.
-FROM rust:1-slim AS builder
+#
+# Pinned by digest so a Docker Hub re-tag cannot silently swap the
+# toolchain, libc, or OpenSSL under a rebuild. Bump in a dedicated
+# commit when refreshing the base — never as a drive-by.
+FROM rust:1-slim@sha256:c03ea1587a8e4474ae1a3f4a377cbb35ad53d2eb5c27f0bdf1ca8986025e322f AS builder
 
 # Build-time TLS + pkg-config — alloy transitively links OpenSSL for
 # WS over TLS, and reqwest pulls pkg-config during build scripts.
@@ -34,8 +38,9 @@ RUN --mount=type=cache,target=/build/target \
 # `debian:bookworm-slim` because we need CA certificates and libssl3
 # for outbound TLS (WS RPC, Chainlink HTTP). Distroless is smaller but
 # drops the shell, which makes `docker compose exec` diagnostics harder
-# on a 4 GB Hetzner box.
-FROM debian:bookworm-slim AS runtime
+# on a 4 GB Hetzner box. Digest-pinned for the same reason as the
+# builder — predictable libssl3 ABI across rebuilds.
+FROM debian:bookworm-slim@sha256:f9c6a2fd2ddbc23e336b6257a5245e31f996953ef06cd13a59fa0a1df2d5c252 AS runtime
 
 RUN apt-get update \
     && apt-get install --no-install-recommends -y \
