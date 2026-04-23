@@ -209,6 +209,20 @@ async fn run_listen(config: Config, borrowers: Vec<Address>) -> Result<()> {
     )?);
 
     let price_feeds = config.chainlink.get(chain_key).cloned().unwrap_or_default();
+    // Empty feed map means the scanner will fall back to the
+    // protocol's own oracle for every price. On Chapel (and any
+    // chain whose Chainlink coverage is sparse) this can produce
+    // bucket classifications driven by synthetic or test-account-set
+    // prices — real liquidatable state is not guaranteed. Surface
+    // that loudly at startup so operators running the testnet demo
+    // see the caveat before wondering why the Liquidatable bucket
+    // stays empty (see #251).
+    if price_feeds.is_empty() {
+        warn!(
+            chain = %chain_key,
+            "no Chainlink feeds configured — bucket classification will be driven entirely by the protocol oracle (no independent price cross-check). On testnets this is typically synthetic; on mainnet this is almost always a misconfiguration and you should populate [chainlink.<chain>] with verified feed addresses before trusting liquidation signals"
+        );
+    }
     let prices = Arc::new(PriceCache::new(
         provider.clone(),
         price_feeds,
@@ -310,7 +324,16 @@ async fn run_listen(config: Config, borrowers: Vec<Address>) -> Result<()> {
     }
     drop(tx);
 
-    info!("listen: draining chain events (Ctrl-C to stop)");
+    info!("listen: draining chain events (SIGINT/SIGTERM to stop)");
+
+    // Cover both interactive (Ctrl-C → SIGINT) and container
+    // lifecycle (`docker stop`, `systemctl stop`, `kubectl delete
+    // pod` → SIGTERM) shutdown triggers. Without SIGTERM the Tokio
+    // runtime is torn down without draining open WS connections or
+    // flushing the Prometheus recorder, which is what happens in
+    // every Docker Compose stop on the Hetzner deploy (see #253).
+    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .context("listen: failed to install SIGTERM handler")?;
 
     tokio::select! {
         _ = async {
@@ -336,7 +359,8 @@ async fn run_listen(config: Config, borrowers: Vec<Address>) -> Result<()> {
                 }
             }
         } => info!("all listeners exited"),
-        _ = tokio::signal::ctrl_c() => info!("ctrl-c received, shutting down"),
+        _ = tokio::signal::ctrl_c() => info!("SIGINT received, shutting down"),
+        _ = sigterm.recv() => info!("SIGTERM received, shutting down"),
     }
 
     Ok(())
