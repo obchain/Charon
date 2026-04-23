@@ -79,6 +79,15 @@ fn default_metrics_bind() -> SocketAddr {
 /// Bot-level knobs — thresholds and intervals.
 #[derive(Debug, Clone, Deserialize)]
 pub struct BotConfig {
+    /// Key into `[chain.*]` naming the active chain for this profile
+    /// (e.g. `"bnb"` for mainnet, `"bnb_testnet"` for Chapel). The CLI
+    /// `listen` command resolves every chain-scoped lookup (RPC,
+    /// flashloan, liquidator, chainlink feeds) through this key so a
+    /// profile that uses a non-mainnet key does not panic on a
+    /// hard-coded `"bnb"` lookup. Defaults to `"bnb"` for backwards
+    /// compatibility with the v0.1 mainnet profile.
+    #[serde(default = "default_bot_chain")]
+    pub chain: String,
     /// Drop opportunities below this USD profit threshold.
     pub min_profit_usd: f64,
     /// Skip liquidations when gas price exceeds this (gwei).
@@ -95,6 +104,10 @@ pub struct BotConfig {
     /// the bot can fire immediately on the next adverse price move.
     #[serde(default = "default_near_liq_threshold")]
     pub near_liq_threshold: f64,
+}
+
+fn default_bot_chain() -> String {
+    "bnb".to_string()
 }
 
 fn default_liquidatable_threshold() -> f64 {
@@ -165,7 +178,175 @@ impl Config {
             .with_context(|| format!("env substitution failed for {}", path.display()))?;
         let config: Config = toml::from_str(&substituted)
             .with_context(|| format!("failed to parse TOML at {}", path.display()))?;
+        config
+            .validate()
+            .with_context(|| format!("invalid config at {}", path.display()))?;
         Ok(config)
+    }
+
+    /// Reject configurations whose liquidation path is half-wired.
+    ///
+    /// `flashloan` and `liquidator` are both `#[serde(default)]` so a
+    /// profile (e.g. testnet) can omit both and run in read-only mode.
+    /// A profile that supplies exactly one of the two is almost
+    /// always an accidental omission: the bot starts, every
+    /// opportunity silently short-circuits at the missing half, and
+    /// the operator sees no error. Fail fast at load time instead,
+    /// naming the offending chain so the mismatch is obvious.
+    ///
+    /// Symmetric: for every `flashloan` entry on chain X, require a
+    /// `liquidator` entry on chain X, and vice versa. All mismatches are
+    /// collected into a single error (sorted) rather than short-circuiting
+    /// on the first one, so an operator fixing a broken profile sees
+    /// every offending chain in one pass instead of running `charon` N
+    /// times to surface N problems.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        use std::collections::BTreeSet;
+        let fl_chains: BTreeSet<&str> =
+            self.flashloan.values().map(|f| f.chain.as_str()).collect();
+        let liq_chains: BTreeSet<&str> = self
+            .liquidator
+            .values()
+            .map(|l| l.chain.as_str())
+            .collect();
+
+        let fl_only: Vec<&str> = fl_chains.difference(&liq_chains).copied().collect();
+        let liq_only: Vec<&str> = liq_chains.difference(&fl_chains).copied().collect();
+
+        if fl_only.is_empty() && liq_only.is_empty() {
+            return Ok(());
+        }
+
+        let mut msg = String::from(
+            "half-wired liquidation path — every chain must supply both a \
+             [flashloan.*] entry and a [liquidator.*] entry, or neither \
+             (both omitted ⇒ read-only mode). Offending chains:\n",
+        );
+        for chain in &fl_only {
+            msg.push_str(&format!(
+                "  - '{chain}': has [flashloan.*] but no matching [liquidator.*] — \
+                 liquidation would be routed but never executed\n"
+            ));
+        }
+        for chain in &liq_only {
+            msg.push_str(&format!(
+                "  - '{chain}': has [liquidator.*] but no matching [flashloan.*] — \
+                 liquidation cannot execute without a flash-loan source\n"
+            ));
+        }
+        Err(anyhow!(msg))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloy::primitives::address;
+
+    fn bot() -> BotConfig {
+        BotConfig {
+            chain: "bnb".to_string(),
+            min_profit_usd: 5.0,
+            max_gas_gwei: 10,
+            scan_interval_ms: 1000,
+            liquidatable_threshold: 1.0,
+            near_liq_threshold: 1.05,
+        }
+    }
+
+    fn base_config() -> Config {
+        Config {
+            bot: bot(),
+            chain: HashMap::new(),
+            protocol: HashMap::new(),
+            flashloan: HashMap::new(),
+            liquidator: HashMap::new(),
+            chainlink: HashMap::new(),
+            metrics: MetricsConfig::default(),
+        }
+    }
+
+    fn fl(chain: &str) -> FlashLoanConfig {
+        FlashLoanConfig {
+            chain: chain.to_string(),
+            pool: address!("6807dc923806fe8fd134338eabca509979a7e0cb"),
+        }
+    }
+
+    fn liq(chain: &str) -> LiquidatorConfig {
+        LiquidatorConfig {
+            chain: chain.to_string(),
+            contract_address: address!("0000000000000000000000000000000000000001"),
+        }
+    }
+
+    #[test]
+    fn validate_passes_when_both_sides_empty() {
+        // Testnet profile: no flashloan, no liquidator ⇒ read-only OK.
+        base_config().validate().expect("fully-empty profile valid");
+    }
+
+    #[test]
+    fn validate_passes_when_both_sides_paired() {
+        let mut cfg = base_config();
+        cfg.flashloan.insert("aave_v3_bsc".into(), fl("bnb"));
+        cfg.liquidator.insert("bnb".into(), liq("bnb"));
+        cfg.validate().expect("paired profile valid");
+    }
+
+    #[test]
+    fn validate_passes_when_map_keys_differ_but_inner_chain_matches() {
+        // Map keys are labels; the inner `chain` field is what the
+        // pipeline pivots on. A profile keyed under arbitrary labels is
+        // still valid as long as the chain tags pair up.
+        let mut cfg = base_config();
+        cfg.flashloan.insert("primary_source".into(), fl("bnb"));
+        cfg.liquidator.insert("mainnet_liq".into(), liq("bnb"));
+        cfg.validate().expect("inner-chain match is sufficient");
+    }
+
+    #[test]
+    fn validate_rejects_flashloan_without_liquidator() {
+        let mut cfg = base_config();
+        cfg.flashloan.insert("aave_v3_bsc".into(), fl("bnb"));
+        let err = cfg.validate().expect_err("flashloan-only must fail");
+        let msg = format!("{err}");
+        assert!(msg.contains("'bnb'"), "error must name the chain: {msg}");
+        assert!(msg.contains("[flashloan.*]"), "error must cite flashloan: {msg}");
+    }
+
+    #[test]
+    fn validate_rejects_liquidator_without_flashloan() {
+        let mut cfg = base_config();
+        cfg.liquidator.insert("bnb".into(), liq("bnb"));
+        let err = cfg.validate().expect_err("liquidator-only must fail");
+        let msg = format!("{err}");
+        assert!(msg.contains("'bnb'"), "error must name the chain: {msg}");
+        assert!(msg.contains("[liquidator.*]"), "error must cite liquidator: {msg}");
+    }
+
+    #[test]
+    fn validate_reports_every_mismatched_chain_in_one_pass() {
+        // Two half-wired chains, one of each shape. Operator sees both
+        // without re-running charon.
+        let mut cfg = base_config();
+        cfg.flashloan.insert("src_a".into(), fl("bnb"));
+        cfg.liquidator.insert("liq_b".into(), liq("polygon"));
+        let err = cfg.validate().expect_err("two mismatches must fail");
+        let msg = format!("{err}");
+        assert!(msg.contains("'bnb'"), "missing bnb half-wire: {msg}");
+        assert!(msg.contains("'polygon'"), "missing polygon half-wire: {msg}");
+    }
+
+    #[test]
+    fn validate_passes_for_same_chain_under_different_map_keys() {
+        // Guards the review's "no false positive when flashloan and
+        // liquidator share the same chain but via different map keys"
+        // invariant.
+        let mut cfg = base_config();
+        cfg.flashloan.insert("aave_v3_bsc".into(), fl("bnb"));
+        cfg.liquidator.insert("charon_bnb_v1".into(), liq("bnb"));
+        cfg.validate().expect("same chain via different keys is fine");
     }
 }
 
