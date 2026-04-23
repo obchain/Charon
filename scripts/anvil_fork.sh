@@ -6,23 +6,29 @@
 # real funds.
 #
 # Usage:
-#   ./scripts/anvil_fork.sh                # fork latest, primary RPC
+#   ./scripts/anvil_fork.sh                # fork at the pinned default block
 #   FORK_BLOCK=41000000 ./scripts/anvil_fork.sh
+#   FORK_BLOCK=latest  ./scripts/anvil_fork.sh   # unpinned (discouraged)
 #   FORK_RPC=https://custom/bsc ./scripts/anvil_fork.sh
-#   FORK_PORT=8546 ./scripts/anvil_fork.sh  # avoid a port collision
+#   FORK_PORT=8546 ./scripts/anvil_fork.sh   # avoid a port collision
 #
 # Environment knobs:
-#   FORK_RPC      — explicit upstream; skips probe/fallback when set
-#   FORK_BLOCK    — pin fork at this block (default: latest upstream)
+#   FORK_RPC      — explicit upstream; skips the default probe when set
+#   FORK_BLOCK    — fork at this block; default `DEFAULT_FORK_BLOCK`.
+#                   Set to the literal string `latest` to follow upstream
+#                   head — not recommended for CI or soak tests because
+#                   state drift across runs breaks reproducibility (#242).
 #   FORK_PORT     — host port for HTTP+WS (default: 8545)
 #   FORK_CHAIN_ID — preserved chain id (default: 56, BSC mainnet)
 #
-# Upstream probing:
-#   When FORK_RPC is unset, the script tests the primary (dRPC) with a
-#   single eth_blockNumber call. A non-2xx response or timeout falls
-#   back to PublicNode. Both are free, keyless, and support historical
-#   state reads — see `docs/Charon_Architecture_Diagrams.html` for the
-#   research notes.
+# Upstream:
+#   The default upstream is dRPC (free, keyless, archive — historical
+#   eth_call works against any block). If dRPC is unreachable the
+#   script exits non-zero rather than falling back to PublicNode;
+#   PublicNode is not an archive node (~128 blocks of state), so a
+#   fork built against it silently returns "missing trie node" on
+#   every historical call and defeats the fork (#246). Override with
+#   FORK_RPC=<your-archive-url> to use a different archive provider.
 
 set -euo pipefail
 
@@ -39,9 +45,15 @@ fi
 
 # ── Defaults ─────────────────────────────────────────────────────────
 readonly PRIMARY_RPC="${FORK_RPC_PRIMARY:-https://bsc.drpc.org}"
-readonly FALLBACK_RPC="${FORK_RPC_FALLBACK:-https://bsc-rpc.publicnode.com}"
 readonly PORT="${FORK_PORT:-8545}"
 readonly CHAIN_ID="${FORK_CHAIN_ID:-56}"
+# Default fork block. Captured 2026-04-23, past every Aave V3 reserve
+# activation and every Venus Core Pool vToken deployment the demo
+# uses. The fork-test suite on `feat/25-foundry-fork-tests` pins the
+# same value so a soak demo and the Foundry regression suite describe
+# identical on-chain state. Bump in a dedicated reviewed commit when
+# refreshing against a newer baseline.
+readonly DEFAULT_FORK_BLOCK="${DEFAULT_FORK_BLOCK:-94000000}"
 
 probe_rpc() {
     # Return 0 iff the RPC answers eth_blockNumber with a non-empty
@@ -72,13 +84,10 @@ resolve_rpc() {
         return
     fi
 
-    echo "primary RPC $PRIMARY_RPC unreachable; falling back to $FALLBACK_RPC" >&2
-    if probe_rpc "$FALLBACK_RPC"; then
-        echo "$FALLBACK_RPC"
-        return
-    fi
-
-    echo "both primary ($PRIMARY_RPC) and fallback ($FALLBACK_RPC) RPCs failed the probe" >&2
+    echo "error: primary RPC $PRIMARY_RPC failed the probe" >&2
+    echo "       refusing to fall back to a non-archive public provider —" >&2
+    echo "       forked historical eth_call would return 'missing trie node'." >&2
+    echo "       pass FORK_RPC=<your-archive-url> to override." >&2
     exit 1
 }
 
@@ -96,15 +105,19 @@ ANVIL_ARGS=(
     --block-time 3
 )
 
-if [[ -n "${FORK_BLOCK:-}" ]]; then
-    ANVIL_ARGS+=(--fork-block-number "$FORK_BLOCK")
+# Resolve the effective fork block. Unset ⇒ the pinned default (for
+# reproducible runs); `latest` ⇒ follow upstream head; anything else ⇒
+# pin at that block.
+FORK_BLOCK_EFFECTIVE="${FORK_BLOCK:-$DEFAULT_FORK_BLOCK}"
+if [[ "$FORK_BLOCK_EFFECTIVE" != "latest" ]]; then
+    ANVIL_ARGS+=(--fork-block-number "$FORK_BLOCK_EFFECTIVE")
 fi
 
 echo "anvil: forking chain ${CHAIN_ID} from ${RPC}"
-if [[ -n "${FORK_BLOCK:-}" ]]; then
-    echo "anvil: pinning at block ${FORK_BLOCK}"
+if [[ "$FORK_BLOCK_EFFECTIVE" == "latest" ]]; then
+    echo "anvil: pinning at upstream head (latest) — unpinned, not reproducible"
 else
-    echo "anvil: pinning at upstream head (latest)"
+    echo "anvil: pinning at block ${FORK_BLOCK_EFFECTIVE}"
 fi
 echo "anvil: listening on http://127.0.0.1:${PORT} (HTTP + WS)"
 echo "anvil: Ctrl-C to stop"
