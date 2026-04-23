@@ -16,7 +16,6 @@
 use alloy::eips::eip2718::Encodable2718;
 use alloy::network::{EthereumWallet, TransactionBuilder};
 use alloy::primitives::{Address, Bytes};
-use alloy::providers::Provider;
 use alloy::rpc::types::TransactionRequest;
 use alloy::signers::local::PrivateKeySigner;
 use alloy::sol;
@@ -133,28 +132,21 @@ impl TxBuilder {
     /// Build an unsigned EIP-1559 [`TransactionRequest`] pointing at
     /// the configured liquidator.
     ///
-    /// Pulls the next nonce from `provider`. `gas_limit` is supplied
-    /// by the caller (typically a multiple of `eth_estimateGas` plus a
-    /// safety buffer). Fee fields are passed through; producing them
-    /// is the gas oracle's job, not the builder's.
-    pub async fn build_tx<P, T>(
+    /// The caller supplies the nonce (typically from
+    /// [`crate::NonceManager::next`]) and gas parameters from the gas
+    /// oracle. This method intentionally does **not** hit the provider
+    /// — doing so would race against the `NonceManager`'s local counter
+    /// and hand out duplicate nonces when two opportunities land in the
+    /// same block.
+    pub fn build_tx(
         &self,
-        provider: &P,
         calldata: Bytes,
+        nonce: u64,
         max_fee_per_gas: u128,
         max_priority_fee_per_gas: u128,
         gas_limit: u64,
-    ) -> Result<TransactionRequest>
-    where
-        P: Provider<T>,
-        T: alloy::transports::Transport + Clone,
-    {
+    ) -> TransactionRequest {
         let from = self.signer.address();
-        let nonce = provider
-            .get_transaction_count(from)
-            .await
-            .context("tx builder: failed to fetch nonce")?;
-
         let tx = TransactionRequest::default()
             .with_from(from)
             .with_to(self.liquidator)
@@ -175,7 +167,7 @@ impl TxBuilder {
             gas_limit,
             "EIP-1559 tx built"
         );
-        Ok(tx)
+        tx
     }
 
     /// Sign the request with the bot signer and return raw EIP-2718

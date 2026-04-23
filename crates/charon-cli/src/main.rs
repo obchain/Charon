@@ -9,15 +9,19 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use alloy::network::TransactionBuilder;
 use alloy::primitives::{Address, U256};
 use alloy::providers::{ProviderBuilder, WsConnect};
+use alloy::rpc::types::TransactionRequest;
 use alloy::signers::local::PrivateKeySigner;
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use charon_core::{
     Config, LendingProtocol, LiquidationOpportunity, LiquidationParams, OpportunityQueue,
     ProfitInputs, SwapRoute, calculate_profit,
 };
-use charon_executor::{Simulator, TxBuilder};
+use charon_executor::{
+    DEFAULT_SUBMIT_TIMEOUT, GasOracle, NonceManager, SubmitError, Submitter, Simulator, TxBuilder,
+};
 use charon_flashloan::{AaveFlashLoan, FlashLoanRouter};
 use charon_protocols::VenusAdapter;
 use charon_scanner::{
@@ -41,6 +45,15 @@ const DEFAULT_SLIPPAGE_BPS: u16 = 50;
 /// `eth_estimateGas × gas_price × native_price` lands once a gas
 /// oracle is wired up.
 const PLACEHOLDER_GAS_USD_CENTS: u64 = 50;
+
+/// Multiplier applied to `eth_estimateGas` before broadcast. 30 %
+/// headroom covers state drift between estimate and inclusion (vToken
+/// index update, oracle writes, swap-pool reserve change, Venus
+/// reentrancy into the callback) without overpaying on a happy-path
+/// liquidation. BSC gas is cheap enough that the extra buffer is worth
+/// the reduction in out-of-gas reverts.
+const GAS_LIMIT_BUFFER_NUM: u64 = 13;
+const GAS_LIMIT_BUFFER_DEN: u64 = 10;
 
 /// Charon — multi-chain flash-loan liquidation bot.
 #[derive(Parser, Debug)]
@@ -66,6 +79,14 @@ enum Command {
         /// pipeline still spins up so the operator can confirm wiring).
         #[arg(long = "borrower")]
         borrowers: Vec<Address>,
+
+        /// Broadcast signed liquidation txs when the simulator passes.
+        /// Off by default — the pipeline runs scan + simulate only.
+        /// Requires: `BOT_SIGNER_KEY` set, a non-zero
+        /// `liquidator.contract_address`, and a `private_rpc_url` (or
+        /// `allow_public_mempool = true`, dev-only).
+        #[arg(long = "execute", default_value_t = false)]
+        execute: bool,
     },
 
     /// Connect to a configured chain and print its latest block number.
@@ -107,7 +128,7 @@ async fn main() -> Result<()> {
     );
 
     match cli.command {
-        Command::Listen { borrowers } => run_listen(config, borrowers).await?,
+        Command::Listen { borrowers, execute } => run_listen(config, borrowers, execute).await?,
         Command::TestConnection { chain } => {
             let chain_cfg = config
                 .chain
@@ -122,13 +143,25 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+/// Bundle of executor components needed to broadcast a simulated
+/// opportunity. Present only when the operator ran `listen --execute`
+/// and every safety gate passed; `None` means the pipeline is in
+/// scan-only or scan-plus-simulate mode.
+struct ExecHarness {
+    gas_oracle: GasOracle,
+    nonce_manager: Arc<NonceManager>,
+    submitter: Arc<Submitter>,
+    signer_address: Address,
+}
+
 /// Wire the full Venus → scanner → profit → router → builder → sim
 /// pipeline into the block-event drain loop.
 ///
-/// **Read-only end-to-end:** the simulator's verdict is logged but no
-/// transaction is broadcast. Wiring the broadcast step lands with the
-/// MEV / private-RPC submission tasks (#18).
-async fn run_listen(config: Config, borrowers: Vec<Address>) -> Result<()> {
+/// With `--execute` the pipeline also signs and broadcasts any
+/// opportunity whose simulator gate passes. Without it the pipeline is
+/// read-only: simulation results are logged but nothing is signed or
+/// sent.
+async fn run_listen(config: Config, borrowers: Vec<Address>, execute: bool) -> Result<()> {
     // ── Adapters + scanner + price cache (existing #8/#9/#10 wiring) ──
     let bnb = config
         .chain
@@ -228,6 +261,46 @@ async fn run_listen(config: Config, borrowers: Vec<Address>) -> Result<()> {
         ))
     });
 
+    // ── Execution harness (gated on --execute) ──
+    // Built only when every safety gate passes: signer present,
+    // non-zero liquidator, private-RPC URL present on the chain. Any
+    // failure here aborts startup rather than silently degrading to
+    // scan-only — `--execute` is an explicit operator intent.
+    let exec_harness: Option<Arc<ExecHarness>> = if execute {
+        let builder = tx_builder
+            .as_ref()
+            .context("--execute requires BOT_SIGNER_KEY to be set and parseable")?;
+        if liquidator_cfg.contract_address == Address::ZERO {
+            bail!("--execute refuses to run with zero-address liquidator");
+        }
+        let url = bnb
+            .private_rpc_url
+            .as_ref()
+            .context("--execute requires a private_rpc_url on chain 'bnb' (https:// or wss://)")?;
+        let submitter = Submitter::connect(url, bnb.private_rpc_auth.as_ref(), DEFAULT_SUBMIT_TIMEOUT)
+            .await
+            .context("--execute: failed to connect private-RPC submitter")?;
+        let signer_address = builder.signer_address();
+        let nonce_manager = NonceManager::init(provider.as_ref(), signer_address)
+            .await
+            .context("--execute: failed to initialise nonce manager")?;
+        let gas_oracle = GasOracle::new(config.bot.max_gas_gwei, bnb.priority_fee_gwei);
+        warn!(
+            signer = %signer_address,
+            liquidator = %liquidator_cfg.contract_address,
+            max_gas_gwei = config.bot.max_gas_gwei,
+            "execute mode ON — bot will sign and broadcast liquidations"
+        );
+        Some(Arc::new(ExecHarness {
+            gas_oracle,
+            nonce_manager: Arc::new(nonce_manager),
+            submitter: Arc::new(submitter),
+            signer_address,
+        }))
+    } else {
+        None
+    };
+
     // ── Profit-ordered queue ──
     let queue = Arc::new(tokio::sync::Mutex::new(OpportunityQueue::with_default_ttl()));
 
@@ -238,7 +311,8 @@ async fn run_listen(config: Config, borrowers: Vec<Address>) -> Result<()> {
         near_liq_threshold = config.bot.near_liq_threshold,
         flash_sources = router.providers().len(),
         signer_present = tx_builder.is_some(),
-        "pipeline ready (scan-only, no broadcast)"
+        execute = exec_harness.is_some(),
+        "pipeline ready"
     );
 
     // ── Block-event drain ──
@@ -270,6 +344,7 @@ async fn run_listen(config: Config, borrowers: Vec<Address>) -> Result<()> {
                             router.clone(),
                             tx_builder.clone(),
                             simulator.clone(),
+                            exec_harness.clone(),
                             queue.clone(),
                             provider.clone(),
                             config.bot.min_profit_usd,
@@ -299,6 +374,7 @@ async fn process_block(
     router: Arc<FlashLoanRouter>,
     tx_builder: Option<Arc<TxBuilder>>,
     simulator: Option<Arc<Simulator>>,
+    exec_harness: Option<Arc<ExecHarness>>,
     queue: Arc<tokio::sync::Mutex<OpportunityQueue>>,
     provider: Arc<alloy::providers::RootProvider<alloy::pubsub::PubSubFrontend>>,
     min_profit_usd: f64,
@@ -321,6 +397,7 @@ async fn process_block(
     // 3. Per-liquidatable: route flash loan, calc profit, build, simulate, queue.
     let liquidatable = scanner.liquidatable();
     let mut queued = 0usize;
+    let mut broadcast = 0usize;
     for pos in liquidatable {
         match process_opportunity(
             &pos,
@@ -328,6 +405,7 @@ async fn process_block(
             router.as_ref(),
             tx_builder.as_deref(),
             simulator.as_deref(),
+            exec_harness.as_deref(),
             provider.as_ref(),
             min_profit_usd,
             block,
@@ -335,8 +413,12 @@ async fn process_block(
         )
         .await
         {
-            Ok(true) => queued += 1,
-            Ok(false) => {}
+            Ok(ProcessOutcome::Queued) => queued += 1,
+            Ok(ProcessOutcome::Broadcast) => {
+                queued += 1;
+                broadcast += 1;
+            }
+            Ok(ProcessOutcome::Dropped) => {}
             Err(err) => debug!(borrower = %pos.borrower, error = ?err, "opportunity dropped"),
         }
     }
@@ -355,16 +437,27 @@ async fn process_block(
         near_liq = counts.near_liquidation,
         liquidatable = counts.liquidatable,
         queued,
+        broadcast,
         queue_len,
         block_ms = start.elapsed().as_millis() as u64,
         "pipeline tick"
     );
 }
 
+/// Outcome of a single `process_opportunity` invocation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProcessOutcome {
+    /// Dropped at a profit / simulation / gas gate. Not in the queue.
+    Dropped,
+    /// Accepted and pushed to the profit-ordered queue. No broadcast.
+    Queued,
+    /// Accepted, queued, and broadcast to the private RPC.
+    Broadcast,
+}
+
 /// Run one liquidatable position through the rest of the pipeline.
-/// Returns `Ok(true)` if it landed in the queue, `Ok(false)` if it was
-/// dropped at a profit / simulation gate, `Err` for unexpected
-/// failures.
+/// Returns a [`ProcessOutcome`] describing how far it made it, or
+/// `Err` for unexpected failures the caller should log at `debug`.
 #[allow(clippy::too_many_arguments)]
 async fn process_opportunity(
     pos: &charon_core::Position,
@@ -372,11 +465,12 @@ async fn process_opportunity(
     router: &FlashLoanRouter,
     tx_builder: Option<&TxBuilder>,
     simulator: Option<&Simulator>,
+    exec_harness: Option<&ExecHarness>,
     provider: &alloy::providers::RootProvider<alloy::pubsub::PubSubFrontend>,
     min_profit_usd: f64,
     queued_at_block: u64,
     queue: Arc<tokio::sync::Mutex<OpportunityQueue>>,
-) -> Result<bool> {
+) -> Result<ProcessOutcome> {
     // a. Adapter: build protocol-specific liquidation params (vTokens + repay).
     let params = adapter.get_liquidation_params(pos)?;
     let LiquidationParams::Venus { repay_amount, .. } = &params;
@@ -384,7 +478,7 @@ async fn process_opportunity(
 
     // b. Router: pick cheapest flash-loan source.
     let Some(quote) = router.route(pos.debt_token, repay).await else {
-        return Ok(false);
+        return Ok(ProcessOutcome::Dropped);
     };
 
     // c. Profit calc — placeholder USD math until precise per-token
@@ -404,7 +498,7 @@ async fn process_opportunity(
         Ok(n) => n,
         Err(err) => {
             debug!(borrower = %pos.borrower, error = ?err, "profit gate dropped");
-            return Ok(false);
+            return Ok(ProcessOutcome::Dropped);
         }
     };
 
@@ -430,18 +524,133 @@ async fn process_opportunity(
     // e. Tx builder + simulator — only if the operator supplied
     //    BOT_SIGNER_KEY. Without it, push to the queue based on profit
     //    alone so dry-runs still surface ranked candidates.
-    if let (Some(builder), Some(sim)) = (tx_builder, simulator) {
-        let calldata = builder.encode_calldata(&opp, &params)?;
-        if let Err(err) = sim.simulate(provider, calldata).await {
-            debug!(borrower = %pos.borrower, error = ?err, "simulation gate dropped");
-            return Ok(false);
+    let calldata = match (tx_builder, simulator) {
+        (Some(builder), Some(sim)) => {
+            let bytes = builder.encode_calldata(&opp, &params)?;
+            if let Err(err) = sim.simulate(provider, bytes.clone()).await {
+                debug!(borrower = %pos.borrower, error = ?err, "simulation gate dropped");
+                return Ok(ProcessOutcome::Dropped);
+            }
+            Some(bytes)
+        }
+        _ => None,
+    };
+
+    // f. Push to the profit-ordered queue before broadcast so a later
+    //    submit failure still leaves a record of the ranked candidate.
+    let mut outcome = ProcessOutcome::Queued;
+    {
+        let mut q = queue.lock().await;
+        q.push(opp.clone(), queued_at_block);
+    }
+
+    // g. Broadcast (only when --execute set every gate, and we have
+    //    calldata from the sim step — `exec_harness.is_some()` implies
+    //    `tx_builder.is_some()` and `simulator.is_some()`).
+    if let (Some(harness), Some(builder), Some(bytes)) = (exec_harness, tx_builder, calldata) {
+        match broadcast(harness, builder, provider, bytes).await {
+            Ok(hash) => {
+                info!(
+                    borrower = %pos.borrower,
+                    net_profit_cents = net.net_usd_cents,
+                    %hash,
+                    "liquidation broadcast"
+                );
+                outcome = ProcessOutcome::Broadcast;
+            }
+            Err(err) => {
+                warn!(
+                    borrower = %pos.borrower,
+                    error = ?err,
+                    "broadcast failed — opportunity left in queue"
+                );
+            }
         }
     }
 
-    // f. Push to the profit-ordered queue.
-    let mut q = queue.lock().await;
-    q.push(opp, queued_at_block);
-    Ok(true)
+    Ok(outcome)
+}
+
+/// Sign and broadcast one opportunity that already passed simulation.
+///
+/// Nonce-gap handling: when the node rejects with "nonce too low" /
+/// "already known" / similar, force a one-shot `NonceManager::resync`
+/// so the next block's broadcast sees the canonical on-chain value.
+/// Connection-lost errors leave the nonce where it is — the caller
+/// will reconnect and the counter stays locally consistent with what
+/// the pipeline actually issued.
+async fn broadcast(
+    harness: &ExecHarness,
+    builder: &TxBuilder,
+    provider: &alloy::providers::RootProvider<alloy::pubsub::PubSubFrontend>,
+    calldata: alloy::primitives::Bytes,
+) -> Result<alloy::primitives::TxHash> {
+    // Fetch EIP-1559 fees; `None` = max-gas ceiling tripped, skip.
+    let Some(fees) = harness
+        .gas_oracle
+        .fetch_params(provider)
+        .await
+        .context("broadcast: gas oracle failed")?
+    else {
+        bail!("gas ceiling tripped");
+    };
+
+    // Estimate gas on a minimal request — the provider only needs
+    // to / from / data / fees to simulate.
+    let est_tx = TransactionRequest::default()
+        .with_from(harness.signer_address)
+        .with_to(builder.liquidator())
+        .with_input(calldata.clone())
+        .with_max_fee_per_gas(fees.max_fee_per_gas)
+        .with_max_priority_fee_per_gas(fees.max_priority_fee_per_gas);
+    let gas_units = harness
+        .gas_oracle
+        .estimate_gas_units(provider, &est_tx)
+        .await
+        .context("broadcast: estimate_gas failed")?;
+    let gas_limit = gas_units.saturating_mul(GAS_LIMIT_BUFFER_NUM) / GAS_LIMIT_BUFFER_DEN;
+
+    // Claim a nonce locally (atomic — no race with a parallel
+    // opportunity in the same block) and build the signed tx.
+    let nonce = harness.nonce_manager.next();
+    let tx = builder.build_tx(
+        calldata,
+        nonce,
+        fees.max_fee_per_gas,
+        fees.max_priority_fee_per_gas,
+        gas_limit,
+    );
+    let raw = match builder.sign(tx).await {
+        Ok(bytes) => bytes,
+        Err(err) => {
+            // Nonce already consumed by `next()` above. Sign failure
+            // means no tx hits the wire, so the counter is ahead of
+            // the chain — force a resync to avoid a permanent gap.
+            if let Err(resync_err) = harness.nonce_manager.resync(provider).await {
+                warn!(error = ?resync_err, "nonce resync failed after sign error");
+            }
+            return Err(err.context("broadcast: sign failed"));
+        }
+    };
+
+    match harness.submitter.submit(raw).await {
+        Ok(hash) => Ok(hash),
+        Err(err) => {
+            // Any RpcRejected leaves our local counter ahead of the
+            // chain — resync unconditionally so we don't poison the
+            // sequence on non-nonce rejections (insufficient funds,
+            // gas too low, revert-on-broadcast). ConnectionLost is
+            // transport-level: the tx may still land, so leave the
+            // counter alone and let the next nonce-too-high reject
+            // drive a resync on the following block.
+            if matches!(err, SubmitError::RpcRejected(_))
+                && let Err(resync_err) = harness.nonce_manager.resync(provider).await
+            {
+                warn!(error = ?resync_err, "nonce resync failed after rejection");
+            }
+            Err(anyhow::Error::new(err).context("broadcast: submit failed"))
+        }
+    }
 }
 
 /// Strip 18 decimals and convert to USD cents (×100), saturating to
