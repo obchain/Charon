@@ -57,7 +57,11 @@ services:
         max-file: "5"
 
   alloy:
-    image: grafana/alloy:v1.4.3
+    # Digest-pinned: Docker Hub tags are mutable (maintainers can
+    # republish under the same tag) and this stack already pins every
+    # other image by digest. Bump in a dedicated commit when refreshing
+    # the sidecar — never as a drive-by.
+    image: grafana/alloy:v1.4.3@sha256:06bdcbb51fc22b16c2e96b31cbdf9cb0972e3bdedfbac2cc55ed36743f7fb9aa
     restart: unless-stopped
     # `run` subcommand and the default server port (12345) are enough
     # for a scrape + remote_write topology; we don't expose the UI.
