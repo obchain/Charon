@@ -32,4 +32,19 @@ prometheus.remote_write "grafana_cloud" {
             password = sys.env("GRAFANA_CLOUD_PROM_PASSWORD")
         }
     }
+
+    // Cap the on-disk WAL so a Grafana Cloud outage or a revoked
+    // token cannot buffer indefinitely and exhaust the 40 GB CX22
+    // disk. 2h of retention covers short network hiccups; older
+    // samples are dropped once the WAL reaches min_keepalive_time
+    // past their age. See #293.
+    //
+    // Alloy validates truncate_frequency < min_keepalive_time at
+    // startup (the underlying Prometheus WAL rejects equal values),
+    // so keep truncate on a 15m cadence under a 30m floor.
+    wal {
+        truncate_frequency = "15m"
+        min_keepalive_time = "30m"
+        max_keepalive_time = "2h"
+    }
 }
