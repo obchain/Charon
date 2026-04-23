@@ -6,23 +6,56 @@
 //! default — the manager bumps locally on every issue, and the caller
 //! re-syncs from chain after a failed broadcast / on startup.
 //!
-//! Why optimistic: `eth_getTransactionCount(latest)` is one round-trip
-//! we don't want on every block. Bumping locally lets multiple flying
-//! txs hold contiguous nonces; if one reverts and a gap opens up, a
-//! `resync` paves it over.
+//! Why optimistic: `eth_getTransactionCount(pending)` is one
+//! round-trip we don't want on every block. Bumping locally lets
+//! multiple in-flight txs hold contiguous nonces; if one reverts and
+//! a gap opens up, a `resync` paves it over.
+//!
+//! ### `pending` vs `latest`
+//!
+//! Both `init` and `resync` query the **pending** block tag, not
+//! `latest`. Reason: if we've already broadcast N txs this block and
+//! resync against `latest`, the mempool-side nonce we get back is
+//! stale — it reflects the state *before* our pending bundle. Using
+//! `pending` counts our own in-flight txs and avoids reusing a nonce
+//! that's sitting in the mempool waiting for inclusion.
+//!
+//! ### High-water-mark guard
+//!
+//! `resync` is a rescue path, not a rollback. If the chain reports
+//! nonce = 42 but we've already handed out 47 locally, snapping to 42
+//! would double-issue nonces 42–46 — every one of those txs would
+//! revert with `nonce too low` once the in-flight ones land. The
+//! high-water mark tracks the maximum value [`next`] ever handed out
+//! and clamps `resync` to `max(on_chain, high_water + 1)`.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use alloy::eips::{BlockId, BlockNumberOrTag};
 use alloy::primitives::Address;
 use alloy::providers::Provider;
-use anyhow::{Context, Result};
-use tracing::{debug, info};
+use alloy::transports::TransportError;
+use tracing::{debug, info, warn};
+
+/// Errors the nonce manager can surface. One variant for now —
+/// `#[non_exhaustive]` keeps the door open for variants like
+/// `NonceGap { on_chain, local }` without a breaking change later.
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum NonceError {
+    #[error("provider error: {0}")]
+    Provider(#[from] TransportError),
+}
 
 /// Tracks the next-to-use nonce for one signer on one chain.
 #[derive(Debug)]
 pub struct NonceManager {
     signer: Address,
+    /// Next nonce to hand out. Bumped via `fetch_add`.
     next: AtomicU64,
+    /// Max value `next()` ever returned + 1. Used by `resync` to
+    /// refuse going backwards past an already-issued nonce.
+    high_water: AtomicU64,
 }
 
 impl NonceManager {
@@ -32,21 +65,23 @@ impl NonceManager {
         Self {
             signer,
             next: AtomicU64::new(start),
+            high_water: AtomicU64::new(start),
         }
     }
 
-    /// Async constructor: pulls the current `eth_getTransactionCount`
-    /// on the `latest` block and stores it as the starting nonce.
-    pub async fn init<P, T>(provider: &P, signer: Address) -> Result<Self>
+    /// Async constructor: pulls `eth_getTransactionCount(pending)`
+    /// and stores it as the starting nonce. `pending` is mandatory
+    /// here — see module-level docs.
+    pub async fn init<P, T>(provider: &P, signer: Address) -> Result<Self, NonceError>
     where
         P: Provider<T>,
         T: alloy::transports::Transport + Clone,
     {
         let nonce = provider
             .get_transaction_count(signer)
-            .await
-            .with_context(|| format!("nonce manager: getTransactionCount({signer}) failed"))?;
-        info!(%signer, nonce, "nonce manager initialised");
+            .block_id(BlockId::Number(BlockNumberOrTag::Pending))
+            .await?;
+        info!(%signer, nonce, "nonce manager initialised (pending tag)");
         Ok(Self::new(signer, nonce))
     }
 
@@ -60,34 +95,67 @@ impl NonceManager {
         self.next.load(Ordering::Acquire)
     }
 
+    /// Highest nonce ever issued (or `start` if nothing has been
+    /// issued). Public for diagnostics; `resync` consults it
+    /// internally.
+    pub fn high_water(&self) -> u64 {
+        self.high_water.load(Ordering::Acquire)
+    }
+
     /// Atomically claim the next nonce and bump the counter. Two
     /// concurrent calls always return distinct values.
     pub fn next(&self) -> u64 {
         let n = self.next.fetch_add(1, Ordering::AcqRel);
+        // Update high-water mark monotonically. Using fetch_max so
+        // racing threads collapse to the same final value without a
+        // lost-update window.
+        self.high_water.fetch_max(n + 1, Ordering::AcqRel);
         debug!(signer = %self.signer, nonce = n, "nonce issued");
         n
     }
 
-    /// Re-fetch the on-chain nonce and adopt it as the new local
-    /// value. Call this after a tx fails (replaces a stuck nonce) or
-    /// on a long idle (catches manual transfers from the same key).
-    pub async fn resync<P, T>(&self, provider: &P) -> Result<u64>
+    /// Re-fetch the on-chain nonce and adopt it — but never go
+    /// backwards past an already-issued value.
+    ///
+    /// Concretely: `next` is set to `max(on_chain, high_water)`. If
+    /// the chain lags our local view (common: our own pending txs
+    /// haven't landed yet), we keep the local nonce. If the chain
+    /// jumped ahead (cold start, manual transfer from the same key),
+    /// we adopt the chain value.
+    ///
+    /// Returns the value `next` was set to.
+    pub async fn resync<P, T>(&self, provider: &P) -> Result<u64, NonceError>
     where
         P: Provider<T>,
         T: alloy::transports::Transport + Clone,
     {
-        let chain = provider
+        let on_chain = provider
             .get_transaction_count(self.signer)
-            .await
-            .with_context(|| {
-                format!(
-                    "nonce manager: getTransactionCount({}) during resync failed",
-                    self.signer
-                )
-            })?;
-        self.next.store(chain, Ordering::Release);
-        info!(signer = %self.signer, nonce = chain, "nonce manager resynced");
-        Ok(chain)
+            .block_id(BlockId::Number(BlockNumberOrTag::Pending))
+            .await?;
+        let hw = self.high_water.load(Ordering::Acquire);
+        let target = on_chain.max(hw);
+
+        if on_chain < hw {
+            warn!(
+                signer = %self.signer,
+                on_chain,
+                high_water = hw,
+                "resync: chain lags local high-water, keeping local value"
+            );
+        }
+
+        self.next.store(target, Ordering::Release);
+        // Keep high_water in lockstep — if chain jumped ahead, our
+        // new baseline is the chain value.
+        self.high_water.fetch_max(target, Ordering::AcqRel);
+        info!(
+            signer = %self.signer,
+            nonce = target,
+            on_chain,
+            "nonce manager resynced (pending tag, hw-guarded)"
+        );
+        Ok(target)
     }
 }
 
@@ -109,6 +177,16 @@ mod tests {
         assert_eq!(m.next(), 8);
         assert_eq!(m.next(), 9);
         assert_eq!(m.current(), 10);
+        assert_eq!(m.high_water(), 10);
+    }
+
+    #[test]
+    fn high_water_tracks_max_issued() {
+        let m = NonceManager::new(signer(), 0);
+        for _ in 0..5 {
+            m.next();
+        }
+        assert_eq!(m.high_water(), 5);
     }
 
     #[test]
@@ -140,5 +218,6 @@ mod tests {
         all.dedup();
         assert_eq!(all.len(), THREADS * PER, "duplicate nonce issued");
         assert_eq!(m.current(), (THREADS * PER) as u64);
+        assert_eq!(m.high_water(), (THREADS * PER) as u64);
     }
 }

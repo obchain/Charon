@@ -9,5 +9,6 @@ description = "Transaction builder, simulator, and broadcaster for Charon"
 charon-core = { workspace = true }
 alloy = { workspace = true }
 anyhow = { workspace = true }
+thiserror = { workspace = true }
 tracing = { workspace = true }
 tokio = { workspace = true }

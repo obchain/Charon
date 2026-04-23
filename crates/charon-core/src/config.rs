@@ -61,7 +61,12 @@ fn default_near_liq_threshold() -> f64 {
 }
 
 /// RPC endpoints for a single chain.
+///
+/// Marked `#[non_exhaustive]` so adding fields (e.g. new fee knobs)
+/// does not break downstream crates constructing literal instances
+/// in tests.
 #[derive(Debug, Clone, Deserialize)]
+#[non_exhaustive]
 pub struct ChainConfig {
     pub chain_id: u64,
     pub ws_url: String,
