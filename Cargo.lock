@@ -1182,6 +1182,7 @@ dependencies = [
  "anyhow",
  "metrics",
  "metrics-exporter-prometheus",
+ "thiserror 1.0.69",
  "tokio",
  "tracing",
 ]

@@ -54,6 +54,9 @@ dotenvy = "0.15"
 metrics = "0.24"
 metrics-exporter-prometheus = { version = "0.16", default-features = false, features = ["http-listener"] }
 
+# Structured error types (library crates)
+thiserror = "1"
+
 # Internal crates
 charon-core = { path = "crates/charon-core" }
 charon-executor = { path = "crates/charon-executor" }
@@ -61,3 +64,16 @@ charon-flashloan = { path = "crates/charon-flashloan" }
 charon-metrics = { path = "crates/charon-metrics" }
 charon-protocols = { path = "crates/charon-protocols" }
 charon-scanner = { path = "crates/charon-scanner" }
+
+# Workspace-wide lint policy. Every crate that opts in via
+# `[lints] workspace = true` inherits these; new crates should opt
+# in from day one. Mirrors the floor established on
+# feat/20-multi-liq-batcher (see issue #211) so the two lineages
+# converge on identical lint posture at merge time.
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+arithmetic_side_effects = "deny"
+cast_possible_truncation = "deny"
+unwrap_used = "deny"
