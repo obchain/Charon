@@ -1,0 +1,90 @@
+---
+# Prometheus alerting rules for the Charon liquidation bot.
+#
+# Load via Prometheus (rule_files:) or Grafana unified alerting
+# (Alerting -> Contact points -> Rules -> Upload file).
+#
+# Thresholds are tuned for a single-host BSC deployment on a 3s block
+# cadence. Adjust per-environment before wiring a pager.
+
+groups:
+  - name: charon-availability
+    interval: 30s
+    rules:
+      - alert: CharonScannerStalled
+        expr: rate(charon_scanner_blocks_total[1m]) == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Charon scanner has stopped consuming blocks"
+          description: |
+            No blocks drained from the listener in the last minute on
+            {{ $labels.instance }} / chain {{ $labels.chain }}. The bot
+            is effectively down — every liquidation opportunity in this
+            window is missed. Check the container status and the WS
+            upstream.
+
+      - alert: CharonNoLiquidationAttemptsOneHour
+        expr: increase(charon_executor_opportunities_queued_total[1h]) == 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Charon has queued zero opportunities for 1h"
+          description: |
+            increase(charon_executor_opportunities_queued_total[1h]) == 0
+            on {{ $labels.instance }}. Either BSC is unusually healthy
+            (possible), the scanner is broken (possible), or the health
+            check thresholds are mis-tuned. Inspect
+            charon_scanner_positions_by_bucket to disambiguate.
+
+  - name: charon-pipeline-health
+    interval: 30s
+    rules:
+      - alert: CharonQueueDepthHigh
+        expr: charon_executor_queue_depth > 50
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Charon executor queue depth sustained above 50"
+          description: |
+            Queue depth {{ $value }} on {{ $labels.instance }} for 2
+            minutes. Executor is not draining; possible private-RPC
+            stall, nonce-manager contention, or gas-ceiling skips.
+
+      - alert: CharonSimulationFailureRateHigh
+        expr: |
+          sum by (instance, chain) (rate(charon_executor_simulations_total{result="failure"}[5m]))
+            /
+          sum by (instance, chain) (rate(charon_executor_simulations_total[5m]))
+            > 0.5
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Charon simulation failure rate > 50% for 5m"
+          description: |
+            Over half of simulations are reverting on
+            {{ $labels.instance }} / chain {{ $labels.chain }}. Most
+            likely: Aave pool paused/frozen, Venus oracle stale, swap
+            router mispriced, or contract ABI drift.
+
+      - alert: CharonOpportunityDropRateHigh
+        expr: |
+          sum by (instance, chain) (rate(charon_executor_opportunities_dropped_total[5m]))
+            /
+          sum by (instance, chain) (rate(charon_executor_opportunities_queued_total[5m]))
+            > 0.9
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Charon dropping > 90% of queued opportunities"
+          description: |
+            Nearly every queued opportunity is dropping on
+            {{ $labels.instance }} / chain {{ $labels.chain }}.
+            Most likely upstream pipeline issue — fresher HF from a
+            newer block, gas ceiling too tight, or min-profit set above
+            current market conditions.
