@@ -93,6 +93,9 @@ async fn main() -> Result<()> {
 
     let config = Config::load(&cli.config)
         .with_context(|| format!("failed to load config from {}", cli.config.display()))?;
+    config
+        .validate()
+        .context("config validation failed — refusing to start")?;
 
     info!(
         chains = config.chain.len(),

@@ -22,10 +22,19 @@ ws_url             = "${BNB_WS_URL}"
 http_url           = "${BNB_HTTP_URL}"
 # Validator-friendly tip on BSC; raise during congestion.
 priority_fee_gwei  = 1
-# Optional private-RPC endpoint (bloxroute / blocknative). When set,
-# tx submission bypasses the public mempool. Leave unset to fall back
-# to `http_url`.
-private_rpc_url    = "${BSC_PRIVATE_RPC_URL}"
+# Private-RPC endpoint (bloxroute / blocknative). Required for any
+# chain that has a deployed liquidator — Config::validate refuses to
+# start otherwise. Leave the env var unset only on testnet / dev
+# runs where `allow_public_mempool = true` is also set below.
+private_rpc_url    = "${CHARON_BSC_PRIVATE_RPC_URL}"
+# Optional bearer token attached as `Authorization: Bearer <token>`
+# to every private-RPC request. Use when the vendor prefers a header
+# over a URL-embedded API key. Unset = no Authorization header.
+private_rpc_auth   = "${CHARON_BSC_PRIVATE_RPC_AUTH}"
+# Escape hatch for local anvil / testnet runs with no private RPC.
+# NEVER enable on mainnet — submitting liquidation calldata to the
+# public mempool is a guaranteed front-run.
+allow_public_mempool = false
 
 # ── Lending protocols ─────────────────────────────────────────────────────
 [protocol.venus]

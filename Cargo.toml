@@ -33,6 +33,16 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # Error handling
 anyhow = "1"
+thiserror = "2"
+
+# Secret handling (redacts via Debug, opt-in exposure)
+secrecy = "0.10"
+
+# URL parsing (scheme validation in the submitter)
+url = "2"
+
+# HTTP client (custom headers on private-RPC transport)
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 
 # Async trait objects
 async-trait = "0.1"
