@@ -9,5 +9,5 @@ description = "Prometheus-compatible metrics exporter and metric constants for C
 anyhow = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
-metrics = "0.24"
-metrics-exporter-prometheus = { version = "0.16", default-features = false, features = ["http-listener"] }
+metrics = { workspace = true }
+metrics-exporter-prometheus = { workspace = true }

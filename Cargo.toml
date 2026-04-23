@@ -50,6 +50,10 @@ clap = { version = "4", features = ["derive"] }
 # .env loader
 dotenvy = "0.15"
 
+# Metrics facade + Prometheus exporter
+metrics = "0.24"
+metrics-exporter-prometheus = { version = "0.16", default-features = false, features = ["http-listener"] }
+
 # Internal crates
 charon-core = { path = "crates/charon-core" }
 charon-executor = { path = "crates/charon-executor" }
