@@ -10,19 +10,40 @@
 #   FORK_BLOCK=41000000 ./scripts/anvil_fork.sh
 #   FORK_BLOCK=latest  ./scripts/anvil_fork.sh   # unpinned (discouraged)
 #   FORK_RPC=https://custom/bsc ./scripts/anvil_fork.sh
-#   FORK_PORT=8546 ./scripts/anvil_fork.sh   # avoid a port collision
+#   CHARON_ANVIL_PORT=8546 ./scripts/anvil_fork.sh   # avoid a port collision
 #
 # Environment knobs:
-#   FORK_RPC      — explicit upstream; skips the default probe when set
-#   FORK_BLOCK    — fork at this block; default `DEFAULT_FORK_BLOCK`.
-#                   Set to the literal string `latest` to follow upstream
-#                   head — not recommended for CI or soak tests because
-#                   state drift across runs breaks reproducibility (#242).
-#   FORK_PORT     — host port for HTTP+WS (default: 8545)
-#   FORK_CHAIN_ID — preserved chain id (default: 56, BSC mainnet)
+#   FORK_RPC                — explicit upstream; skips the default probe when set
+#   FORK_BLOCK              — fork at this block; default `DEFAULT_FORK_BLOCK`.
+#                             Set to the literal string `latest` to follow upstream
+#                             head — not recommended for CI or soak tests because
+#                             state drift across runs breaks reproducibility (#242).
+#   CHARON_ANVIL_PORT       — host port for HTTP+WS (default: 8545). This is the
+#                             same variable `config/fork.toml` reads via
+#                             `${CHARON_ANVIL_PORT:-8545}`, so script and config
+#                             agree on the port without the operator editing TOML (#247).
+#   FORK_CHAIN_ID           — preserved chain id (default: 56, BSC mainnet)
 #   FORK_MINE_INTERVAL_SECS — seconds between background anvil_mine
-#                   calls (default: 30). Set to 0 to disable the keep-
-#                   alive loop entirely (see stale-Chainlink note below).
+#                             calls (default: 30). Set to 0 to disable the keep-
+#                             alive loop entirely (see stale-Chainlink note below).
+#
+# Foundry version pin (#259):
+#   Foundry CLI output is reformatted across releases (nightly channel
+#   changed the `forge --version` template in late 2024). Rather than
+#   parse a moving target, we compare the raw first-line version
+#   stamp against `CHARON_REQUIRED_FOUNDRY_VERSION` and warn — not
+#   hard-fail — if they don't match. The goal is that a fresh clone
+#   six months from now either sees the known-good stamp or gets a
+#   loud remediation hint instead of silently running against a
+#   version whose anvil behavior has drifted.
+#
+#   Override knobs:
+#     CHARON_REQUIRED_FOUNDRY_VERSION     — expected substring in `anvil --version`
+#                                           output (default pinned below).
+#     CHARON_SKIP_FOUNDRY_VERSION_CHECK=1 — bypass the check entirely. Intended
+#                                           for CI images that pin Foundry out
+#                                           of band; local devs should run
+#                                           `foundryup -v <version>` instead.
 #
 # Upstream:
 #   The default upstream is dRPC (free, keyless, archive — historical
@@ -76,6 +97,39 @@ if ! command -v curl >/dev/null 2>&1; then
     exit 127
 fi
 
+# ── Foundry version pin (#259) ───────────────────────────────────────
+# Warn loudly if the installed anvil doesn't match the known-good
+# stamp. We don't hard-fail on mismatch because (a) Foundry release
+# cadence is weekly and the version string format has drifted, and
+# (b) CI images pin their own versions. Hard-fail only when the
+# operator can't produce a version string at all — that's a broken
+# install, not a drift.
+readonly REQUIRED_FOUNDRY_VERSION="${CHARON_REQUIRED_FOUNDRY_VERSION:-stable}"
+if [[ "${CHARON_SKIP_FOUNDRY_VERSION_CHECK:-0}" != "1" ]]; then
+    # `anvil --version` prints e.g. `anvil 0.3.0-stable (...)` or a
+    # `nightly (...)` line depending on channel. Grab the first line.
+    if ! anvil_version_line=$(anvil --version 2>/dev/null | head -n1); then
+        echo "anvil: failed to read 'anvil --version' output — install appears broken." >&2
+        echo "       reinstall Foundry: curl -L https://foundry.paradigm.xyz | bash && foundryup" >&2
+        exit 127
+    fi
+    if [[ -z "$anvil_version_line" ]]; then
+        echo "anvil: 'anvil --version' produced empty output — install appears broken." >&2
+        exit 127
+    fi
+    if [[ "$anvil_version_line" != *"$REQUIRED_FOUNDRY_VERSION"* ]]; then
+        echo "anvil: WARNING — installed version may not match the pin." >&2
+        echo "       required substring: '$REQUIRED_FOUNDRY_VERSION'" >&2
+        echo "       installed:          '$anvil_version_line'" >&2
+        echo "       remediate:          foundryup -i $REQUIRED_FOUNDRY_VERSION" >&2
+        echo "       or bypass:          CHARON_SKIP_FOUNDRY_VERSION_CHECK=1 ./scripts/anvil_fork.sh" >&2
+        echo "       continuing in 2s — anvil semantics may have drifted." >&2
+        sleep 2
+    else
+        echo "anvil: version ok ($anvil_version_line)"
+    fi
+fi
+
 # cast is only strictly required for the stale-Chainlink keep-alive.
 # If it's missing and the loop is enabled, fail loudly — a silent
 # fallback would reproduce exactly the Grafana-looks-dead failure mode
@@ -90,7 +144,13 @@ fi
 
 # ── Defaults ─────────────────────────────────────────────────────────
 readonly PRIMARY_RPC="${FORK_RPC_PRIMARY:-https://bsc.drpc.org}"
-readonly PORT="${FORK_PORT:-8545}"
+# Port name matches `config/fork.toml`'s `${CHARON_ANVIL_PORT:-8545}`
+# substitution so `CHARON_ANVIL_PORT=8546 ./anvil_fork.sh` and
+# `CHARON_ANVIL_PORT=8546 charon --config config/fork.toml` agree
+# without editing TOML (#247). `FORK_PORT` is honored as a legacy
+# alias so existing operator muscle memory still works; prefer
+# `CHARON_ANVIL_PORT` for new invocations.
+readonly PORT="${CHARON_ANVIL_PORT:-${FORK_PORT:-8545}}"
 readonly CHAIN_ID="${FORK_CHAIN_ID:-56}"
 readonly LOCAL_RPC="http://127.0.0.1:${PORT}"
 # Default fork block. Captured 2026-04-23, past every Aave V3 reserve
