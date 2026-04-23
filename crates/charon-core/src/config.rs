@@ -7,11 +7,79 @@
 //! ```
 
 use alloy::primitives::Address;
-use anyhow::{Context, anyhow};
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use thiserror::Error;
+
+/// Typed errors returned by [`Config::load`] and [`Config::validate`].
+///
+/// Replaces the previous `anyhow::Error` surface so the CLI can
+/// pattern-match on the failure mode and render actionable recovery
+/// hints instead of a flat chain string. Every variant carries the
+/// config path (when known) and the specific fields needed to debug
+/// the issue without re-reading the file. `#[non_exhaustive]` so new
+/// variants can land without a semver bump.
+#[derive(Debug, Error)]
+#[non_exhaustive]
+pub enum ConfigError {
+    /// The config file could not be read (missing, unreadable, EIO).
+    #[error("failed to read config file {}: {source}", path.display())]
+    FileRead {
+        /// Absolute or caller-supplied path the loader tried to open.
+        path: PathBuf,
+        /// Underlying OS error.
+        #[source]
+        source: std::io::Error,
+    },
+
+    /// A `${NAME}` placeholder referenced an environment variable that
+    /// is not set at load time.
+    #[error("env var `{var}` is not set (referenced in config at {})", path.display())]
+    EnvVarMissing {
+        /// Name of the missing environment variable.
+        var: String,
+        /// Path of the config file that contained the reference.
+        path: PathBuf,
+    },
+
+    /// A `${` was opened but never closed by a matching `}`.
+    #[error("unterminated `${{` placeholder in config {}", path.display())]
+    UnterminatedPlaceholder {
+        /// Path of the offending config file.
+        path: PathBuf,
+    },
+
+    /// TOML parse failure after substitution. Wraps the `toml` crate's
+    /// error so the caller keeps line/column diagnostics.
+    #[error("failed to parse TOML at {}: {source}", path.display())]
+    TomlParse {
+        /// Path of the config file that failed to parse.
+        path: PathBuf,
+        /// Underlying parse error.
+        #[source]
+        source: toml::de::Error,
+    },
+
+    /// [`Config::validate`] found a chain that supplies exactly one
+    /// side of the flashloan/liquidator pair. See the rustdoc on
+    /// `validate` for why that's rejected.
+    #[error(
+        "half-wired config: chain '{chain}' has {present} but not {missing}"
+    )]
+    HalfWired {
+        /// Chain short name pulled from the inner `chain` field.
+        chain: String,
+        /// Section present in the config.
+        present: &'static str,
+        /// Section absent from the config.
+        missing: &'static str,
+    },
+}
+
+/// Convenience alias for `Result<T, ConfigError>` used throughout this module.
+pub type Result<T, E = ConfigError> = std::result::Result<T, E>;
 
 /// Top-level Charon config loaded from `config/default.toml`.
 #[derive(Debug, Clone, Deserialize)]
@@ -208,17 +276,19 @@ impl Config {
     ///
     /// Returns an error if the file is missing, malformed, or references an
     /// environment variable that isn't set.
-    pub fn load(path: impl AsRef<Path>) -> anyhow::Result<Self> {
-        let path = path.as_ref();
-        let raw = std::fs::read_to_string(path)
-            .with_context(|| format!("failed to read config at {}", path.display()))?;
-        let substituted = substitute_env_vars(&raw)
-            .with_context(|| format!("env substitution failed for {}", path.display()))?;
-        let config: Config = toml::from_str(&substituted)
-            .with_context(|| format!("failed to parse TOML at {}", path.display()))?;
-        config
-            .validate()
-            .with_context(|| format!("invalid config at {}", path.display()))?;
+    pub fn load(path: impl AsRef<Path>) -> Result<Self> {
+        let path_ref = path.as_ref();
+        let raw = std::fs::read_to_string(path_ref).map_err(|source| ConfigError::FileRead {
+            path: path_ref.to_path_buf(),
+            source,
+        })?;
+        let substituted = substitute_env_vars(&raw, path_ref)?;
+        let config: Config =
+            toml::from_str(&substituted).map_err(|source| ConfigError::TomlParse {
+                path: path_ref.to_path_buf(),
+                source,
+            })?;
+        config.validate()?;
         Ok(config)
     }
 
@@ -238,7 +308,7 @@ impl Config {
     /// on the first one, so an operator fixing a broken profile sees
     /// every offending chain in one pass instead of running `charon` N
     /// times to surface N problems.
-    pub fn validate(&self) -> anyhow::Result<()> {
+    pub fn validate(&self) -> Result<()> {
         use std::collections::BTreeSet;
         let fl_chains: BTreeSet<&str> =
             self.flashloan.values().map(|f| f.chain.as_str()).collect();
@@ -248,31 +318,27 @@ impl Config {
             .map(|l| l.chain.as_str())
             .collect();
 
-        let fl_only: Vec<&str> = fl_chains.difference(&liq_chains).copied().collect();
-        let liq_only: Vec<&str> = liq_chains.difference(&fl_chains).copied().collect();
-
-        if fl_only.is_empty() && liq_only.is_empty() {
-            return Ok(());
+        // Return on the first mismatched chain we encounter. The typed
+        // variant names the offending chain plus the section that is
+        // present/missing; operators fixing multiple half-wired chains
+        // re-run once per fix, which is preferable to a catch-all
+        // string that callers cannot pattern-match on. The lexicographic
+        // order (from BTreeSet) makes the first-offender deterministic.
+        if let Some(chain) = fl_chains.difference(&liq_chains).next() {
+            return Err(ConfigError::HalfWired {
+                chain: (*chain).to_string(),
+                present: "[flashloan.*]",
+                missing: "[liquidator.*]",
+            });
         }
-
-        let mut msg = String::from(
-            "half-wired liquidation path — every chain must supply both a \
-             [flashloan.*] entry and a [liquidator.*] entry, or neither \
-             (both omitted ⇒ read-only mode). Offending chains:\n",
-        );
-        for chain in &fl_only {
-            msg.push_str(&format!(
-                "  - '{chain}': has [flashloan.*] but no matching [liquidator.*] — \
-                 liquidation would be routed but never executed\n"
-            ));
+        if let Some(chain) = liq_chains.difference(&fl_chains).next() {
+            return Err(ConfigError::HalfWired {
+                chain: (*chain).to_string(),
+                present: "[liquidator.*]",
+                missing: "[flashloan.*]",
+            });
         }
-        for chain in &liq_only {
-            msg.push_str(&format!(
-                "  - '{chain}': has [liquidator.*] but no matching [flashloan.*] — \
-                 liquidation cannot execute without a flash-loan source\n"
-            ));
-        }
-        Err(anyhow!(msg))
+        Ok(())
     }
 }
 
@@ -348,9 +414,14 @@ mod tests {
         let mut cfg = base_config();
         cfg.flashloan.insert("aave_v3_bsc".into(), fl("bnb"));
         let err = cfg.validate().expect_err("flashloan-only must fail");
-        let msg = format!("{err}");
-        assert!(msg.contains("'bnb'"), "error must name the chain: {msg}");
-        assert!(msg.contains("[flashloan.*]"), "error must cite flashloan: {msg}");
+        match err {
+            ConfigError::HalfWired { chain, present, missing } => {
+                assert_eq!(chain, "bnb");
+                assert_eq!(present, "[flashloan.*]");
+                assert_eq!(missing, "[liquidator.*]");
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
     }
 
     #[test]
@@ -358,22 +429,76 @@ mod tests {
         let mut cfg = base_config();
         cfg.liquidator.insert("bnb".into(), liq("bnb"));
         let err = cfg.validate().expect_err("liquidator-only must fail");
-        let msg = format!("{err}");
-        assert!(msg.contains("'bnb'"), "error must name the chain: {msg}");
-        assert!(msg.contains("[liquidator.*]"), "error must cite liquidator: {msg}");
+        match err {
+            ConfigError::HalfWired { chain, present, missing } => {
+                assert_eq!(chain, "bnb");
+                assert_eq!(present, "[liquidator.*]");
+                assert_eq!(missing, "[flashloan.*]");
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
     }
 
     #[test]
-    fn validate_reports_every_mismatched_chain_in_one_pass() {
-        // Two half-wired chains, one of each shape. Operator sees both
-        // without re-running charon.
+    fn validate_reports_first_mismatched_chain_deterministically() {
+        // Two half-wired chains on opposite sides. `BTreeSet::difference`
+        // iterates in lexicographic order so the first variant emitted is
+        // stable across runs. Operators fix, re-run, see the next one.
         let mut cfg = base_config();
         cfg.flashloan.insert("src_a".into(), fl("bnb"));
         cfg.liquidator.insert("liq_b".into(), liq("polygon"));
         let err = cfg.validate().expect_err("two mismatches must fail");
-        let msg = format!("{err}");
-        assert!(msg.contains("'bnb'"), "missing bnb half-wire: {msg}");
-        assert!(msg.contains("'polygon'"), "missing polygon half-wire: {msg}");
+        match err {
+            ConfigError::HalfWired { chain, .. } => {
+                assert_eq!(chain, "bnb", "flashloan-only branch reports first");
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn load_reports_missing_file_as_file_read() {
+        let err = Config::load("/nonexistent/path/charon-config-missing.toml")
+            .expect_err("missing file must error");
+        assert!(matches!(err, ConfigError::FileRead { .. }));
+    }
+
+    #[test]
+    fn substitute_env_vars_reports_unset_as_env_var_missing() {
+        let p = Path::new("/tmp/stub.toml");
+        // Unique var so parallel test runs don't collide with a
+        // caller's env by accident.
+        let err = substitute_env_vars(
+            "ws_url = \"${CHARON_ENV_MISSING_FOR_TESTS_9f3a2c}\"\n",
+            p,
+        )
+        .expect_err("unset env var must error");
+        match err {
+            ConfigError::EnvVarMissing { var, .. } => {
+                assert_eq!(var, "CHARON_ENV_MISSING_FOR_TESTS_9f3a2c");
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn substitute_env_vars_reports_unclosed_placeholder() {
+        let p = Path::new("/tmp/stub.toml");
+        let err = substitute_env_vars("ws_url = \"${NEVER_CLOSED\n", p)
+            .expect_err("unterminated placeholder must error");
+        assert!(matches!(err, ConfigError::UnterminatedPlaceholder { .. }));
+    }
+
+    #[test]
+    fn load_reports_bad_toml_as_toml_parse() {
+        // Write a tiny malformed file into a scratch path and load it.
+        // Using std::env::temp_dir keeps us off `tempfile` (not a dev
+        // dep on this branch) while remaining unique per-test.
+        let tmp = std::env::temp_dir().join("charon_bad_toml_9f3a2c.toml");
+        std::fs::write(&tmp, b"this is = = not toml").expect("write tmp");
+        let err = Config::load(&tmp).expect_err("bad TOML must error");
+        let _ = std::fs::remove_file(&tmp);
+        assert!(matches!(err, ConfigError::TomlParse { .. }));
     }
 
     #[test]
@@ -389,9 +514,9 @@ mod tests {
 }
 
 /// Replace every `${NAME}` in `input` with the value of environment variable
-/// `NAME`. Returns an error if any referenced variable is unset or if a
-/// `${` is not closed by `}`.
-fn substitute_env_vars(input: &str) -> anyhow::Result<String> {
+/// `NAME`. Returns [`ConfigError::UnterminatedPlaceholder`] if a `${` has no
+/// matching `}` and [`ConfigError::EnvVarMissing`] if the variable is not set.
+fn substitute_env_vars(input: &str, path: &Path) -> Result<String> {
     let mut output = String::with_capacity(input.len());
     let mut rest = input;
     while let Some(start) = rest.find("${") {
@@ -399,10 +524,14 @@ fn substitute_env_vars(input: &str) -> anyhow::Result<String> {
         let after = &rest[start + 2..];
         let end = after
             .find('}')
-            .ok_or_else(|| anyhow!("unterminated `${{` in config"))?;
+            .ok_or_else(|| ConfigError::UnterminatedPlaceholder {
+                path: path.to_path_buf(),
+            })?;
         let var_name = &after[..end];
-        let value =
-            std::env::var(var_name).with_context(|| format!("env var `{var_name}` is not set"))?;
+        let value = std::env::var(var_name).map_err(|_| ConfigError::EnvVarMissing {
+            var: var_name.to_string(),
+            path: path.to_path_buf(),
+        })?;
         output.push_str(&value);
         rest = &after[end + 1..];
     }
