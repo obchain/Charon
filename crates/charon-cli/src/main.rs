@@ -178,6 +178,19 @@ async fn run_listen(config: Config, borrowers: Vec<Address>) -> Result<()> {
         .values()
         .find(|l| l.chain == chain_key);
 
+    // Publish run mode up front so dashboards can scope Liquidatable
+    // bucket growth alerts by `charon_run_mode{mode="full"}` and treat
+    // a growing bucket under read-only as expected (testnet demo).
+    // Config::validate (#243) has already guaranteed we are not in a
+    // half-wired state, so the pairing below is deterministic.
+    let run_mode = if aave_cfg.is_some() && liquidator_cfg.is_some() {
+        charon_metrics::run_mode::FULL
+    } else {
+        charon_metrics::run_mode::READ_ONLY
+    };
+    charon_metrics::set_run_mode(run_mode);
+    info!(chain = %chain_key, mode = run_mode, "charon run mode");
+
     // Single shared pub-sub provider — adapter, price cache, flash-loan
     // adapter, and tx builder all hang off it. Cuts WS connection
     // count from 4 to 1.

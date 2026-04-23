@@ -41,6 +41,17 @@ pub mod names {
 
     // Build / runtime
     pub const BUILD_INFO: &str = "charon_build_info";
+    pub const RUN_MODE: &str = "charon_run_mode";
+}
+
+/// Run-mode label value on `charon_run_mode`. `FULL` means flashloan +
+/// liquidator are both configured for the active chain and the
+/// opportunity-processing arm is live; `READ_ONLY` means one or both
+/// are intentionally absent (e.g. testnet) and the scanner + metrics
+/// stay up for observability but no liquidation can execute.
+pub mod run_mode {
+    pub const FULL: &str = "full";
+    pub const READ_ONLY: &str = "read_only";
 }
 
 /// Position classification bucket used as the `bucket` label on
@@ -127,6 +138,10 @@ fn describe_all() {
         names::BUILD_INFO,
         "Build metadata as labels; value is always 1."
     );
+    describe_gauge!(
+        names::RUN_MODE,
+        "Bot run mode as a `mode` label; value is 1 for the active mode and 0 for the inactive one. Lets dashboards colour `charon_scanner_positions{bucket=\"liquidatable\"}` growth as expected (read-only demos) vs alarming (full mode)."
+    );
 }
 
 // ─── Typed helpers (thin wrappers so call sites stay terse) ───────────
@@ -190,6 +205,18 @@ pub fn set_build_info(version: &str, git_sha: &str) {
     .set(1.0);
 }
 
+/// Publish the bot's run mode. Sets `charon_run_mode{mode=<active>}`
+/// to 1 and the other label value to 0 so dashboards can select on
+/// either series without ambiguity. Call once at startup after
+/// `Config::validate` has decided whether the profile is full or
+/// read-only.
+pub fn set_run_mode(active: &str) {
+    for m in [run_mode::FULL, run_mode::READ_ONLY] {
+        let value = if m == active { 1.0 } else { 0.0 };
+        gauge!(names::RUN_MODE, "mode" => m.to_owned()).set(value);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -246,5 +273,7 @@ mod tests {
         record_opportunity_dropped("bnb", drop_stage::BUILD);
         set_queue_depth(3);
         set_build_info("0.1.0", "deadbeef");
+        set_run_mode(run_mode::FULL);
+        set_run_mode(run_mode::READ_ONLY);
     }
 }
