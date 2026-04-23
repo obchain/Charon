@@ -37,7 +37,19 @@ pub struct Config {
 }
 
 /// Prometheus exporter configuration.
+///
+/// `#[serde(deny_unknown_fields)]` makes typos in
+/// `config/default.toml` a hard load-time error — a stray
+/// `metrics.bindd = …` used to be silently ignored, leaving the
+/// exporter on its default loopback bind while the operator
+/// assumed the override took effect. `#[non_exhaustive]` reserves
+/// room to add fields (e.g. TLS, scrape-path override) without a
+/// breaking semver bump; external callers must construct via
+/// [`MetricsConfig::default`] and mutate the fields they care
+/// about rather than using a struct literal.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+#[non_exhaustive]
 pub struct MetricsConfig {
     /// Start the exporter at bot startup. Set to `false` to run charon
     /// with zero metrics overhead (e.g. one-shot debug runs).

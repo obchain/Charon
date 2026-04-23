@@ -104,20 +104,12 @@ async fn main() -> Result<()> {
         "config loaded"
     );
 
-    // Prometheus exporter — install the global recorder before any
-    // subsystem records a metric. Disabled by the operator via
-    // `[metrics] enabled = false` turns the bot into a zero-overhead
-    // one-shot, which is handy for `test-connection` smoke runs.
-    if config.metrics.enabled {
-        charon_metrics::init(config.metrics.bind).await?;
-        charon_metrics::set_build_info(
-            env!("CARGO_PKG_VERSION"),
-            option_env!("CHARON_GIT_SHA").unwrap_or("unknown"),
-        );
-    } else {
-        info!("metrics disabled via config");
-    }
-
+    // `test-connection` is a one-shot smoke test; it does not
+    // stay resident and has no pipeline to instrument, so the
+    // metrics exporter stays off for that subcommand regardless
+    // of config. `run_listen` owns exporter lifecycle so the
+    // listener future can be supervised alongside block
+    // listeners — see #222.
     match cli.command {
         Command::Listen { borrowers } => run_listen(config, borrowers).await?,
         Command::TestConnection { chain } => {
@@ -253,46 +245,110 @@ async fn run_listen(config: Config, borrowers: Vec<Address>) -> Result<()> {
         "pipeline ready (scan-only, no broadcast)"
     );
 
-    // ── Block-event drain ──
+    // ── Supervised long-running tasks ──
+    //
+    // One JoinSet owns every resident task: per-chain block
+    // listeners and the Prometheus exporter HTTP listener. When
+    // any task completes (panic, error, or Ok), we break out of
+    // the drain loop and trigger a controlled shutdown instead
+    // of silently running with a degraded surface — discarding
+    // the exporter's JoinHandle, as before #222, meant a panic
+    // in `hyper`/`tokio` inside the exporter would kill the
+    // task and leave the bot running blind to Grafana.
+    let mut supervised: tokio::task::JoinSet<Result<(), anyhow::Error>> =
+        tokio::task::JoinSet::new();
+
+    // Metrics exporter: install the recorder and push the
+    // returned future into the JoinSet. `install` returns
+    // `Ok(None)` on repeat calls in the same process (#223), in
+    // which case there is nothing to supervise here.
+    if config.metrics.enabled {
+        match charon_metrics::install(config.metrics.bind)? {
+            Some(exporter) => {
+                charon_metrics::set_build_info(
+                    env!("CARGO_PKG_VERSION"),
+                    option_env!("CHARON_GIT_SHA").unwrap_or("unknown"),
+                );
+                supervised.spawn(async move {
+                    exporter
+                        .await
+                        .map_err(|err| anyhow::anyhow!("metrics exporter: {err:?}"))
+                });
+            }
+            None => {
+                info!("metrics exporter already running; skipping duplicate install");
+            }
+        }
+    } else {
+        info!("metrics disabled via config");
+    }
+
     let (tx, mut rx) = mpsc::channel::<ChainEvent>(CHAIN_EVENT_CHANNEL);
     for (name, chain_cfg) in config.chain {
         let listener = BlockListener::new(name.clone(), chain_cfg, tx.clone());
-        tokio::spawn(async move {
-            if let Err(err) = listener.run().await {
-                warn!(chain = %name, error = ?err, "listener terminated");
-            }
+        let chain_name = name.clone();
+        supervised.spawn(async move {
+            listener
+                .run()
+                .await
+                .map_err(|err| anyhow::anyhow!("listener {chain_name}: {err}"))
         });
     }
     drop(tx);
 
     info!("listen: draining chain events (Ctrl-C to stop)");
 
-    tokio::select! {
-        _ = async {
-            while let Some(event) = rx.recv().await {
-                match event {
-                    ChainEvent::NewBlock { chain, number, timestamp } => {
-                        process_block(
-                            chain,
-                            number,
-                            timestamp,
-                            &borrowers,
-                            adapter.clone(),
-                            scanner.clone(),
-                            router.clone(),
-                            tx_builder.clone(),
-                            simulator.clone(),
-                            queue.clone(),
-                            provider.clone(),
-                            config.bot.min_profit_usd,
-                        )
-                        .await;
-                    }
+    let drain = async {
+        while let Some(event) = rx.recv().await {
+            match event {
+                ChainEvent::NewBlock {
+                    chain,
+                    number,
+                    timestamp,
+                } => {
+                    process_block(
+                        chain,
+                        number,
+                        timestamp,
+                        &borrowers,
+                        adapter.clone(),
+                        scanner.clone(),
+                        router.clone(),
+                        tx_builder.clone(),
+                        simulator.clone(),
+                        queue.clone(),
+                        provider.clone(),
+                        config.bot.min_profit_usd,
+                    )
+                    .await;
                 }
             }
-        } => info!("all listeners exited"),
+        }
+    };
+
+    tokio::select! {
+        _ = drain => info!("all listeners exited"),
         _ = tokio::signal::ctrl_c() => info!("ctrl-c received, shutting down"),
+        res = supervised.join_next() => match res {
+            Some(Ok(Ok(()))) => {
+                warn!("a supervised task exited cleanly; shutting down the rest");
+            }
+            Some(Ok(Err(err))) => {
+                warn!(error = ?err, "a supervised task returned an error; shutting down");
+            }
+            Some(Err(err)) => {
+                warn!(error = ?err, "a supervised task panicked; shutting down");
+            }
+            None => {
+                // JoinSet empty — nothing to supervise, fall through.
+            }
+        },
     }
+
+    // Abort any still-running supervised task so the binary does
+    // not hang on shutdown waiting for a listener's WS reconnect.
+    supervised.abort_all();
+    while supervised.join_next().await.is_some() {}
 
     Ok(())
 }

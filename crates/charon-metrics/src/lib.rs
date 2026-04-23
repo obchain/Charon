@@ -18,13 +18,23 @@
 //! ```
 
 use std::net::SocketAddr;
+use std::sync::OnceLock;
 
 use metrics::{counter, describe_counter, describe_gauge, describe_histogram, gauge, histogram};
 use metrics_exporter_prometheus::{
-    BuildError as PromBuildError, Matcher, PrometheusBuilder,
+    BuildError as PromBuildError, ExporterFuture, Matcher, PrometheusBuilder,
 };
 use thiserror::Error;
 use tracing::info;
+
+/// Tracks whether the global Prometheus recorder has already been
+/// installed in this process. `metrics_exporter_prometheus` calls
+/// `metrics::set_global_recorder` under the hood, and that call
+/// panics on a second successful install. Gating [`init`] behind
+/// this `OnceLock` turns a second invocation into a silent no-op
+/// so repeated calls from tests (or a future restart path) do not
+/// tear the process down.
+static INIT: OnceLock<()> = OnceLock::new();
 
 /// Errors returned from [`init`]. Exposed as a `#[non_exhaustive]`
 /// enum so `charon-cli` can distinguish bind failures (port collision
@@ -44,7 +54,7 @@ pub enum MetricsError {
         source: PromBuildError,
     },
     /// Installing the global Prometheus recorder failed. Typically a
-    /// port collision on `bind` or a recorder double-install. The
+    /// port collision on `bind` or an exporter-build error. The
     /// underlying `BuildError` preserves the original diagnosis.
     #[error("failed to install Prometheus exporter on {bind}: {source}")]
     InstallFailed {
@@ -52,6 +62,16 @@ pub enum MetricsError {
         #[source]
         source: PromBuildError,
     },
+    /// The `metrics` global recorder was already installed by some
+    /// other crate in the same process. Distinct from
+    /// [`MetricsError::InstallFailed`] because the fix is
+    /// different: exporter-build errors retry; a foreign recorder
+    /// has to be removed from the dep graph entirely. The
+    /// idempotency gate on [`install`] short-circuits our own
+    /// second install, so reaching this variant means a third
+    /// party got there first.
+    #[error("failed to set global recorder for {bind}: {reason}")]
+    RecorderInstall { bind: SocketAddr, reason: String },
 }
 
 /// Convenience alias so helpers and call sites share one return shape.
@@ -61,8 +81,7 @@ pub type Result<T, E = MetricsError> = std::result::Result<T, E>;
 // BSC produces a block every ~3s; resolution is packed around that
 // threshold so p50/p95 quantiles stay meaningful instead of piling
 // into `+Inf` with the exporter's default HTTP-latency buckets.
-const BLOCK_DURATION_SECONDS_BUCKETS: &[f64] =
-    &[0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 3.0, 5.0, 10.0];
+const BLOCK_DURATION_SECONDS_BUCKETS: &[f64] = &[0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 3.0, 5.0, 10.0];
 
 // Bucket boundaries for `charon_executor_profit_usd_cents`.
 // Realistic Venus liquidation profit spans ~$0.05 dust to ~$10k
@@ -126,12 +145,62 @@ pub mod drop_stage {
 
 /// Install the global Prometheus recorder and start the HTTP listener.
 ///
-/// Safe to call at most once per process; subsequent calls return an
-/// error because the global recorder can only be set once. The exporter
-/// task runs for the lifetime of the tokio runtime — no handle is
-/// returned because it never needs to be stopped in-process.
+/// Idempotent: the first successful call installs the recorder and
+/// spawns the `/metrics` listener, subsequent calls log and return
+/// `Ok(())` without touching the global recorder. This guards against
+/// double-install panics in `metrics::set_global_recorder`, which
+/// would otherwise take the bot down on an accidental retry. The
+/// exporter task runs for the lifetime of the tokio runtime — no
+/// handle is returned because it never needs to be stopped in-process.
 pub async fn init(bind: SocketAddr) -> Result<()> {
-    PrometheusBuilder::new()
+    // Fire-and-forget variant: install the recorder and spawn the
+    // listener future onto the current tokio runtime. The returned
+    // JoinHandle is intentionally discarded here — this path is
+    // meant for tests and for code paths that do not have a
+    // JoinSet supervisor. Production call sites should prefer
+    // [`install`] so the exporter task can be supervised together
+    // with the bot's other long-running tasks (see #222).
+    match install(bind)? {
+        Some(fut) => {
+            tokio::spawn(async move {
+                if let Err(err) = fut.await {
+                    tracing::error!(error = ?err, "metrics exporter task terminated");
+                }
+            });
+        }
+        None => {
+            // Recorder already installed; nothing to drive.
+        }
+    }
+    Ok(())
+}
+
+/// Install the global Prometheus recorder and return the
+/// [`ExporterFuture`] that drives the `/metrics` HTTP listener.
+///
+/// The returned future must be polled for the exporter to accept
+/// scrapes — production code pushes it into the same `JoinSet`
+/// that supervises block listeners so a panic in the exporter
+/// triggers the same controlled-shutdown path (#222). Tests that
+/// do not care about supervision should call [`init`] instead.
+///
+/// Returns `Ok(None)` on the second and later calls in the same
+/// process, because the global recorder can only be installed
+/// once — a second `install()` would panic inside
+/// `metrics::set_global_recorder`, see #223. Callers that got
+/// `None` must skip supervising a listener future; the prior
+/// install still owns the HTTP socket.
+pub fn install(bind: SocketAddr) -> Result<Option<ExporterFuture>> {
+    // Idempotency gate — short-circuit before we touch the
+    // PrometheusBuilder. `INIT` is checked again after the
+    // successful build to close the narrow race where two
+    // concurrent callers both observe `None` here.
+    if INIT.get().is_some() {
+        info!(bind = %bind, "metrics exporter already initialized; skipping re-install");
+        return Ok(None);
+    }
+
+    let (recorder, exporter) = PrometheusBuilder::new()
         .with_http_listener(bind)
         .set_buckets_for_metric(
             Matcher::Full(names::PIPELINE_BLOCK_DURATION_SECONDS.to_string()),
@@ -149,13 +218,31 @@ pub async fn init(bind: SocketAddr) -> Result<()> {
             metric: names::EXECUTOR_PROFIT_USD_CENTS,
             source,
         })?
-        .install()
+        .build()
         .map_err(|source| MetricsError::InstallFailed { bind, source })?;
+
+    // Close the race: if another caller beat us to INIT, drop
+    // the recorder and exporter we just built and report no-op.
+    // `set_global_recorder` below would otherwise panic on
+    // double-install.
+    if INIT.set(()).is_err() {
+        info!(bind = %bind, "metrics exporter lost init race; discarding fresh build");
+        return Ok(None);
+    }
+
+    // `set_global_recorder` fails only if a recorder is already
+    // installed in the process. We check `INIT` above, so the
+    // only way to reach a real failure here is a third-party
+    // crate having already installed a `metrics` recorder.
+    metrics::set_global_recorder(recorder).map_err(|err| MetricsError::RecorderInstall {
+        bind,
+        reason: err.to_string(),
+    })?;
 
     describe_all();
 
     info!(bind = %bind, path = "/metrics", "metrics exporter listening");
-    Ok(())
+    Ok(Some(exporter))
 }
 
 /// Emit Prometheus `# HELP` + `# TYPE` descriptors for every metric
@@ -281,38 +368,6 @@ mod tests {
     use tokio::net::TcpStream;
     use tokio::time::{Duration, sleep};
 
-    /// Smoke-test: `init` must bind the HTTP listener so a subsequent
-    /// TCP connect to `/metrics` succeeds. A failed listener bind is
-    /// the single most common regression when swapping exporter
-    /// versions; this catches it without asserting on the text body.
-    #[tokio::test]
-    async fn init_binds_prometheus_http_listener() {
-        // Port 0 asks the OS for an ephemeral port, avoiding collisions
-        // with any concurrent test run. We then need to know which port
-        // was picked so we can connect back — bind a probe socket first
-        // just to reserve a port number, drop it, hand the number to
-        // the exporter. Races are technically possible but vanishingly
-        // rare in practice on `127.0.0.1`.
-        let probe = std::net::TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))
-            .expect("probe bind");
-        let port = probe
-            .local_addr()
-            .expect("probe socket must expose its bound local_addr")
-            .port();
-        drop(probe);
-
-        let bind = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
-        init(bind).await.expect("init should succeed");
-
-        // Small yield so the listener's spawn has a chance to bind
-        // before the connect probe fires.
-        sleep(Duration::from_millis(50)).await;
-
-        TcpStream::connect(bind)
-            .await
-            .expect("listener should accept TCP connections");
-    }
-
     /// `MetricsError::BucketConfig` must render the offending metric
     /// name in its `Display` string and expose the upstream
     /// `PromBuildError` through `Error::source()` so operator tooling
@@ -323,7 +378,10 @@ mod tests {
     #[test]
     fn bucket_config_error_display_and_source_chain() {
         let err = PrometheusBuilder::new()
-            .set_buckets_for_metric(Matcher::Full(names::EXECUTOR_PROFIT_USD_CENTS.to_string()), &[])
+            .set_buckets_for_metric(
+                Matcher::Full(names::EXECUTOR_PROFIT_USD_CENTS.to_string()),
+                &[],
+            )
             .map_err(|source| MetricsError::BucketConfig {
                 metric: names::EXECUTOR_PROFIT_USD_CENTS,
                 source,
@@ -339,6 +397,60 @@ mod tests {
             std::error::Error::source(&err).is_some(),
             "BucketConfig must expose its PromBuildError as source()"
         );
+    }
+
+    /// Covers two invariants at once because `INIT` is
+    /// process-wide and unit tests in the same binary share it:
+    ///
+    /// 1. The first call binds the `/metrics` HTTP listener so a
+    ///    subsequent TCP connect succeeds — regression gate
+    ///    against broken listener wiring on exporter bumps.
+    /// 2. Second and Nth calls return `Ok(())` without touching
+    ///    the global recorder — `metrics-exporter-prometheus`
+    ///    otherwise panics inside `set_global_recorder`, which
+    ///    would take the bot down on what ought to be a harmless
+    ///    retry (regression gate for #223).
+    ///
+    /// Folded into one test so unit-test ordering cannot leave
+    /// `INIT` in a pre-set state and silently skip the bind
+    /// assertion in a sibling test.
+    #[tokio::test]
+    async fn init_binds_listener_and_is_idempotent() {
+        // Port 0 asks the OS for an ephemeral port, avoiding
+        // collisions with any concurrent test run. Bind a probe
+        // socket, record the number, drop it, hand the port to
+        // the exporter. Races are technically possible but
+        // vanishingly rare on 127.0.0.1 and do not compromise
+        // correctness — the connect probe below would simply
+        // fail loudly.
+        let probe = std::net::TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))
+            .expect("probe bind");
+        let port = probe
+            .local_addr()
+            .expect("probe socket must expose its bound local_addr")
+            .port();
+        drop(probe);
+
+        let bind = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
+        init(bind).await.expect("first init should succeed");
+
+        // Yield so the listener's spawn binds before we probe.
+        sleep(Duration::from_millis(50)).await;
+
+        TcpStream::connect(bind)
+            .await
+            .expect("listener should accept TCP connections");
+
+        // Re-invoke with a deliberately unusable bind. If the
+        // idempotency gate were missing, PrometheusBuilder would
+        // attempt a fresh install and panic inside
+        // `set_global_recorder`. We assert `Ok(())` and that the
+        // listener never moves off `bind`.
+        let bogus = SocketAddr::from((Ipv4Addr::LOCALHOST, 0));
+        init(bogus)
+            .await
+            .expect("second init must be a silent no-op");
+        init(bogus).await.expect("third init must also be a no-op");
     }
 
     /// Typed helpers must not panic when called — this exercises every
