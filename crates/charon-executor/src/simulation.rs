@@ -14,6 +14,7 @@ use alloy::primitives::{Address, Bytes};
 use alloy::providers::Provider;
 use alloy::rpc::types::TransactionRequest;
 use anyhow::Result;
+use charon_metrics::{endpoint_kind, record_rpc_error, rpc_error, rpc_method, time_rpc};
 use tracing::{debug, warn};
 
 /// Stateless simulator — holds the sender + target contract address
@@ -48,7 +49,19 @@ impl Simulator {
             .to(self.liquidator)
             .input(calldata.into());
 
-        match provider.call(&req).await {
+        // `time_rpc` owns the histogram sample — the error branch
+        // below classifies the failure separately. The simulator
+        // talks to the same chain RPC the scanner uses (no private
+        // submission relay), so the endpoint kind is `public`.
+        // `provider.call(..)` in alloy 0.8 returns an `EthCall`
+        // builder (`IntoFuture`, not `Future`); wrap the `.await`
+        // in a plain async block so `time_rpc` sees a `Future`.
+        let outcome = time_rpc(rpc_method::ETH_CALL, endpoint_kind::PUBLIC, async {
+            provider.call(&req).await
+        })
+        .await;
+
+        match outcome {
             Ok(out) => {
                 debug!(
                     sender = %self.sender,
@@ -60,6 +73,12 @@ impl Simulator {
             }
             Err(err) => {
                 let msg = format!("{err:#}");
+                // A reverted simulation is a deterministic RPC-level
+                // rejection (the node executed the call and returned
+                // a failure), which is the textbook `rejected`
+                // classification — not a transport-layer timeout or
+                // connection drop.
+                record_rpc_error(rpc_method::ETH_CALL, rpc_error::REJECTED);
                 warn!(
                     sender = %self.sender,
                     target = %self.liquidator,

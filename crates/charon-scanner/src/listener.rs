@@ -56,6 +56,12 @@ impl BlockListener {
     /// Run the listener forever. Reconnects with exponential backoff on
     /// any connection or subscription error. Returns `Ok(())` only if the
     /// receiving side of the channel is dropped.
+    ///
+    /// Increments
+    /// [`charon_rpc_connection_reconnects_total`](charon_metrics::names::RPC_RECONNECTS_TOTAL)
+    /// under `endpoint_kind="public"` on every reconnect attempt
+    /// (issue #302) — the `newHeads` stream rides the chain's
+    /// public pubsub endpoint.
     pub async fn run(self) -> Result<()> {
         let mut backoff = Duration::from_secs(1);
         loop {
@@ -66,6 +72,9 @@ impl BlockListener {
                     return Ok(());
                 }
                 Err(err) => {
+                    charon_metrics::record_rpc_reconnect(
+                        charon_metrics::endpoint_kind::PUBLIC,
+                    );
                     warn!(
                         chain = %self.name,
                         error = ?err,

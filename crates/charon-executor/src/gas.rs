@@ -34,8 +34,15 @@ pub struct GasParams {
 }
 
 /// Per-chain gas oracle. Construct once per chain at startup.
-#[derive(Debug, Clone, Copy)]
+///
+/// Owns the chain's short name (matches the `[chain.<name>]` key in
+/// config) so every gas-metric emission carries a stable `chain`
+/// label — same string the scanner uses, so dashboards can join the
+/// executor's gas panels against scanner panels on a single label.
+#[derive(Debug, Clone)]
 pub struct GasOracle {
+    /// Short chain name used as the `chain` metric label.
+    chain: String,
     /// Drop the tx if `max_fee_per_gas` exceeds this (gwei).
     max_gas_gwei: u64,
     /// EIP-1559 priority fee, gwei.
@@ -43,8 +50,13 @@ pub struct GasOracle {
 }
 
 impl GasOracle {
-    pub fn new(max_gas_gwei: u64, priority_fee_gwei: u64) -> Self {
+    /// Build an oracle for one chain.
+    ///
+    /// `chain` is the short name used as the `chain` metric label
+    /// across the scanner/executor stacks — typically `"bnb"` on BSC.
+    pub fn new(chain: impl Into<String>, max_gas_gwei: u64, priority_fee_gwei: u64) -> Self {
         Self {
+            chain: chain.into(),
             max_gas_gwei,
             priority_fee_gwei,
         }
@@ -53,6 +65,15 @@ impl GasOracle {
     /// Read the latest base fee, bump it 25 %, attach the priority fee.
     /// Returns `Ok(None)` when the resulting `max_fee_per_gas` exceeds
     /// the configured ceiling — caller should skip the opportunity.
+    ///
+    /// Emits three gauges on every successful read
+    /// ([`charon_gas_base_fee_wei`](charon_metrics::names::GAS_BASE_FEE_WEI),
+    /// [`charon_gas_priority_fee_wei`](charon_metrics::names::GAS_PRIORITY_FEE_WEI),
+    /// [`charon_gas_max_fee_wei`](charon_metrics::names::GAS_MAX_FEE_WEI))
+    /// and increments
+    /// [`charon_gas_ceiling_skips_total`](charon_metrics::names::GAS_CEILING_SKIPS_TOTAL)
+    /// on the ceiling-hit branch. Each sample is labelled with the
+    /// chain name this oracle was built for. Issue #301.
     pub async fn fetch_params<P, T>(&self, provider: &P) -> Result<Option<GasParams>>
     where
         P: Provider<T>,
@@ -73,11 +94,23 @@ impl GasOracle {
             .context("gas oracle: header has no base_fee_per_gas (pre-EIP-1559 chain?)")?
             .into();
 
+        // Record the raw `baseFeePerGas` reading before any
+        // checked-arithmetic branch can bail — a chain that's mid
+        // base-fee spike is exactly when we want the gauge to move.
+        charon_metrics::set_gas_base_fee_wei(&self.chain, base_fee);
+
         let max_fee = base_fee
             .checked_mul(BASE_FEE_BUMP_PCT)
             .context("gas oracle: max-fee multiplication overflow")?
             / BPS_DIV;
         let max_fee_gwei = max_fee / ONE_GWEI;
+        let max_priority_fee_per_gas = u128::from(self.priority_fee_gwei) * ONE_GWEI;
+
+        // Priority fee is configured (not RPC-derived) but still
+        // surfaced on the gauge so operators can confirm the bot
+        // picked up the expected per-chain value after a config
+        // reload.
+        charon_metrics::set_gas_priority_fee_wei(&self.chain, max_priority_fee_per_gas);
 
         if max_fee_gwei > u128::from(self.max_gas_gwei) {
             warn!(
@@ -85,14 +118,23 @@ impl GasOracle {
                 ceiling_gwei = self.max_gas_gwei,
                 "gas exceeds configured ceiling — skipping tx"
             );
+            charon_metrics::record_gas_ceiling_skip(
+                &self.chain,
+                charon_metrics::gas_skip_reason::CEILING,
+            );
+            // Leave `GAS_MAX_FEE_WEI` untouched on the skip branch:
+            // the gauge's semantic is "max fee the last *submitted*
+            // tx carried", so setting it from a rejected proposal
+            // would make dashboards lie about the real worst-case
+            // submission cost.
             return Ok(None);
         }
 
-        let max_priority_fee_per_gas = u128::from(self.priority_fee_gwei) * ONE_GWEI;
         let params = GasParams {
             max_fee_per_gas: max_fee,
             max_priority_fee_per_gas,
         };
+        charon_metrics::set_gas_max_fee_wei(&self.chain, params.max_fee_per_gas);
         debug!(
             base_fee_gwei = base_fee / ONE_GWEI,
             max_fee_gwei = params.max_fee_per_gas / ONE_GWEI,

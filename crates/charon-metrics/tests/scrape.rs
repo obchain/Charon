@@ -51,6 +51,31 @@ async fn scrape_returns_valid_prometheus_text() {
     record_block_scanned("bnb");
     charon_metrics::set_position_bucket("bnb", charon_metrics::bucket::HEALTHY, 1);
 
+    // Mempool (#300), gas (#301), and RPC (#302) series — record
+    // at least one sample per series so the scrape surfaces the
+    // metric name and its expected label set. Each of these is the
+    // end-to-end regression gate for a typo in the name constant
+    // or a missing `describe_*` registration.
+    charon_metrics::set_mempool_pending_oracle_updates("bnb", 2);
+    charon_metrics::record_mempool_drained("bnb", 5);
+    charon_metrics::record_mempool_ws_reconnect("bnb");
+
+    charon_metrics::set_gas_base_fee_wei("bnb", 3_000_000_000);
+    charon_metrics::set_gas_priority_fee_wei("bnb", 1_000_000_000);
+    charon_metrics::set_gas_max_fee_wei("bnb", 5_000_000_000);
+    charon_metrics::record_gas_ceiling_skip("bnb", charon_metrics::gas_skip_reason::CEILING);
+
+    charon_metrics::record_rpc_call(
+        charon_metrics::rpc_method::ETH_CALL,
+        charon_metrics::endpoint_kind::PUBLIC,
+        0.012,
+    );
+    charon_metrics::record_rpc_error(
+        charon_metrics::rpc_method::ETH_CALL,
+        charon_metrics::rpc_error::TIMEOUT,
+    );
+    charon_metrics::record_rpc_reconnect(charon_metrics::endpoint_kind::PRIVATE);
+
     // Give the recorder a beat to flush the new sample into the
     // renderer's internal state.
     tokio::time::sleep(Duration::from_millis(50)).await;
@@ -91,6 +116,53 @@ async fn scrape_returns_valid_prometheus_text() {
     assert!(
         body.contains("chain=\"bnb\""),
         "scrape body missing expected `chain=\"bnb\"` label; got:\n{body}"
+    );
+
+    // Each new series (#300 / #301 / #302) must appear by name so
+    // typos in the constants or a missing describe_* call surface
+    // here. Label values exercised above are checked for at least
+    // one representative sample per metric family.
+    for name in [
+        names::MEMPOOL_PENDING_ORACLE_UPDATES,
+        names::MEMPOOL_DRAINED_TOTAL,
+        names::MEMPOOL_WS_RECONNECTS_TOTAL,
+        names::GAS_BASE_FEE_WEI,
+        names::GAS_PRIORITY_FEE_WEI,
+        names::GAS_MAX_FEE_WEI,
+        names::GAS_CEILING_SKIPS_TOTAL,
+        names::RPC_CALL_DURATION_SECONDS,
+        names::RPC_ERRORS_TOTAL,
+        names::RPC_RECONNECTS_TOTAL,
+    ] {
+        assert!(
+            body.contains(name),
+            "scrape body missing `{name}`; got:\n{body}"
+        );
+    }
+
+    // Label-set regression gates: one representative pair per
+    // metric family. A drift in label naming (e.g. renaming
+    // `endpoint_kind` to `kind`) otherwise silently breaks every
+    // dashboard that pivots on the label.
+    assert!(
+        body.contains("reason=\"ceiling\""),
+        "gas ceiling-skip counter missing `reason` label; got:\n{body}"
+    );
+    assert!(
+        body.contains("method=\"eth_call\""),
+        "rpc duration histogram missing `method` label; got:\n{body}"
+    );
+    assert!(
+        body.contains("endpoint_kind=\"public\""),
+        "rpc duration histogram missing `endpoint_kind` label; got:\n{body}"
+    );
+    assert!(
+        body.contains("error_kind=\"timeout\""),
+        "rpc error counter missing `error_kind` label; got:\n{body}"
+    );
+    assert!(
+        body.contains("endpoint_kind=\"private\""),
+        "rpc reconnect counter missing `endpoint_kind=\"private\"`; got:\n{body}"
     );
 }
 

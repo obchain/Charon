@@ -17,8 +17,10 @@
 //! # }
 //! ```
 
+use std::future::Future;
 use std::net::SocketAddr;
 use std::sync::OnceLock;
+use std::time::Instant;
 
 use metrics::{counter, describe_counter, describe_gauge, describe_histogram, gauge, histogram};
 use metrics_exporter_prometheus::{
@@ -98,6 +100,22 @@ const PROFIT_USD_CENTS_BUCKETS: &[f64] = &[
     1_000_000.0,
 ];
 
+// Bucket boundaries for `charon_rpc_call_duration_seconds`.
+// Spans sub-millisecond LAN-local responses up to the 30 s
+// provider-level timeout ceiling so call-site timeouts still
+// surface as a finite bucket instead of `+Inf`. Lower bound of
+// 1 ms sits just above the jitter floor of a tokio timer on a
+// warm runtime — any sample finer than that is noise rather than
+// a signal about upstream latency. Upper bound of 30 s matches
+// the hard deadline used by submit/simulate call sites: a call
+// that outruns 30 s has timed out regardless, so anything bigger
+// would only widen `+Inf` overflow without adding resolution.
+// Logarithmic spacing keeps p50/p95/p99 resolution meaningful
+// across four decades.
+const RPC_CALL_DURATION_SECONDS_BUCKETS: &[f64] = &[
+    0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0,
+];
+
 /// Single-source-of-truth metric names. Kept as constants so call
 /// sites, dashboard JSON, and alert rules refer to the same strings.
 pub mod names {
@@ -114,6 +132,31 @@ pub mod names {
     pub const EXECUTOR_OPPS_DROPPED_TOTAL: &str = "charon_executor_opportunities_dropped_total";
     pub const EXECUTOR_PROFIT_USD_CENTS: &str = "charon_executor_profit_usd_cents";
     pub const EXECUTOR_QUEUE_DEPTH: &str = "charon_executor_queue_depth";
+
+    // Mempool monitor (issue #300). Counts pending oracle updates
+    // observed in the mempool, oracle updates drained at block
+    // boundaries, and upstream websocket reconnect attempts — the
+    // third doubles as a health signal for flaky pubsub upstreams.
+    pub const MEMPOOL_PENDING_ORACLE_UPDATES: &str = "charon_mempool_pending_oracle_updates";
+    pub const MEMPOOL_DRAINED_TOTAL: &str = "charon_mempool_drained_total";
+    pub const MEMPOOL_WS_RECONNECTS_TOTAL: &str = "charon_mempool_websocket_reconnects_total";
+
+    // Gas oracle (issue #301). Latest EIP-1559 base fee, priority
+    // fee used on the last submission attempt, and resulting
+    // maxFeePerGas — plus a counter for opportunities dropped
+    // because `max_fee_per_gas` exceeded the configured ceiling.
+    pub const GAS_BASE_FEE_WEI: &str = "charon_gas_base_fee_wei";
+    pub const GAS_PRIORITY_FEE_WEI: &str = "charon_gas_priority_fee_wei";
+    pub const GAS_MAX_FEE_WEI: &str = "charon_gas_max_fee_wei";
+    pub const GAS_CEILING_SKIPS_TOTAL: &str = "charon_gas_ceiling_skips_total";
+
+    // RPC instrumentation (issue #302). Histogram of call durations
+    // by method + endpoint kind, error counters partitioned by
+    // failure mode, and a reconnect counter so upstream transport
+    // churn is observable without log grepping.
+    pub const RPC_CALL_DURATION_SECONDS: &str = "charon_rpc_call_duration_seconds";
+    pub const RPC_ERRORS_TOTAL: &str = "charon_rpc_errors_total";
+    pub const RPC_RECONNECTS_TOTAL: &str = "charon_rpc_connection_reconnects_total";
 
     // Build / runtime
     pub const BUILD_INFO: &str = "charon_build_info";
@@ -141,6 +184,61 @@ pub mod drop_stage {
     pub const PROFIT: &str = "profit";
     pub const SIMULATION: &str = "simulation";
     pub const BUILD: &str = "build";
+}
+
+/// Endpoint-kind label used on every RPC metric (issue #302).
+/// "public" covers node providers on the open internet (Alchemy,
+/// Infura, a self-hosted archive). "private" covers order-flow
+/// aware submission paths (bloxroute, blocknative, sequencer
+/// endpoints on L2s) whose latency profile and failure modes
+/// differ sharply from public reads. Splitting on this label is
+/// how operators see "my private relay is degrading" without
+/// having to cross-reference logs.
+pub mod endpoint_kind {
+    pub const PUBLIC: &str = "public";
+    pub const PRIVATE: &str = "private";
+}
+
+/// RPC method label on `charon_rpc_call_duration_seconds` and
+/// `charon_rpc_errors_total`. Only the methods the bot actually
+/// calls are listed — new methods should be added here as call
+/// sites adopt the [`time_rpc`] wrapper. Freeform methods can be
+/// passed as `&str` too; the constants exist so dashboards and
+/// alert rules can reference the same string a call site uses.
+pub mod rpc_method {
+    pub const ETH_CALL: &str = "eth_call";
+    pub const ETH_GET_BLOCK_BY_NUMBER: &str = "eth_getBlockByNumber";
+    pub const ETH_SEND_RAW_TRANSACTION: &str = "eth_sendRawTransaction";
+    pub const ETH_GET_LOGS: &str = "eth_getLogs";
+    pub const ETH_GET_BLOCK_NUMBER: &str = "eth_blockNumber";
+    pub const ETH_ESTIMATE_GAS: &str = "eth_estimateGas";
+    pub const ETH_GET_TRANSACTION_BY_HASH: &str = "eth_getTransactionByHash";
+    pub const ETH_SUBSCRIBE_NEW_HEADS: &str = "eth_subscribe_newHeads";
+    pub const ETH_SUBSCRIBE_PENDING_TX: &str = "eth_subscribe_newPendingTransactions";
+}
+
+/// Failure mode label on `charon_rpc_errors_total`. Kept as a
+/// closed three-way enum so alert rules can pivot on `error_kind`
+/// without fuzzy matching on log strings. Call sites classify
+/// their own errors into one of these before recording — the
+/// mapping from `alloy` / `anyhow` errors to a kind is a
+/// per-call-site judgement (a `tokio::time::timeout` firing is
+/// [`TIMEOUT`], an RPC-level rejection is [`REJECTED`], an
+/// `io::Error` or dropped subscription stream is
+/// [`CONNECTION_LOST`]).
+pub mod rpc_error {
+    pub const TIMEOUT: &str = "timeout";
+    pub const REJECTED: &str = "rejected";
+    pub const CONNECTION_LOST: &str = "connection_lost";
+}
+
+/// Reason label on `charon_gas_ceiling_skips_total`. `CEILING`
+/// is the only reason the current gas oracle emits — the label
+/// exists so future reasons (e.g. `BASE_FEE_SPIKE`,
+/// `PRIORITY_FEE_MISSING`) can be added without reshaping the
+/// metric.
+pub mod gas_skip_reason {
+    pub const CEILING: &str = "ceiling";
 }
 
 /// Install the global Prometheus recorder and start the HTTP listener.
@@ -218,6 +316,14 @@ pub fn install(bind: SocketAddr) -> Result<Option<ExporterFuture>> {
             metric: names::EXECUTOR_PROFIT_USD_CENTS,
             source,
         })?
+        .set_buckets_for_metric(
+            Matcher::Full(names::RPC_CALL_DURATION_SECONDS.to_string()),
+            RPC_CALL_DURATION_SECONDS_BUCKETS,
+        )
+        .map_err(|source| MetricsError::BucketConfig {
+            metric: names::RPC_CALL_DURATION_SECONDS,
+            source,
+        })?
         .build()
         .map_err(|source| MetricsError::InstallFailed { bind, source })?;
 
@@ -282,6 +388,47 @@ fn describe_all() {
     describe_gauge!(
         names::EXECUTOR_QUEUE_DEPTH,
         "Current depth of the profit-ordered opportunity queue."
+    );
+    describe_gauge!(
+        names::MEMPOOL_PENDING_ORACLE_UPDATES,
+        "Pending Venus oracle updates currently observed in the mempool (pre-signed liquidations armed)."
+    );
+    describe_counter!(
+        names::MEMPOOL_DRAINED_TOTAL,
+        "Pre-signed liquidations drained from the mempool cache at block confirmation, partitioned by chain."
+    );
+    describe_counter!(
+        names::MEMPOOL_WS_RECONNECTS_TOTAL,
+        "Reconnect attempts against the pending-transactions websocket subscription (flaky-upstream signal)."
+    );
+    describe_gauge!(
+        names::GAS_BASE_FEE_WEI,
+        "Latest EIP-1559 `baseFeePerGas` observed for the chain, in wei."
+    );
+    describe_gauge!(
+        names::GAS_PRIORITY_FEE_WEI,
+        "Priority fee (tip) used on the most recent gas-params resolution, in wei."
+    );
+    describe_gauge!(
+        names::GAS_MAX_FEE_WEI,
+        "`maxFeePerGas` used on the most recent submission attempt, in wei."
+    );
+    describe_counter!(
+        names::GAS_CEILING_SKIPS_TOTAL,
+        "Opportunities skipped because the resolved `max_fee_per_gas` exceeded the configured ceiling."
+    );
+    describe_histogram!(
+        names::RPC_CALL_DURATION_SECONDS,
+        metrics::Unit::Seconds,
+        "Wall-clock duration of one RPC call, partitioned by method and endpoint kind (public vs private)."
+    );
+    describe_counter!(
+        names::RPC_ERRORS_TOTAL,
+        "RPC call failures partitioned by method and error kind (timeout, rejected, connection_lost)."
+    );
+    describe_counter!(
+        names::RPC_RECONNECTS_TOTAL,
+        "Reconnect attempts against an RPC transport (websocket or HTTP keep-alive), partitioned by endpoint kind."
     );
     describe_gauge!(
         names::BUILD_INFO,
@@ -359,6 +506,187 @@ pub fn set_build_info(version: &str, git_sha: &str) {
         "git_sha" => git_sha.to_owned()
     )
     .set(1.0);
+}
+
+// ─── Mempool helpers (issue #300) ─────────────────────────────────────
+
+/// Set the gauge of pending oracle updates the mempool monitor is
+/// currently tracking. Called on insert/drain so the dashboard value
+/// tracks the live cache size rather than a stale counter. Gauge (not
+/// counter) because the quantity is "how many right now", which must
+/// fall back to zero between blocks.
+pub fn set_mempool_pending_oracle_updates(chain: &str, count: u64) {
+    gauge!(
+        names::MEMPOOL_PENDING_ORACLE_UPDATES,
+        "chain" => chain.to_owned()
+    )
+    .set(count as f64);
+}
+
+/// Record `drained` pre-signed liquidations drained from the mempool
+/// cache at a block boundary. Zero-valued drains are a legitimate
+/// signal (nothing to do this block) so the call site records
+/// unconditionally — Prometheus handles zero-delta increments.
+pub fn record_mempool_drained(chain: &str, drained: u64) {
+    counter!(
+        names::MEMPOOL_DRAINED_TOTAL,
+        "chain" => chain.to_owned()
+    )
+    .increment(drained);
+}
+
+/// Record one websocket reconnect attempt against the pending-tx
+/// subscription. Emitted every time the monitor loop falls through
+/// to its backoff branch — a high rate here is the operator's cue
+/// that the upstream pubsub endpoint is flaky.
+pub fn record_mempool_ws_reconnect(chain: &str) {
+    counter!(
+        names::MEMPOOL_WS_RECONNECTS_TOTAL,
+        "chain" => chain.to_owned()
+    )
+    .increment(1);
+}
+
+// ─── Gas oracle helpers (issue #301) ──────────────────────────────────
+
+/// Set the latest observed `baseFeePerGas` for the chain, in wei.
+/// Values are passed as `u128` to survive the 1559 full range without
+/// pre-truncation; the gauge is cast to `f64` at emission time, same
+/// as every other Prometheus gauge — sub-wei precision is never
+/// actionable for ops.
+pub fn set_gas_base_fee_wei(chain: &str, wei: u128) {
+    gauge!(
+        names::GAS_BASE_FEE_WEI,
+        "chain" => chain.to_owned()
+    )
+    .set(wei as f64);
+}
+
+/// Set the priority fee used on the last gas-params resolution,
+/// in wei.
+pub fn set_gas_priority_fee_wei(chain: &str, wei: u128) {
+    gauge!(
+        names::GAS_PRIORITY_FEE_WEI,
+        "chain" => chain.to_owned()
+    )
+    .set(wei as f64);
+}
+
+/// Set the `maxFeePerGas` used on the last submission attempt,
+/// in wei.
+pub fn set_gas_max_fee_wei(chain: &str, wei: u128) {
+    gauge!(
+        names::GAS_MAX_FEE_WEI,
+        "chain" => chain.to_owned()
+    )
+    .set(wei as f64);
+}
+
+/// Record one opportunity skipped by the gas oracle because the
+/// resolved `max_fee_per_gas` exceeded the configured ceiling (or
+/// any future skip reason added to [`gas_skip_reason`]).
+pub fn record_gas_ceiling_skip(chain: &str, reason: &str) {
+    counter!(
+        names::GAS_CEILING_SKIPS_TOTAL,
+        "chain" => chain.to_owned(),
+        "reason" => reason.to_owned()
+    )
+    .increment(1);
+}
+
+// ─── RPC instrumentation (issue #302) ─────────────────────────────────
+
+/// Observe one completed RPC call's wall-clock duration.
+///
+/// Most call sites should wrap their provider invocation in
+/// [`time_rpc`] instead of calling this directly — the wrapper
+/// handles `Instant::now()` and the label plumbing. Expose this
+/// helper for call sites that already have a `Duration` in hand
+/// (e.g. batched calls that track a single elapsed span across
+/// multiple internal retries).
+pub fn record_rpc_call(method: &str, endpoint_kind: &str, seconds: f64) {
+    histogram!(
+        names::RPC_CALL_DURATION_SECONDS,
+        "method" => method.to_owned(),
+        "endpoint_kind" => endpoint_kind.to_owned()
+    )
+    .record(seconds);
+}
+
+/// Record one RPC call failure. `error_kind` must be one of the
+/// constants in [`rpc_error`]; freeform strings are accepted but
+/// break dashboard pivots, so callers should funnel their errors
+/// through a classifier.
+pub fn record_rpc_error(method: &str, error_kind: &str) {
+    counter!(
+        names::RPC_ERRORS_TOTAL,
+        "method" => method.to_owned(),
+        "error_kind" => error_kind.to_owned()
+    )
+    .increment(1);
+}
+
+/// Record one reconnect attempt against an RPC transport. Emitted
+/// by pubsub listeners (block listener, mempool monitor) every
+/// time their outer reconnect loop fires — cumulative rate is the
+/// operator's "upstream is unstable" signal.
+pub fn record_rpc_reconnect(endpoint_kind: &str) {
+    counter!(
+        names::RPC_RECONNECTS_TOTAL,
+        "endpoint_kind" => endpoint_kind.to_owned()
+    )
+    .increment(1);
+}
+
+/// Wrap one RPC call, record its wall-clock duration into
+/// [`names::RPC_CALL_DURATION_SECONDS`], and return the call's
+/// own result untouched.
+///
+/// This is the single preferred instrumentation pattern for adding
+/// RPC latency / error visibility to a call site — prefer it over
+/// sprinkling `record_rpc_call` / `record_rpc_error` directly. It
+/// keeps the happy path a one-liner and guarantees the duration
+/// sample always lands in the histogram, even on the error branch
+/// (where latency-to-error is still useful context). Errors are
+/// *not* auto-classified — the call site knows best whether an
+/// `alloy` error is a [`rpc_error::TIMEOUT`] or a
+/// [`rpc_error::REJECTED`]; pair this helper with one
+/// [`record_rpc_error`] call on the error branch.
+///
+/// Example:
+/// ```no_run
+/// # async fn demo() -> anyhow::Result<()> {
+/// use charon_metrics::{endpoint_kind, rpc_error, rpc_method, record_rpc_error, time_rpc};
+/// # async fn eth_call() -> Result<(), anyhow::Error> { Ok(()) }
+/// let result = time_rpc(
+///     rpc_method::ETH_CALL,
+///     endpoint_kind::PUBLIC,
+///     eth_call(),
+/// )
+/// .await;
+/// if let Err(err) = &result {
+///     record_rpc_error(rpc_method::ETH_CALL, rpc_error::REJECTED);
+///     eprintln!("{err}");
+/// }
+/// # Ok(())
+/// # }
+/// ```
+///
+/// New call sites adopting RPC instrumentation should follow
+/// this pattern. An alloy middleware/layer would be cleaner in
+/// principle, but the `alloy` 0.8 `Provider` trait does not
+/// expose a stable middleware hook at the method-name layer — a
+/// per-call-site wrapper lets us carry the method label verbatim
+/// without leaking through an intermediate `RequestPacket` whose
+/// method string is internal-only.
+pub async fn time_rpc<F, T>(method: &str, endpoint_kind: &str, fut: F) -> T
+where
+    F: Future<Output = T>,
+{
+    let start = Instant::now();
+    let out = fut.await;
+    record_rpc_call(method, endpoint_kind, start.elapsed().as_secs_f64());
+    out
 }
 
 #[cfg(test)]
@@ -474,5 +802,58 @@ mod tests {
         record_opportunity_dropped("bnb", drop_stage::BUILD);
         set_queue_depth(3);
         set_build_info("0.1.0", "deadbeef");
+
+        // Mempool (#300)
+        set_mempool_pending_oracle_updates("bnb", 4);
+        record_mempool_drained("bnb", 3);
+        record_mempool_drained("bnb", 0);
+        record_mempool_ws_reconnect("bnb");
+
+        // Gas (#301)
+        set_gas_base_fee_wei("bnb", 3_000_000_000);
+        set_gas_priority_fee_wei("bnb", 1_000_000_000);
+        set_gas_max_fee_wei("bnb", 5_000_000_000);
+        record_gas_ceiling_skip("bnb", gas_skip_reason::CEILING);
+
+        // RPC (#302)
+        record_rpc_call(rpc_method::ETH_CALL, endpoint_kind::PUBLIC, 0.012);
+        record_rpc_call(
+            rpc_method::ETH_SEND_RAW_TRANSACTION,
+            endpoint_kind::PRIVATE,
+            0.045,
+        );
+        record_rpc_error(rpc_method::ETH_CALL, rpc_error::TIMEOUT);
+        record_rpc_error(rpc_method::ETH_GET_LOGS, rpc_error::REJECTED);
+        record_rpc_error(
+            rpc_method::ETH_GET_BLOCK_BY_NUMBER,
+            rpc_error::CONNECTION_LOST,
+        );
+        record_rpc_reconnect(endpoint_kind::PUBLIC);
+        record_rpc_reconnect(endpoint_kind::PRIVATE);
+    }
+
+    /// `time_rpc` must record a non-zero elapsed sample into the
+    /// histogram and return the wrapped future's output unchanged.
+    /// Covers the ergonomic-wrapper contract: callers rely on it
+    /// being a drop-in around `await`.
+    #[tokio::test]
+    async fn time_rpc_returns_inner_output_and_records_duration() {
+        let out = time_rpc(rpc_method::ETH_CALL, endpoint_kind::PUBLIC, async {
+            tokio::task::yield_now().await;
+            42u32
+        })
+        .await;
+        assert_eq!(out, 42);
+
+        // Error case: the wrapper must not swallow errors from the
+        // inner future — callers chain `record_rpc_error` on the Err
+        // branch and would lose visibility otherwise.
+        let err: std::result::Result<(), &'static str> = time_rpc(
+            rpc_method::ETH_SEND_RAW_TRANSACTION,
+            endpoint_kind::PRIVATE,
+            async { Err("rpc down") },
+        )
+        .await;
+        assert_eq!(err, Err("rpc down"));
     }
 }

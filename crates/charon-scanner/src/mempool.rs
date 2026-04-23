@@ -115,8 +115,15 @@ pub struct PreSignedLiquidation {
 /// Pure decode + pre-sign storage. Separated from the RPC layer so
 /// tests can exercise the selector logic and TTL semantics without
 /// opening a socket.
+///
+/// Holds the chain's short name so the mempool metrics (#300) can
+/// be labelled with the same `chain` key the scanner and gas oracle
+/// use. Default constructors fall back to `"unknown"` rather than
+/// refusing construction — unit tests for the decoder don't care,
+/// and production call sites always pass an explicit name.
 #[derive(Debug)]
 pub struct PendingCache {
+    chain: String,
     oracle: Address,
     selectors: HashSet<FixedBytes<4>>,
     pending: DashMap<Address, PreSignedLiquidation>,
@@ -125,11 +132,13 @@ pub struct PendingCache {
 
 impl PendingCache {
     pub fn new(
+        chain: impl Into<String>,
         oracle: Address,
         selectors: HashSet<FixedBytes<4>>,
         max_pending_age: Duration,
     ) -> Self {
         Self {
+            chain: chain.into(),
             oracle,
             selectors,
             pending: DashMap::new(),
@@ -138,11 +147,16 @@ impl PendingCache {
     }
 
     pub fn with_defaults(oracle: Address) -> Self {
-        Self::new(oracle, default_selectors(), DEFAULT_MAX_PENDING_AGE)
+        Self::new("unknown", oracle, default_selectors(), DEFAULT_MAX_PENDING_AGE)
     }
 
     pub fn oracle(&self) -> Address {
         self.oracle
+    }
+
+    /// Chain label the cache emits with on every mempool metric.
+    pub fn chain(&self) -> &str {
+        &self.chain
     }
 
     pub fn is_tracked_selector(&self, selector: FixedBytes<4>) -> bool {
@@ -153,6 +167,11 @@ impl PendingCache {
     /// entry for the same borrower — the most recent oracle update
     /// wins, which is what we want when two updates land in the same
     /// block window (the later one is what the chain will see).
+    ///
+    /// Refreshes the
+    /// [`charon_mempool_pending_oracle_updates`](charon_metrics::names::MEMPOOL_PENDING_ORACLE_UPDATES)
+    /// gauge so dashboards track the live cache size even between
+    /// block-boundary drains. Issue #300.
     pub fn insert(&self, tx: PreSignedLiquidation) {
         debug!(
             borrower = %tx.borrower,
@@ -160,6 +179,10 @@ impl PendingCache {
             "pre-signed liquidation armed"
         );
         self.pending.insert(tx.borrower, tx);
+        charon_metrics::set_mempool_pending_oracle_updates(
+            &self.chain,
+            self.pending.len() as u64,
+        );
     }
 
     pub fn pending_len(&self) -> usize {
@@ -174,6 +197,12 @@ impl PendingCache {
     /// older than `max_pending_age_secs`. Called by the block-listener
     /// task on each `NewBlock` event — pre-signs only live for one
     /// block window, so anything that didn't fire is stale.
+    ///
+    /// Increments
+    /// [`charon_mempool_drained_total`](charon_metrics::names::MEMPOOL_DRAINED_TOTAL)
+    /// by the number of fresh entries drained and zeroes the
+    /// [`charon_mempool_pending_oracle_updates`](charon_metrics::names::MEMPOOL_PENDING_ORACLE_UPDATES)
+    /// gauge — the cache is empty after a drain. Issue #300.
     pub fn drain(&self) -> Vec<PreSignedLiquidation> {
         let now = unix_now();
         let max_age = self.max_pending_age_secs;
@@ -193,6 +222,11 @@ impl PendingCache {
             }
         }
         debug!(drained = out.len(), "mempool cache drained");
+        charon_metrics::record_mempool_drained(&self.chain, out.len() as u64);
+        charon_metrics::set_mempool_pending_oracle_updates(
+            &self.chain,
+            self.pending.len() as u64,
+        );
         out
     }
 
@@ -228,8 +262,10 @@ pub struct MempoolMonitor {
 }
 
 impl MempoolMonitor {
-    /// Full-control constructor.
+    /// Full-control constructor. `chain` is the short chain name the
+    /// mempool metrics (#300) emit as a `chain` label.
     pub fn new(
+        chain: impl Into<String>,
         provider: Arc<RootProvider<PubSubFrontend>>,
         oracle: Address,
         selectors: HashSet<FixedBytes<4>>,
@@ -237,14 +273,24 @@ impl MempoolMonitor {
     ) -> Self {
         Self {
             provider,
-            cache: Arc::new(PendingCache::new(oracle, selectors, max_pending_age)),
+            cache: Arc::new(PendingCache::new(
+                chain,
+                oracle,
+                selectors,
+                max_pending_age,
+            )),
         }
     }
 
     /// Convenience: build with [`default_selectors`] and
     /// [`DEFAULT_MAX_PENDING_AGE`].
-    pub fn with_defaults(provider: Arc<RootProvider<PubSubFrontend>>, oracle: Address) -> Self {
+    pub fn with_defaults(
+        chain: impl Into<String>,
+        provider: Arc<RootProvider<PubSubFrontend>>,
+        oracle: Address,
+    ) -> Self {
         Self::new(
+            chain,
             provider,
             oracle,
             default_selectors(),
@@ -254,6 +300,11 @@ impl MempoolMonitor {
 
     pub fn oracle(&self) -> Address {
         self.cache.oracle()
+    }
+
+    /// Chain label this monitor emits with.
+    pub fn chain(&self) -> &str {
+        self.cache.chain()
     }
 
     /// Share the inner cache. Lets the block-listener task call
@@ -283,6 +334,16 @@ impl MempoolMonitor {
     /// Emits one [`OracleUpdate`] per matched tx on `tx`. Returns
     /// `Ok(())` only when the receiver is dropped — the loop is
     /// expected to run for the lifetime of the process.
+    ///
+    /// Every reconnect attempt bumps
+    /// [`charon_mempool_websocket_reconnects_total`](charon_metrics::names::MEMPOOL_WS_RECONNECTS_TOTAL)
+    /// (issue #300) and
+    /// [`charon_rpc_connection_reconnects_total`](charon_metrics::names::RPC_RECONNECTS_TOTAL)
+    /// under `endpoint_kind="public"` (issue #302). Both land on the
+    /// same operator dashboard — the per-chain mempool counter is
+    /// the actionable signal; the generic RPC reconnect counter
+    /// aggregates across every pubsub call site for a quick
+    /// "is upstream degrading?" read.
     pub async fn run(&self, tx: mpsc::Sender<OracleUpdate>) -> Result<()> {
         let mut backoff = Duration::from_secs(1);
         loop {
@@ -292,6 +353,10 @@ impl MempoolMonitor {
                     return Ok(());
                 }
                 Err(err) => {
+                    charon_metrics::record_mempool_ws_reconnect(self.chain());
+                    charon_metrics::record_rpc_reconnect(
+                        charon_metrics::endpoint_kind::PUBLIC,
+                    );
                     warn!(
                         oracle = %self.oracle(),
                         error = ?err,
@@ -318,14 +383,28 @@ impl MempoolMonitor {
         while let Some(hash) = stream.next().await {
             // Lookup failures are common for txs that dropped out of
             // the pool between the hash push and our get — log at
-            // debug, keep going.
-            let full = match self.provider.get_transaction_by_hash(hash).await {
+            // debug, keep going. `time_rpc` instruments the per-call
+            // latency (issue #302); the `connection_lost` / transport
+            // failure branch is classified by `record_rpc_error`
+            // below so timeouts vs dropped txs stay separable in
+            // the dashboard.
+            let full = match charon_metrics::time_rpc(
+                charon_metrics::rpc_method::ETH_GET_TRANSACTION_BY_HASH,
+                charon_metrics::endpoint_kind::PUBLIC,
+                async { self.provider.get_transaction_by_hash(hash).await },
+            )
+            .await
+            {
                 Ok(Some(t)) => t,
                 Ok(None) => {
                     debug!(%hash, "pending tx vanished before fetch");
                     continue;
                 }
                 Err(err) => {
+                    charon_metrics::record_rpc_error(
+                        charon_metrics::rpc_method::ETH_GET_TRANSACTION_BY_HASH,
+                        charon_metrics::rpc_error::CONNECTION_LOST,
+                    );
                     debug!(%hash, ?err, "get_transaction_by_hash failed");
                     continue;
                 }

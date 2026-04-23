@@ -15,6 +15,7 @@ use alloy::primitives::{Bytes, TxHash};
 use alloy::providers::{Provider, ProviderBuilder, RootProvider};
 use alloy::transports::BoxTransport;
 use anyhow::{Context, Result};
+use charon_metrics::{endpoint_kind, record_rpc_error, rpc_error, rpc_method, time_rpc};
 use tracing::{info, warn};
 
 /// Default submission timeout per attempt (6 s ≈ 8 BSC blocks).
@@ -61,10 +62,36 @@ impl Submitter {
     /// Submit raw signed transaction bytes. Retries once on timeout.
     /// Non-timeout RPC errors (revert, bad nonce, bad signature) fail
     /// immediately — no point retrying a deterministic rejection.
+    ///
+    /// Each attempt is instrumented via
+    /// [`charon_metrics::time_rpc`] under
+    /// [`rpc_method::ETH_SEND_RAW_TRANSACTION`] /
+    /// [`endpoint_kind::PRIVATE`]; failures are classified into
+    /// [`rpc_error::TIMEOUT`] vs [`rpc_error::REJECTED`] so dashboards
+    /// can separate flaky-relay symptoms from deterministic
+    /// rejections (bad nonce, revert, bad signature). Issue #302.
     pub async fn submit(&self, raw: Bytes) -> Result<TxHash> {
         for attempt in 1..=MAX_ATTEMPTS {
             let fut = self.provider.send_raw_transaction(&raw);
-            match tokio::time::timeout(self.timeout, fut).await {
+            // `time_rpc` is wrapped *inside* the outer
+            // `tokio::time::timeout`, so its histogram sample only
+            // lands when the provider future resolves within the
+            // submission ceiling (success + rejection branches). A
+            // hard timeout skips the sample — by construction it
+            // would be `~self.timeout` and carries no extra signal;
+            // the timeout branch is covered by
+            // `charon_rpc_errors_total{error_kind="timeout"}`
+            // instead.
+            let timed = tokio::time::timeout(
+                self.timeout,
+                time_rpc(
+                    rpc_method::ETH_SEND_RAW_TRANSACTION,
+                    endpoint_kind::PRIVATE,
+                    fut,
+                ),
+            )
+            .await;
+            match timed {
                 Ok(Ok(pending)) => {
                     let hash = *pending.tx_hash();
                     info!(
@@ -76,6 +103,10 @@ impl Submitter {
                     return Ok(hash);
                 }
                 Ok(Err(err)) => {
+                    record_rpc_error(
+                        rpc_method::ETH_SEND_RAW_TRANSACTION,
+                        rpc_error::REJECTED,
+                    );
                     warn!(
                         endpoint = %self.endpoint,
                         attempt,
@@ -85,6 +116,10 @@ impl Submitter {
                     return Err(anyhow::anyhow!("submit RPC error: {err}"));
                 }
                 Err(_) => {
+                    record_rpc_error(
+                        rpc_method::ETH_SEND_RAW_TRANSACTION,
+                        rpc_error::TIMEOUT,
+                    );
                     warn!(
                         endpoint = %self.endpoint,
                         attempt,
