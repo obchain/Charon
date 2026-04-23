@@ -18,7 +18,7 @@ import { IERC20 } from "./interfaces/IERC20.sol";
 //        b. Call vToken.liquidateBorrow() — repay debt, seize collateral vTokens.
 //        c. Call vToken.redeem() — convert ALL seized vTokens to underlying.
 //        d. Swap collateral → debt asset via PancakeSwap V3.
-//        e. Sweep profit to owner.
+//        e. Sweep profit to the COLD wallet — hot wallet (owner) holds gas only.
 //        f. Approve Aave for repayment (amount + premium); Aave pulls it after return.
 //
 // Security invariants:
@@ -31,6 +31,8 @@ import { IERC20 } from "./interfaces/IERC20.sol";
 //     flash-loan, re-entering executeLiquidation's guard frame. The msg.sender
 //     == AAVE_POOL gate is the equivalent protection for the callback.
 //   - Lingering approvals zeroed after each consume point (vToken, SwapRouter).
+//   - Profit is swept to the immutable COLD_WALLET, never to the hot wallet.
+//     This enforces the CLAUDE.md safety invariant: "hot wallet holds gas only".
 //   - No tx.origin usage. No delegatecall. No assembly. No upgradeability.
 //   - No external library imports — all interfaces are inline/local.
 // ─────────────────────────────────────────────────────────────────────────────
@@ -40,6 +42,7 @@ import { IERC20 } from "./interfaces/IERC20.sol";
 ///         v0.1 supports Venus Protocol on BNB Chain.
 /// @dev Implements IFlashLoanSimpleReceiver for the Aave V3 flash-loan callback.
 ///      The bot (hot wallet = owner) is the sole authorized caller of executeLiquidation.
+///      All profit is routed to the immutable cold wallet set at construction.
 contract CharonLiquidator is IFlashLoanSimpleReceiver {
     // ─────────────────────────────────────────────────────────────────────────
     // Protocol ID constants — must mirror the Rust `ProtocolId` enum order.
@@ -61,7 +64,8 @@ contract CharonLiquidator is IFlashLoanSimpleReceiver {
     // Immutable configuration — set once at construction, never changed.
     // ─────────────────────────────────────────────────────────────────────────
 
-    /// @notice The bot's hot wallet. Only address authorised to call executeLiquidation and rescue.
+    /// @notice The bot's hot wallet. Only address authorised to call executeLiquidation
+    ///         and rescue. By policy it holds gas only — profit is never routed here.
     address public immutable owner;
 
     /// @notice Aave V3 Pool proxy on BNB Chain.
@@ -71,6 +75,12 @@ contract CharonLiquidator is IFlashLoanSimpleReceiver {
     /// @notice PancakeSwap V3 SwapRouter on BNB Chain.
     ///         Mainnet: 0x13f4EA83D0bd40E75C8222255bc855a974568Dd4
     address public immutable SWAP_ROUTER;
+
+    /// @notice Cold wallet — sole recipient of liquidation profit.
+    /// @dev Profit is transferred here inside executeOperation, never to the hot
+    ///      wallet. Enforces the CLAUDE.md safety invariant that the bot wallet
+    ///      holds gas only. Set once at construction and immutable thereafter.
+    address public immutable COLD_WALLET;
 
     // ─────────────────────────────────────────────────────────────────────────
     // Structs
@@ -108,9 +118,15 @@ contract CharonLiquidator is IFlashLoanSimpleReceiver {
     /// @param borrower    The liquidated account.
     /// @param debtToken   The underlying asset that was repaid.
     /// @param repayAmount The amount of debtToken that was repaid.
-    /// @param profit      Net profit in debtToken units retained by this contract.
+    /// @param profit      Net profit in debtToken units swept to the cold wallet.
+    /// @param recipient   The cold wallet address that received `profit` (indexed
+    ///                    so off-chain monitors can filter by destination).
     event LiquidationExecuted(
-        address indexed borrower, address indexed debtToken, uint256 repayAmount, uint256 profit
+        address indexed borrower,
+        address indexed debtToken,
+        uint256 repayAmount,
+        uint256 profit,
+        address indexed recipient
     );
 
     /// @notice Emitted when the owner recovers tokens or native BNB via rescue().
@@ -145,18 +161,23 @@ contract CharonLiquidator is IFlashLoanSimpleReceiver {
     // Constructor
     // ─────────────────────────────────────────────────────────────────────────
 
-    /// @notice Deploys CharonLiquidator and permanently binds it to one Aave Pool
-    ///         and one PancakeSwap V3 router.
+    /// @notice Deploys CharonLiquidator and permanently binds it to one Aave Pool,
+    ///         one PancakeSwap V3 router, and one cold-wallet profit recipient.
     /// @dev msg.sender becomes the immutable owner (the bot's hot wallet).
-    ///      Both addresses are validated non-zero at construction.
+    ///      All three addresses are validated non-zero at construction.
+    ///      The cold wallet is required: the CLAUDE.md safety invariant forbids
+    ///      parking profit in the hot wallet.
     /// @param _aavePool   Aave V3 Pool proxy address on BNB Chain.
     /// @param _swapRouter PancakeSwap V3 SwapRouter address on BNB Chain.
-    constructor(address _aavePool, address _swapRouter) {
+    /// @param _coldWallet Cold-wallet address that receives all liquidation profit.
+    constructor(address _aavePool, address _swapRouter, address _coldWallet) {
         require(_aavePool != address(0), "!aavePool");
         require(_swapRouter != address(0), "!swapRouter");
+        require(_coldWallet != address(0), "!coldWallet");
         owner = msg.sender;
         AAVE_POOL = _aavePool;
         SWAP_ROUTER = _swapRouter;
+        COLD_WALLET = _coldWallet;
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -224,7 +245,7 @@ contract CharonLiquidator is IFlashLoanSimpleReceiver {
     ///        f. Swap collateral underlying → debt token via PancakeSwap V3.
     ///        g. Zero out SwapRouter approval (consumed).
     ///        h. Verify post-swap balance covers totalOwed.
-    ///        i. Sweep profit to owner.
+    ///        i. Sweep profit to COLD_WALLET (NEVER to the hot wallet / owner).
     ///        j. Emit LiquidationExecuted.
     ///        k. Approve Aave Pool for totalOwed (Aave pulls this after we return).
     ///        l. Return true.
@@ -324,19 +345,23 @@ contract CharonLiquidator is IFlashLoanSimpleReceiver {
         // minSwapOut was set below totalOwed by the caller.
         require(finalBal >= totalOwed, "swap output below repayment");
 
-        // ── Step 7: sweep profit to owner ─────────────────────────────────────
-        // Profit must leave this contract before we approve Aave, otherwise Aave
-        // could theoretically pull more than totalOwed if the token has quirks.
+        // ── Step 7: sweep profit to COLD WALLET ───────────────────────────────
+        // Profit must leave this contract to the cold wallet (NOT the hot-wallet
+        // owner) before we approve Aave. This enforces the CLAUDE.md safety
+        // invariant: hot wallet holds gas only. Sweeping before approval also
+        // prevents Aave from pulling more than totalOwed if the debt token has
+        // quirks (fee-on-transfer, rebasing, etc.).
         uint256 profit = finalBal - totalOwed;
         if (profit > 0) {
-            // transfer return value not checked: owner is a trusted address set at
-            // construction; a failure here reverts the whole tx (excess funds stay
-            // in the contract until rescued). Standard ERC-20s revert on failure.
-            IERC20(p.debtToken).transfer(owner, profit);
+            // transfer return value not checked: COLD_WALLET is a trusted address
+            // set at construction; a failure here reverts the whole tx (excess
+            // funds stay in the contract until rescued). Standard ERC-20s revert
+            // on failure.
+            IERC20(p.debtToken).transfer(COLD_WALLET, profit);
         }
 
         // ── Step 8: emit before the final approval so logs reflect the full state ─
-        emit LiquidationExecuted(p.borrower, p.debtToken, p.repayAmount, profit);
+        emit LiquidationExecuted(p.borrower, p.debtToken, p.repayAmount, profit, COLD_WALLET);
 
         // ── Step 9: approve Aave to pull totalOwed ────────────────────────────
         // Aave pulls amount + premium from this contract after executeOperation
