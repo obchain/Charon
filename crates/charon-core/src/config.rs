@@ -34,8 +34,13 @@ pub struct Config {
 /// Bot-level knobs — thresholds and intervals.
 #[derive(Debug, Clone, Deserialize)]
 pub struct BotConfig {
-    /// Drop opportunities below this USD profit threshold.
-    pub min_profit_usd: f64,
+    /// Drop opportunities below this profit threshold, in **micro-USD**
+    /// (1 USD = 1e6). Stored as `u64` so the TOML stays integer-only
+    /// and the value round-trips through serde without float surprises.
+    ///
+    /// Example: `5_000_000` = $5.00 minimum. The profit calculator
+    /// converts this to cents (`/ 10_000`) internally.
+    pub min_profit_usd_1e6: u64,
     /// Skip liquidations when gas price exceeds this (gwei).
     pub max_gas_gwei: u64,
     /// Polling interval for protocols that don't push events.

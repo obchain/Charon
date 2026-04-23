@@ -84,7 +84,7 @@ async fn main() -> Result<()> {
         protocols = config.protocol.len(),
         flashloan_sources = config.flashloan.len(),
         liquidators = config.liquidator.len(),
-        min_profit_usd = config.bot.min_profit_usd,
+        min_profit_usd_1e6 = config.bot.min_profit_usd_1e6,
         "config loaded"
     );
 

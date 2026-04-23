@@ -4,8 +4,9 @@
 # load time — see `.env.example` for the full list of expected vars.
 
 [bot]
-# Drop opportunities below this USD profit threshold.
-min_profit_usd   = 5.0
+# Drop opportunities below this profit threshold, in micro-USD (1 USD = 1e6).
+# 5_000_000 = $5.00 minimum. Integer-only so serde / TOML round-trip cleanly.
+min_profit_usd_1e6 = 5_000_000
 # Skip liquidations when gas price exceeds this (gwei).
 max_gas_gwei     = 10
 # Polling cadence for protocols without push events (ms).

@@ -1145,6 +1145,8 @@ dependencies = [
  "anyhow",
  "async-trait",
  "serde",
+ "thiserror 1.0.69",
+ "tokio",
  "toml",
 ]
 
