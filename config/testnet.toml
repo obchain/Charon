@@ -55,7 +55,8 @@ bind    = "0.0.0.0:9091"
 # for Chapel (chainId 97) should appear below — never a historical
 # mirror, blog post, or third-party aggregator.
 #
-# Verification date: 2026-04-23.
+# Verification date: 2026-04-23 (addresses below cross-checked against
+# docs.chain.link/data-feeds/price-feeds, BNB Chain Testnet tab).
 #
 # Re-verification cadence: Chainlink rarely redeploys feeds on Chapel,
 # but testnet feeds are not covered by the same SLA as mainnet and can
@@ -75,16 +76,16 @@ bind    = "0.0.0.0:9091"
 # unexplained absence of a symbol from the cache as a drifted address
 # until proven otherwise.
 #
-# Addresses left as TODOs below were not independently re-verified
-# against data.chain.link at the time of this edit. Per #237's
-# explicit "do not invent addresses" constraint, they stay commented
-# out until an operator confirms the canonical proxy on the Chainlink
-# directory and fills them in with the same inline-comment format.
+# Symbol keys match the Venus market short names used elsewhere in
+# this config (BNB = wrapped BNB, BTCB = Bitcoin BEP-20, ETH = Ether
+# BEP-20, USDT/USDC/DAI = stablecoin, LINK = Chainlink). PriceCache
+# looks these up by exact string so a mismatch between the key here
+# and the symbol passed to `get()` silently misses the feed.
 [chainlink.bnb]
-# BNB / USD   — TODO(#237): verify on data.chain.link (BNB Chain Testnet)
-# BTC / USD   — TODO(#237): verify on data.chain.link (BNB Chain Testnet)
-# ETH / USD   — TODO(#237): verify on data.chain.link (BNB Chain Testnet)
-# USDT / USD  — TODO(#237): verify on data.chain.link (BNB Chain Testnet)
-# USDC / USD  — TODO(#237): verify on data.chain.link (BNB Chain Testnet)
-# DAI / USD   — TODO(#237): verify on data.chain.link (BNB Chain Testnet)
-# LINK / USD  — TODO(#237): verify on data.chain.link (BNB Chain Testnet)
+BNB  = "0x2514895c72f50D8bd4B4F9b1110F0D6bD2c97526"  # BNB  / USD — Chainlink Chapel aggregator proxy
+BTCB = "0x5741306c21795FdCBb9b265Ea0255F499DFe515C"  # BTC  / USD — Chainlink Chapel aggregator proxy
+ETH  = "0x143db3CEEfbdfe5631aDD3E50f7614B6ba708BA7"  # ETH  / USD — Chainlink Chapel aggregator proxy
+USDT = "0xEca2605f0BCF2BA5966372C99837b1F182d3D620"  # USDT / USD — Chainlink Chapel aggregator proxy
+USDC = "0x90c069C4538adAc136E051052E14c1cD799C41B7"  # USDC / USD — Chainlink Chapel aggregator proxy
+DAI  = "0xE4eE17114774713d2De0eC0f035d4F7665fc025D"  # DAI  / USD — Chainlink Chapel aggregator proxy
+LINK = "0x1B329402Cb1825C6F30A0d92aB9E2862BE47333f"  # LINK / USD — Chainlink Chapel aggregator proxy
