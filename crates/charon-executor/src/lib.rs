@@ -16,7 +16,9 @@ pub mod nonce;
 pub mod simulation;
 pub mod submit;
 
-pub use batcher::{Batcher, LiquidationBatch, MAX_BATCH_SIZE};
+pub use batcher::{
+    BSC_CHAIN_ID, Batcher, BatcherError, LiquidationBatch, MAX_BATCH_SIZE, SOLIDITY_MAX_BATCH_SIZE,
+};
 pub use builder::{ICharonLiquidator, TxBuilder};
 pub use gas::{GasOracle, GasParams, gas_cost_usd_cents};
 pub use nonce::NonceManager;

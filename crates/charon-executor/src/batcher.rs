@@ -1,8 +1,8 @@
 //! Multi-liquidation batcher.
 //!
-//! Groups per-chain [`LiquidationOpportunity`] records that land in the
-//! same block window and encodes them into one `batchExecute(...)` call
-//! on `CharonLiquidator.sol`. Saves one tx per extra opportunity — the
+//! Groups [`LiquidationOpportunity`] records that land in the same
+//! block window and encodes them into one `batchExecute(...)` call on
+//! `CharonLiquidator.sol`. Saves one tx per extra opportunity — the
 //! flash-loan fee on each borrow is still paid, but the base tx cost
 //! (21000 gas + signature verify + calldata base) amortises across the
 //! whole batch.
@@ -12,31 +12,49 @@
 //! later PR) builds the tx via [`TxBuilder`](crate::TxBuilder) with the
 //! calldata produced here.
 //!
+//! v0.1 scope: Venus on BNB Chain only. The planner rejects any input
+//! whose `chain_id` is not [`BSC_CHAIN_ID`]; cross-chain partitioning is
+//! out of scope until the bot grows a second protocol target.
+//!
 //! Current heuristic:
-//! - Group strictly by `chain_id` (can't batch across chains)
-//! - Preserve profit-desc ordering within a group
-//! - Cap at `MAX_BATCH_SIZE = 3` — PRD default; the on-chain cap is 10
+//! - All opportunities must share `chain_id == 56` (BSC)
+//! - Preserve profit-desc ordering supplied by the caller
+//! - Cap per batch at [`MAX_BATCH_SIZE`] = 3 — PRD default; the on-chain
+//!   cap is [`SOLIDITY_MAX_BATCH_SIZE`] = 10 and the planner enforces
+//!   both ceilings
 //! - Only emit a batch if it contains ≥ 2 opportunities; a 1-item
 //!   "batch" is cheaper as a plain `executeLiquidation` call (skips the
 //!   array length word + loop overhead)
 
-use std::collections::HashMap;
-
 use alloy::primitives::Bytes;
 use alloy::sol;
 use alloy::sol_types::SolCall;
-use anyhow::Result;
 use charon_core::{LiquidationOpportunity, LiquidationParams};
+use thiserror::Error;
 use tracing::debug;
 
 /// Matches `MAX_BATCH_SIZE` in `CharonLiquidator.sol`. The Solidity
-/// ceiling is 10; keeping the default smaller (3) keeps gas estimates
-/// predictable and mirrors the PRD's suggested batch size.
+/// ceiling is 10 ([`SOLIDITY_MAX_BATCH_SIZE`]); the Rust default is
+/// smaller to keep gas estimates predictable and mirror the PRD's
+/// suggested batch size.
 pub const MAX_BATCH_SIZE: usize = 3;
 
+/// Hard ceiling enforced on the Solidity side (`CharonLiquidator.sol`
+/// `MAX_BATCH_SIZE`). Any batch whose length exceeds this constant
+/// would be rejected on-chain by `require(n <= MAX_BATCH_SIZE, ...)`;
+/// the encoder rejects it earlier so a compromised or misconfigured
+/// caller cannot waste a tx or burn gas for guaranteed revert.
+pub const SOLIDITY_MAX_BATCH_SIZE: usize = 10;
+
+/// BNB Chain (v0.1 only). Cross-chain partitioning is deferred until a
+/// second protocol target lands; until then any non-BSC opportunity is
+/// a programming error and the planner surfaces it as such.
+pub const BSC_CHAIN_ID: u64 = 56;
+
 // On-chain struct + batch entrypoint. Must stay in lockstep with the
-// Solidity source — the selector test on `ICharonLiquidator` catches
-// drift on the single-item path; the batch path is pinned here.
+// Solidity source — the selector test pins the canonical keccak256 of
+// the function signature, so any drift in the struct shape or the
+// function name breaks the test before it reaches mainnet.
 sol! {
     /// Solidity-side `LiquidationParams` — same shape as in
     /// [`crate::builder::CharonLiquidationParams`], redeclared here so
@@ -61,10 +79,55 @@ sol! {
 
 const PROTOCOL_VENUS: u8 = 3;
 
+/// Typed error surface for the public batcher API. Keeps `anyhow` out
+/// of the library boundary so downstream callers can pattern-match on
+/// failure modes and surface them as domain errors rather than opaque
+/// `Result<_, anyhow::Error>` blobs.
+#[derive(Debug, Error)]
+pub enum BatcherError {
+    /// Caller supplied a `params` slice whose length does not equal
+    /// `batch.opportunities.len()`. Zipping proceeds pairwise, so any
+    /// mismatch corrupts the mapping between opportunities and their
+    /// protocol parameters.
+    #[error("batcher: params/opportunities length mismatch (params={params}, opps={opps})")]
+    ParamLengthMismatch {
+        /// Length of the `params` slice supplied to `encode_calldata`.
+        params: usize,
+        /// Length of `batch.opportunities`.
+        opps: usize,
+    },
+
+    /// Batch length exceeds the on-chain `MAX_BATCH_SIZE` in
+    /// `CharonLiquidator.sol`. See [`SOLIDITY_MAX_BATCH_SIZE`].
+    #[error("batcher: batch too large ({len} items, on-chain limit {limit})")]
+    BatchTooLarge {
+        /// Actual batch length.
+        len: usize,
+        /// Hard ceiling on the Solidity side.
+        limit: usize,
+    },
+
+    /// Batch contains an opportunity whose `chain_id` does not match
+    /// the v0.1 BSC-only scope. Collapses the previous
+    /// cross-chain `HashMap` into a single explicit guard.
+    #[error("batcher: unsupported chain_id {got}, only {expected} (BSC) is supported in v0.1")]
+    UnsupportedChain {
+        /// Chain id observed on the offending opportunity.
+        got: u64,
+        /// The only chain id accepted in v0.1.
+        expected: u64,
+    },
+
+    /// `SolCall::abi_encode` returned an error. Wrapped so the caller
+    /// does not depend on `alloy`'s internal error types.
+    #[error("batcher: ABI encoding failed: {0}")]
+    AbiEncodeError(String),
+}
+
 /// One batch ready for `TxBuilder` to wrap into an EIP-1559 transaction.
 #[derive(Debug, Clone)]
 pub struct LiquidationBatch {
-    /// Chain the opportunities share.
+    /// Chain the opportunities share (always `BSC_CHAIN_ID` in v0.1).
     pub chain_id: u64,
     /// Opportunities in profit-desc order, length in `[2, MAX_BATCH_SIZE]`.
     pub opportunities: Vec<LiquidationOpportunity>,
@@ -81,8 +144,12 @@ pub struct Batcher {
 
 impl Batcher {
     pub fn new(max_batch_size: usize) -> Self {
+        // Clamp to [1, SOLIDITY_MAX_BATCH_SIZE] so a misconfigured
+        // caller cannot produce a batch that would be rejected on-chain
+        // after the tx was built and signed.
+        let clamped = max_batch_size.clamp(1, SOLIDITY_MAX_BATCH_SIZE);
         Self {
-            max_batch_size: max_batch_size.max(1),
+            max_batch_size: clamped,
         }
     }
 
@@ -90,37 +157,47 @@ impl Batcher {
         Self::new(MAX_BATCH_SIZE)
     }
 
-    /// Partition `opportunities` into per-chain batches.
+    /// Chunk `opportunities` into BSC-only batches.
     ///
-    /// Input order is preserved within each chain group (caller should
-    /// supply in profit-desc order; the batcher doesn't re-rank).
-    /// Single-opportunity groups are omitted from the output — they
+    /// Returns [`BatcherError::UnsupportedChain`] if any input is not
+    /// on BSC — v0.1 does not partition across chains. Input order is
+    /// preserved (caller should supply profit-desc; the batcher does
+    /// not re-rank). Single-opportunity chunks are omitted — they
     /// belong on the plain `executeLiquidation` path, not `batchExecute`.
-    pub fn plan(&self, opportunities: Vec<LiquidationOpportunity>) -> Vec<LiquidationBatch> {
-        let mut by_chain: HashMap<u64, Vec<LiquidationOpportunity>> = HashMap::new();
-        for opp in opportunities {
-            by_chain.entry(opp.position.chain_id).or_default().push(opp);
-        }
-
-        let mut out = Vec::new();
-        for (chain_id, group) in by_chain {
-            for chunk in group.chunks(self.max_batch_size) {
-                if chunk.len() < 2 {
-                    continue;
-                }
-                let total_net_usd_cents = chunk
-                    .iter()
-                    .map(|o| o.net_profit_usd_cents)
-                    .fold(0u64, u64::saturating_add);
-                out.push(LiquidationBatch {
-                    chain_id,
-                    opportunities: chunk.to_vec(),
-                    total_net_usd_cents,
+    pub fn plan(
+        &self,
+        opportunities: Vec<LiquidationOpportunity>,
+    ) -> Result<Vec<LiquidationBatch>, BatcherError> {
+        // Single-chain guard: v0.1 is BSC-only. Rejecting here rather
+        // than silently filtering forces the caller to surface the
+        // misconfiguration before we burn RPC round-trips on
+        // ineligible opportunities.
+        for opp in &opportunities {
+            if opp.position.chain_id != BSC_CHAIN_ID {
+                return Err(BatcherError::UnsupportedChain {
+                    got: opp.position.chain_id,
+                    expected: BSC_CHAIN_ID,
                 });
             }
         }
+
+        let mut out = Vec::new();
+        for chunk in opportunities.chunks(self.max_batch_size) {
+            if chunk.len() < 2 {
+                continue;
+            }
+            let total_net_usd_cents = chunk
+                .iter()
+                .map(|o| o.net_profit_usd_cents)
+                .fold(0u64, u64::saturating_add);
+            out.push(LiquidationBatch {
+                chain_id: BSC_CHAIN_ID,
+                opportunities: chunk.to_vec(),
+                total_net_usd_cents,
+            });
+        }
         debug!(batch_count = out.len(), "batcher planned");
-        out
+        Ok(out)
     }
 
     /// ABI-encode a `batchExecute(LiquidationParams[])` call.
@@ -130,20 +207,41 @@ impl Batcher {
     /// `LendingProtocol::get_liquidation_params`). The caller supplies
     /// them as a parallel slice so the batcher never has to know how a
     /// given protocol derives its vToken addresses.
+    ///
+    /// # Safety
+    ///
+    /// The returned calldata is **not** self-validating. Callers MUST
+    /// pass it through
+    /// [`Simulator::simulate`](crate::Simulator::simulate) before
+    /// broadcasting, per the CLAUDE.md safety invariant that every
+    /// liquidation tx passes an `eth_call` gate. The simulator catches
+    /// protocol-level reverts (insufficient collateral, stale oracle,
+    /// closed market) that the planner cannot see from off-chain data
+    /// alone.
+    ///
+    /// The batch path of the sim gate is tracked in issue #298;
+    /// skipping simulation is a bypass of the last line of defense and
+    /// is never acceptable in production code paths.
     pub fn encode_calldata(
         &self,
         batch: &LiquidationBatch,
         params: &[LiquidationParams],
-    ) -> Result<Bytes> {
-        if params.len() != batch.opportunities.len() {
-            anyhow::bail!(
-                "batcher: params/opportunities length mismatch ({} vs {})",
-                params.len(),
-                batch.opportunities.len()
-            );
+    ) -> Result<Bytes, BatcherError> {
+        let opps = batch.opportunities.len();
+        if params.len() != opps {
+            return Err(BatcherError::ParamLengthMismatch {
+                params: params.len(),
+                opps,
+            });
+        }
+        if opps > SOLIDITY_MAX_BATCH_SIZE {
+            return Err(BatcherError::BatchTooLarge {
+                len: opps,
+                limit: SOLIDITY_MAX_BATCH_SIZE,
+            });
         }
 
-        let mut items = Vec::with_capacity(batch.opportunities.len());
+        let mut items = Vec::with_capacity(opps);
         for (opp, params) in batch.opportunities.iter().zip(params.iter()) {
             let LiquidationParams::Venus {
                 borrower,
@@ -166,7 +264,7 @@ impl Batcher {
         let call = ICharonBatch::batchExecuteCall { items };
         let bytes: Bytes = call.abi_encode().into();
         debug!(
-            items = batch.opportunities.len(),
+            items = opps,
             calldata_len = bytes.len(),
             chain_id = batch.chain_id,
             "batch calldata encoded"
@@ -184,7 +282,7 @@ impl Default for Batcher {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alloy::primitives::{Address, U256, address};
+    use alloy::primitives::{Address, U256, address, keccak256};
     use charon_core::{FlashLoanSource, Position, ProtocolId, SwapRoute};
 
     fn mk_opp(chain_id: u64, net_cents: u64, borrower_byte: u8) -> LiquidationOpportunity {
@@ -229,35 +327,52 @@ mod tests {
 
     #[test]
     fn single_opportunity_does_not_become_a_batch() {
-        let out = Batcher::with_default_size().plan(vec![mk_opp(56, 100, 1)]);
+        let out = Batcher::with_default_size()
+            .plan(vec![mk_opp(56, 100, 1)])
+            .expect("plan");
         assert!(out.is_empty(), "1-item input should yield no batches");
     }
 
     #[test]
     fn same_chain_groups_into_one_batch() {
-        let out = Batcher::with_default_size().plan(vec![
-            mk_opp(56, 300, 1),
-            mk_opp(56, 200, 2),
-            mk_opp(56, 100, 3),
-        ]);
+        let out = Batcher::with_default_size()
+            .plan(vec![
+                mk_opp(56, 300, 1),
+                mk_opp(56, 200, 2),
+                mk_opp(56, 100, 3),
+            ])
+            .expect("plan");
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].chain_id, 56);
         assert_eq!(out[0].opportunities.len(), 3);
         assert_eq!(out[0].total_net_usd_cents, 600);
     }
 
+    /// v0.1 is BSC-only. A non-BSC opportunity is a programming error,
+    /// not a quiet partitioning condition, so the planner rejects it.
     #[test]
-    fn different_chains_produce_separate_batches() {
-        let out = Batcher::with_default_size().plan(vec![
-            mk_opp(56, 100, 1),
-            mk_opp(56, 100, 2),
-            mk_opp(1, 100, 3),
-            mk_opp(1, 100, 4),
-        ]);
-        assert_eq!(out.len(), 2);
-        let mut chains: Vec<u64> = out.iter().map(|b| b.chain_id).collect();
-        chains.sort();
-        assert_eq!(chains, vec![1, 56]);
+    fn plan_rejects_non_bsc_chain_id() {
+        let err = Batcher::with_default_size()
+            .plan(vec![mk_opp(56, 100, 1), mk_opp(1, 100, 2)])
+            .expect_err("non-BSC must error");
+        match err {
+            BatcherError::UnsupportedChain { got, expected } => {
+                assert_eq!(got, 1);
+                assert_eq!(expected, 56);
+            }
+            other => panic!("wrong error variant: {other:?}"),
+        }
+    }
+
+    /// All-BSC input of length > 1 planned normally — confirms the
+    /// single-chain guard does not reject the happy path.
+    #[test]
+    fn assert_single_chain() {
+        let out = Batcher::with_default_size()
+            .plan(vec![mk_opp(56, 100, 1), mk_opp(56, 100, 2)])
+            .expect("plan");
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].chain_id, 56);
     }
 
     #[test]
@@ -265,13 +380,39 @@ mod tests {
         // Size 2 → 5 opps → chunks of [2, 2, 1]; the trailing 1 is
         // dropped because it's not a real batch.
         let b = Batcher::new(2);
-        let out = b.plan((1..=5).map(|i| mk_opp(56, 100, i)).collect());
+        let out = b
+            .plan((1..=5).map(|i| mk_opp(56, 100, i)).collect())
+            .expect("plan");
         assert_eq!(out.len(), 2);
         assert!(out.iter().all(|b| b.opportunities.len() == 2));
     }
 
+    /// `new()` must clamp a caller-supplied size at the Solidity cap —
+    /// otherwise `plan` could emit a batch that `batchExecute` rejects
+    /// with "batch too large" after the tx is already signed.
+    #[test]
+    fn new_clamps_max_batch_size_to_solidity_cap() {
+        let b = Batcher::new(99);
+        let opps: Vec<_> = (1u8..=12).map(|i| mk_opp(56, 100, i)).collect();
+        let out = b.plan(opps).expect("plan");
+        // 12 opps chunked at 10 → [10, 2]; both ≥ 2 so both survive.
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].opportunities.len(), SOLIDITY_MAX_BATCH_SIZE);
+        assert_eq!(out[1].opportunities.len(), 2);
+    }
+
+    /// Canonical keccak256 pin: external witness of the batchExecute
+    /// selector. If either the function name or the struct shape drifts
+    /// from `CharonLiquidator.sol`, this test fails before any tx is
+    /// ever built. The signature must exactly mirror the Solidity
+    /// declaration — v0.1 has eight tuple fields and no `swapPoolFee`.
     #[test]
     fn encode_calldata_has_batch_execute_selector() {
+        const CANONICAL_SIG: &str =
+            "batchExecute((uint8,address,address,address,address,address,uint256,uint256)[])";
+        let digest = keccak256(CANONICAL_SIG.as_bytes());
+        let expected: [u8; 4] = [digest[0], digest[1], digest[2], digest[3]];
+
         let batch = LiquidationBatch {
             chain_id: 56,
             opportunities: vec![mk_opp(56, 100, 1), mk_opp(56, 200, 2)],
@@ -281,11 +422,15 @@ mod tests {
         let bytes = Batcher::with_default_size()
             .encode_calldata(&batch, &params)
             .expect("encode");
+
         assert_eq!(
             &bytes[..4],
-            &ICharonBatch::batchExecuteCall::SELECTOR,
-            "calldata selector drifted from batchExecute"
+            &expected,
+            "calldata selector drifted from canonical batchExecute signature"
         );
+        // Belt-and-braces: confirm alloy's derived selector agrees with
+        // the hand-computed keccak256, catching macro-side regressions.
+        assert_eq!(&bytes[..4], &ICharonBatch::batchExecuteCall::SELECTOR);
     }
 
     #[test]
@@ -296,10 +441,45 @@ mod tests {
             total_net_usd_cents: 300,
         };
         let params = vec![mk_params(1)]; // only one
-        assert!(
-            Batcher::with_default_size()
-                .encode_calldata(&batch, &params)
-                .is_err()
-        );
+        let err = Batcher::with_default_size()
+            .encode_calldata(&batch, &params)
+            .expect_err("mismatched lengths must error");
+        match err {
+            BatcherError::ParamLengthMismatch { params, opps } => {
+                assert_eq!(params, 1);
+                assert_eq!(opps, 2);
+            }
+            other => panic!("wrong error variant: {other:?}"),
+        }
+    }
+
+    /// Direct guard test: a handcrafted oversize batch is rejected by
+    /// `encode_calldata` before any abi encoding happens. Bypasses
+    /// `plan`'s own clamping because the Solidity ceiling is the
+    /// authoritative invariant.
+    #[test]
+    fn encode_calldata_rejects_oversize_batch() {
+        // SOLIDITY_MAX_BATCH_SIZE is 10; the test needs 11 opps with
+        // distinct borrower bytes. Use u8::try_from to keep the
+        // workspace `cast_possible_truncation` lint satisfied.
+        let limit_u8 = u8::try_from(SOLIDITY_MAX_BATCH_SIZE).expect("limit fits in u8");
+        let over = limit_u8.checked_add(1).expect("limit + 1 fits in u8");
+        let opps: Vec<_> = (1u8..=over).map(|i| mk_opp(56, 100, i)).collect();
+        let params: Vec<_> = (1u8..=over).map(mk_params).collect();
+        let batch = LiquidationBatch {
+            chain_id: 56,
+            total_net_usd_cents: 0,
+            opportunities: opps,
+        };
+        let err = Batcher::with_default_size()
+            .encode_calldata(&batch, &params)
+            .expect_err("oversize batch must error");
+        match err {
+            BatcherError::BatchTooLarge { len, limit } => {
+                assert_eq!(len, SOLIDITY_MAX_BATCH_SIZE + 1);
+                assert_eq!(limit, SOLIDITY_MAX_BATCH_SIZE);
+            }
+            other => panic!("wrong error variant: {other:?}"),
+        }
     }
 }
