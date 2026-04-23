@@ -12,7 +12,7 @@
       }
     ]
   },
-  "description": "Charon liquidation bot — scanner, executor, and profit telemetry. Scrapes the charon-metrics Prometheus exporter (default :9091).",
+  "description": "Charon liquidation bot — scanner, executor, and profit telemetry. Scrapes the charon-metrics Prometheus exporter (default :9091). Chain/Instance variables default to All (.*) so panels render before the first scrape populates label_values; they auto-refine once metrics flow.",
   "editable": true,
   "fiscalYearStartMonth": 0,
   "graphTooltip": 1,
@@ -425,9 +425,11 @@
         "type": "datasource"
       },
       {
-        "current": { "selected": false, "text": "All", "value": "$__all" },
+        "allValue": ".*",
+        "current": { "selected": true, "text": "All", "value": "$__all" },
         "datasource": { "type": "prometheus", "uid": "${datasource}" },
         "definition": "label_values(charon_scanner_blocks_total, chain)",
+        "description": "Chain label. Defaults to All (.*) so panels render data even before label_values is populated (fresh import or cold start).",
         "hide": 0,
         "includeAll": true,
         "label": "Chain",
@@ -442,9 +444,11 @@
         "type": "query"
       },
       {
-        "current": { "selected": false, "text": "All", "value": "$__all" },
+        "allValue": ".*",
+        "current": { "selected": true, "text": "All", "value": "$__all" },
         "datasource": { "type": "prometheus", "uid": "${datasource}" },
         "definition": "label_values(charon_build_info, instance)",
+        "description": "Instance label (Prometheus scrape target). Defaults to All (.*) so panels render before the first scrape populates the dropdown.",
         "hide": 0,
         "includeAll": true,
         "label": "Instance",
