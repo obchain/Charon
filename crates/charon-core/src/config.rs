@@ -159,9 +159,25 @@ pub enum ConfigError {
     /// start is deliberate: broadcasting liquidation calldata to the
     /// public mempool reliably loses to front-runners.
     #[error(
-        "chain '{chain}' has a deployed liquidator but no private_rpc_url;          set one, or set allow_public_mempool = true to opt in (testnet/dev only)"
+        "chain '{chain}' has a deployed liquidator but no private_rpc_url; set one, or set allow_public_mempool = true to opt in (testnet/dev only)"
     )]
     PrivateRpcRequired {
+        /// Chain key (matches a `[chain.<name>]` section).
+        chain: String,
+    },
+    /// A chain has a `[liquidator.<chain>]` entry whose
+    /// `contract_address` is the zero address. Starting a live-mempool
+    /// run with this config would route `eth_call` simulations and
+    /// every flashloan callback to `address(0)`: the call returns empty
+    /// bytes (no revert), which the simulator interprets as a pass,
+    /// producing a silent false-positive gate. Allowed only when the
+    /// chain explicitly opts in to public-mempool submission
+    /// (`allow_public_mempool = true`) for local anvil / testnet runs
+    /// where a real deploy does not yet exist.
+    #[error(
+        "chain '{chain}' has liquidator.contract_address = 0x0; deploy CharonLiquidator and set the real address, or set allow_public_mempool = true to opt in (testnet/dev only)"
+    )]
+    ZeroAddressLiquidator {
         /// Chain key (matches a `[chain.<name>]` section).
         chain: String,
     },
@@ -227,6 +243,9 @@ impl Config {
     /// - Every `[liquidator.<chain>]` has a `[chain.<chain>]` with a
     ///   `private_rpc_url`, unless that chain set
     ///   `allow_public_mempool = true`.
+    /// - Every `[liquidator.<chain>]` has a non-zero
+    ///   `contract_address`, unless that chain set
+    ///   `allow_public_mempool = true` (dev/testnet escape hatch).
     /// - `liquidatable_threshold <= near_liq_threshold`.
     pub fn validate(&self) -> Result<(), ConfigError> {
         for liq in self.liquidator.values() {
@@ -239,6 +258,11 @@ impl Config {
             };
             if chain_cfg.private_rpc_url.is_none() && !chain_cfg.allow_public_mempool {
                 return Err(ConfigError::PrivateRpcRequired {
+                    chain: liq.chain.clone(),
+                });
+            }
+            if liq.contract_address == Address::ZERO && !chain_cfg.allow_public_mempool {
+                return Err(ConfigError::ZeroAddressLiquidator {
                     chain: liq.chain.clone(),
                 });
             }
@@ -291,16 +315,23 @@ mod tests {
         }
     }
 
-    fn base_config(chain_cfg: ChainConfig, liquidator_present: bool) -> Config {
+    /// Non-zero sentinel address used by tests that are not exercising
+    /// the zero-address rule. Keeps the default `base_config` valid
+    /// after the `ZeroAddressLiquidator` check landed.
+    fn nonzero_liquidator() -> Address {
+        Address::from([0x11; 20])
+    }
+
+    fn base_config(chain_cfg: ChainConfig, liquidator: Option<Address>) -> Config {
         let mut chains = HashMap::new();
         chains.insert("bnb".to_string(), chain_cfg);
         let mut liquidators = HashMap::new();
-        if liquidator_present {
+        if let Some(addr) = liquidator {
             liquidators.insert(
                 "bnb".to_string(),
                 LiquidatorConfig {
                     chain: "bnb".to_string(),
-                    contract_address: Address::ZERO,
+                    contract_address: addr,
                 },
             );
         }
@@ -322,7 +353,7 @@ mod tests {
 
     #[test]
     fn validate_rejects_liquidator_without_private_rpc() {
-        let cfg = base_config(chain(None, false), true);
+        let cfg = base_config(chain(None, false), Some(nonzero_liquidator()));
         let err = cfg.validate().expect_err("must refuse public mempool");
         match err {
             ConfigError::PrivateRpcRequired { chain } => assert_eq!(chain, "bnb"),
@@ -332,13 +363,13 @@ mod tests {
 
     #[test]
     fn validate_allows_public_mempool_opt_in() {
-        let cfg = base_config(chain(None, true), true);
+        let cfg = base_config(chain(None, true), Some(nonzero_liquidator()));
         cfg.validate().expect("opt-in must be honoured");
     }
 
     #[test]
     fn validate_passes_with_private_rpc_configured() {
-        let cfg = base_config(chain(Some("https://private.example"), false), true);
+        let cfg = base_config(chain(Some("https://private.example"), false), Some(nonzero_liquidator()));
         cfg.validate().expect("private rpc present -> valid");
     }
 
@@ -347,13 +378,13 @@ mod tests {
         // A chain with no deployed liquidator has nothing to submit,
         // so the private-rpc requirement does not apply. Validation
         // must not trip on it.
-        let cfg = base_config(chain(None, false), false);
+        let cfg = base_config(chain(None, false), None);
         cfg.validate().expect("no liquidator -> no private-rpc req");
     }
 
     #[test]
     fn validate_rejects_threshold_inversion() {
-        let mut cfg = base_config(chain(Some("https://p"), false), true);
+        let mut cfg = base_config(chain(Some("https://p"), false), Some(nonzero_liquidator()));
         cfg.bot.liquidatable_threshold = 1.1;
         cfg.bot.near_liq_threshold = 1.0;
         let err = cfg.validate().expect_err("inverted thresholds rejected");
@@ -364,7 +395,7 @@ mod tests {
     fn normalize_collapses_empty_private_rpc_auth_to_none() {
         let mut c = chain(Some("https://private.example"), false);
         c.private_rpc_auth = Some(SecretString::from(String::new()));
-        let mut cfg = base_config(c, true);
+        let mut cfg = base_config(c, Some(nonzero_liquidator()));
         cfg.normalize_empty_secrets();
         let got = cfg.chain.get("bnb").expect("chain present");
         assert!(
@@ -377,7 +408,7 @@ mod tests {
     fn normalize_collapses_empty_private_rpc_url_to_none() {
         let mut c = chain(Some(""), false);
         c.private_rpc_auth = None;
-        let mut cfg = base_config(c, true);
+        let mut cfg = base_config(c, Some(nonzero_liquidator()));
         cfg.normalize_empty_secrets();
         let got = cfg.chain.get("bnb").expect("chain present");
         assert!(
@@ -390,7 +421,7 @@ mod tests {
     fn normalize_preserves_non_empty_secrets() {
         let mut c = chain(Some("https://private.example"), false);
         c.private_rpc_auth = Some(SecretString::from("token".to_string()));
-        let mut cfg = base_config(c, true);
+        let mut cfg = base_config(c, Some(nonzero_liquidator()));
         cfg.normalize_empty_secrets();
         let got = cfg.chain.get("bnb").expect("chain present");
         assert!(got.private_rpc_url.is_some(), "url must be preserved");
@@ -401,7 +432,7 @@ mod tests {
     fn normalize_walks_every_chain_independently() {
         let empty = chain(Some(""), false);
         let set = chain(Some("https://private.example"), false);
-        let mut cfg = base_config(empty, true);
+        let mut cfg = base_config(empty, Some(nonzero_liquidator()));
         cfg.chain.insert("l2".to_string(), set);
         cfg.normalize_empty_secrets();
         assert!(
@@ -420,12 +451,55 @@ mod tests {
         // refuse a chain that had an empty `${VAR}` substitution for
         // its private_rpc_url and did not opt in to public mempool.
         let c = chain(Some(""), false);
-        let mut cfg = base_config(c, true);
+        let mut cfg = base_config(c, Some(nonzero_liquidator()));
         cfg.normalize_empty_secrets();
         let err = cfg
             .validate()
             .expect_err("empty-substituted url must fail validate()");
         assert!(matches!(err, ConfigError::PrivateRpcRequired { .. }));
+    }
+
+    #[test]
+    fn validate_rejects_zero_address_liquidator_without_opt_in() {
+        let cfg = base_config(
+            chain(Some("https://private.example"), false),
+            Some(Address::ZERO),
+        );
+        let err = cfg
+            .validate()
+            .expect_err("zero-address liquidator must be rejected");
+        match err {
+            ConfigError::ZeroAddressLiquidator { chain } => assert_eq!(chain, "bnb"),
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_allows_zero_address_with_public_mempool_opt_in() {
+        // Dev / testnet runs before a real deploy: zero-address
+        // liquidator is tolerated when the operator explicitly opts in
+        // to public-mempool submission.
+        let cfg = base_config(
+            chain(Some("https://private.example"), true),
+            Some(Address::ZERO),
+        );
+        cfg.validate()
+            .expect("zero-addr + opt-in must pass (dev mode)");
+    }
+
+    #[test]
+    fn validate_private_rpc_check_fires_before_zero_address_check() {
+        // Both checks gate on !allow_public_mempool; the private-RPC
+        // rule is listed first in the loop so operators see the more
+        // actionable error first. Lock that ordering.
+        let cfg = base_config(chain(None, false), Some(Address::ZERO));
+        let err = cfg
+            .validate()
+            .expect_err("either check could fire; assert order");
+        assert!(
+            matches!(err, ConfigError::PrivateRpcRequired { .. }),
+            "expected PrivateRpcRequired first, got {err:?}"
+        );
     }
 
     #[test]
