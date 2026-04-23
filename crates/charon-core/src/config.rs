@@ -8,7 +8,7 @@
 
 use alloy::primitives::Address;
 use anyhow::{Context, anyhow};
-use secrecy::SecretString;
+use secrecy::{ExposeSecret, SecretString};
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::path::Path;
@@ -184,9 +184,40 @@ impl Config {
             .with_context(|| format!("failed to read config at {}", path.display()))?;
         let substituted = substitute_env_vars(&raw)
             .with_context(|| format!("env substitution failed for {}", path.display()))?;
-        let config: Config = toml::from_str(&substituted)
+        let mut config: Config = toml::from_str(&substituted)
             .with_context(|| format!("failed to parse TOML at {}", path.display()))?;
+        config.normalize_empty_secrets();
         Ok(config)
+    }
+
+    /// Collapse empty `SecretString` values to `None` on every chain.
+    ///
+    /// `substitute_env_vars` replaces a `${VAR}` placeholder with the
+    /// literal env-var value. When an operator leaves
+    /// `CHARON_BSC_PRIVATE_RPC_AUTH=` empty in `.env`, the TOML field
+    /// becomes `""` and serde deserializes it as `Some(SecretString(""))`
+    /// — not `None`. Downstream that becomes a blank `Authorization:
+    /// Bearer ` header and a misleading pass from
+    /// [`Self::validate`]'s `is_none()` check on `private_rpc_url`. This
+    /// normalizer runs once after load so the rest of the codebase can
+    /// trust `None` to mean "unset".
+    fn normalize_empty_secrets(&mut self) {
+        for chain_cfg in self.chain.values_mut() {
+            if chain_cfg
+                .private_rpc_url
+                .as_ref()
+                .is_some_and(|s| s.expose_secret().is_empty())
+            {
+                chain_cfg.private_rpc_url = None;
+            }
+            if chain_cfg
+                .private_rpc_auth
+                .as_ref()
+                .is_some_and(|s| s.expose_secret().is_empty())
+            {
+                chain_cfg.private_rpc_auth = None;
+            }
+        }
     }
 
     /// Enforce cross-section invariants. Call after [`Self::load`] and
@@ -327,6 +358,74 @@ mod tests {
         cfg.bot.near_liq_threshold = 1.0;
         let err = cfg.validate().expect_err("inverted thresholds rejected");
         assert!(matches!(err, ConfigError::ThresholdInversion { .. }));
+    }
+
+    #[test]
+    fn normalize_collapses_empty_private_rpc_auth_to_none() {
+        let mut c = chain(Some("https://private.example"), false);
+        c.private_rpc_auth = Some(SecretString::from(String::new()));
+        let mut cfg = base_config(c, true);
+        cfg.normalize_empty_secrets();
+        let got = cfg.chain.get("bnb").expect("chain present");
+        assert!(
+            got.private_rpc_auth.is_none(),
+            "empty auth must collapse to None"
+        );
+    }
+
+    #[test]
+    fn normalize_collapses_empty_private_rpc_url_to_none() {
+        let mut c = chain(Some(""), false);
+        c.private_rpc_auth = None;
+        let mut cfg = base_config(c, true);
+        cfg.normalize_empty_secrets();
+        let got = cfg.chain.get("bnb").expect("chain present");
+        assert!(
+            got.private_rpc_url.is_none(),
+            "empty url must collapse to None"
+        );
+    }
+
+    #[test]
+    fn normalize_preserves_non_empty_secrets() {
+        let mut c = chain(Some("https://private.example"), false);
+        c.private_rpc_auth = Some(SecretString::from("token".to_string()));
+        let mut cfg = base_config(c, true);
+        cfg.normalize_empty_secrets();
+        let got = cfg.chain.get("bnb").expect("chain present");
+        assert!(got.private_rpc_url.is_some(), "url must be preserved");
+        assert!(got.private_rpc_auth.is_some(), "auth must be preserved");
+    }
+
+    #[test]
+    fn normalize_walks_every_chain_independently() {
+        let empty = chain(Some(""), false);
+        let set = chain(Some("https://private.example"), false);
+        let mut cfg = base_config(empty, true);
+        cfg.chain.insert("l2".to_string(), set);
+        cfg.normalize_empty_secrets();
+        assert!(
+            cfg.chain.get("bnb").unwrap().private_rpc_url.is_none(),
+            "empty chain must collapse"
+        );
+        assert!(
+            cfg.chain.get("l2").unwrap().private_rpc_url.is_some(),
+            "non-empty chain must survive"
+        );
+    }
+
+    #[test]
+    fn normalize_then_validate_rejects_empty_url_without_opt_in() {
+        // Together with normalize_empty_secrets, validate() must now
+        // refuse a chain that had an empty `${VAR}` substitution for
+        // its private_rpc_url and did not opt in to public mempool.
+        let c = chain(Some(""), false);
+        let mut cfg = base_config(c, true);
+        cfg.normalize_empty_secrets();
+        let err = cfg
+            .validate()
+            .expect_err("empty-substituted url must fail validate()");
+        assert!(matches!(err, ConfigError::PrivateRpcRequired { .. }));
     }
 
     #[test]
