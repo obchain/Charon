@@ -27,11 +27,14 @@
 //!   array length word + loop overhead)
 
 use alloy::primitives::Bytes;
+use alloy::providers::Provider;
 use alloy::sol;
 use alloy::sol_types::SolCall;
 use charon_core::{LiquidationOpportunity, LiquidationParams};
 use thiserror::Error;
 use tracing::debug;
+
+use crate::simulation::Simulator;
 
 /// Matches `MAX_BATCH_SIZE` in `CharonLiquidator.sol`. The Solidity
 /// ceiling is 10 ([`SOLIDITY_MAX_BATCH_SIZE`]); the Rust default is
@@ -122,6 +125,91 @@ pub enum BatcherError {
     /// does not depend on `alloy`'s internal error types.
     #[error("batcher: ABI encoding failed: {0}")]
     AbiEncodeError(String),
+
+    /// `eth_call` simulation of the batch reverted. Carries the
+    /// underlying revert string from the node so the caller can
+    /// log it and drop the batch. This is the failure path of the
+    /// type-level simulate gate — see [`UnsimulatedBatchCalldata`]
+    /// and [`Batcher::simulate`].
+    #[error("batcher: batch simulation reverted: {0}")]
+    SimulationFailed(String),
+}
+
+/// Calldata returned by [`Batcher::encode_calldata`].
+///
+/// Wraps the raw ABI-encoded bytes so they cannot reach a submitter
+/// without first being promoted to [`SimulatedBatchCalldata`] via
+/// [`Batcher::simulate`]. The wrapper is deliberately opaque: no
+/// `Deref`, no `AsRef<Bytes>`, no public `.0`. The only paths into
+/// this type are the encoder and its tests; the only path out is the
+/// simulate gate. This makes the CLAUDE.md invariant "no broadcast
+/// without a passing `eth_call`" a compile-time guarantee for the
+/// batch path, mirroring the `UnverifiedPreSigned` guard on the
+/// mempool pre-sign path (see `charon-scanner::mempool`).
+#[derive(Debug, Clone)]
+pub struct UnsimulatedBatchCalldata(Bytes);
+
+impl UnsimulatedBatchCalldata {
+    /// Borrow the inner bytes for simulation purposes **only**. The
+    /// simulate gate inside the batcher is the one caller — external
+    /// code must go through [`Batcher::simulate`].
+    ///
+    /// This is `pub(crate)` instead of `pub` so a broadcaster written
+    /// against `charon-executor` cannot reach the raw calldata without
+    /// passing through `Batcher::simulate` first. `#[cfg(test)]`
+    /// tests in this module access it through the same accessor.
+    pub(crate) fn as_bytes(&self) -> &Bytes {
+        &self.0
+    }
+
+    /// Length of the inner calldata in bytes. Useful for telemetry
+    /// (fee estimation, calldata-budget checks) at sites that do not
+    /// need to read the bytes themselves.
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    /// True if the inner calldata is empty. Paired with
+    /// [`Self::len`] so the opaque wrapper can still satisfy the
+    /// standard length/empty contract without exposing the buffer.
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+/// Calldata that has passed the batcher's `eth_call` simulation gate.
+///
+/// Produced exclusively by [`Batcher::simulate`]. A downstream
+/// submitter that accepts only `SimulatedBatchCalldata` cannot be
+/// handed raw encoder output by mistake — the type system refuses.
+/// Consumes the inner bytes on request via [`Self::into_bytes`] so
+/// the broadcaster gets an owned `Bytes` for the final
+/// `eth_sendRawTransaction` without paying a copy.
+#[derive(Debug, Clone)]
+pub struct SimulatedBatchCalldata(Bytes);
+
+impl SimulatedBatchCalldata {
+    /// Consume the wrapper and return the inner calldata. Intended
+    /// for the broadcaster call site once batch submission is wired
+    /// into the CLI pipeline.
+    pub fn into_bytes(self) -> Bytes {
+        self.0
+    }
+
+    /// Borrow the inner bytes without consuming the wrapper.
+    pub fn as_bytes(&self) -> &Bytes {
+        &self.0
+    }
+
+    /// Length of the inner calldata in bytes.
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    /// True if the inner calldata is empty.
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
 }
 
 /// One batch ready for `TxBuilder` to wrap into an EIP-1559 transaction.
@@ -210,23 +298,27 @@ impl Batcher {
     ///
     /// # Safety
     ///
-    /// The returned calldata is **not** self-validating. Callers MUST
-    /// pass it through
-    /// [`Simulator::simulate`](crate::Simulator::simulate) before
-    /// broadcasting, per the CLAUDE.md safety invariant that every
-    /// liquidation tx passes an `eth_call` gate. The simulator catches
-    /// protocol-level reverts (insufficient collateral, stale oracle,
-    /// closed market) that the planner cannot see from off-chain data
-    /// alone.
+    /// The returned [`UnsimulatedBatchCalldata`] is a compile-time
+    /// guard enforcing the CLAUDE.md invariant that every
+    /// liquidation tx passes an `eth_call` gate before broadcast.
+    /// The wrapper cannot be unpacked into raw bytes by external
+    /// code; the only promotion path is [`Batcher::simulate`], which
+    /// runs the calldata through [`Simulator::simulate`] and returns
+    /// [`SimulatedBatchCalldata`] on success. A broadcaster written
+    /// against this crate that accepts only `SimulatedBatchCalldata`
+    /// therefore cannot be handed raw encoder output by mistake.
     ///
-    /// The batch path of the sim gate is tracked in issue #298;
-    /// skipping simulation is a bypass of the last line of defense and
-    /// is never acceptable in production code paths.
+    /// The simulator catches protocol-level reverts (insufficient
+    /// collateral, stale oracle, closed market) that the planner
+    /// cannot see from off-chain data alone. Skipping simulation is
+    /// a bypass of the last line of defense and is never acceptable
+    /// in production code paths — the type system now makes that
+    /// bypass a compile error rather than a doc-comment aspiration.
     pub fn encode_calldata(
         &self,
         batch: &LiquidationBatch,
         params: &[LiquidationParams],
-    ) -> Result<Bytes, BatcherError> {
+    ) -> Result<UnsimulatedBatchCalldata, BatcherError> {
         let opps = batch.opportunities.len();
         if params.len() != opps {
             return Err(BatcherError::ParamLengthMismatch {
@@ -269,7 +361,40 @@ impl Batcher {
             chain_id = batch.chain_id,
             "batch calldata encoded"
         );
-        Ok(bytes)
+        Ok(UnsimulatedBatchCalldata(bytes))
+    }
+
+    /// Run a batch calldata through the `eth_call` simulation gate
+    /// and promote it to [`SimulatedBatchCalldata`].
+    ///
+    /// Consumes the [`UnsimulatedBatchCalldata`] so the same buffer
+    /// cannot be simulated twice and reused without going through
+    /// the gate again (a resubmission of stale calldata after
+    /// intervening block state change is a silent profit regression
+    /// the gate would otherwise miss). On simulation failure the
+    /// revert string is surfaced via [`BatcherError::SimulationFailed`]
+    /// and the caller drops the batch.
+    ///
+    /// The `simulator` argument carries the sender and liquidator
+    /// addresses; pass a freshly constructed [`Simulator`] or one
+    /// already built by the submitter wiring. The `provider` is the
+    /// same alloy `Provider` used by the scanner/executor — no
+    /// bespoke transport plumbing.
+    pub async fn simulate<P, T>(
+        &self,
+        provider: &P,
+        simulator: &Simulator,
+        calldata: UnsimulatedBatchCalldata,
+    ) -> Result<SimulatedBatchCalldata, BatcherError>
+    where
+        P: Provider<T>,
+        T: alloy::transports::Transport + Clone,
+    {
+        simulator
+            .simulate(provider, calldata.as_bytes().clone())
+            .await
+            .map_err(|err| BatcherError::SimulationFailed(format!("{err:#}")))?;
+        Ok(SimulatedBatchCalldata(calldata.0))
     }
 }
 
@@ -419,9 +544,10 @@ mod tests {
             total_net_usd_cents: 300,
         };
         let params = vec![mk_params(1), mk_params(2)];
-        let bytes = Batcher::with_default_size()
+        let wrapped = Batcher::with_default_size()
             .encode_calldata(&batch, &params)
             .expect("encode");
+        let bytes = wrapped.as_bytes();
 
         assert_eq!(
             &bytes[..4],

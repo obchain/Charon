@@ -18,6 +18,7 @@ pub mod submit;
 
 pub use batcher::{
     BSC_CHAIN_ID, Batcher, BatcherError, LiquidationBatch, MAX_BATCH_SIZE, SOLIDITY_MAX_BATCH_SIZE,
+    SimulatedBatchCalldata, UnsimulatedBatchCalldata,
 };
 pub use builder::{ICharonLiquidator, TxBuilder};
 pub use gas::{GasOracle, GasParams, gas_cost_usd_cents};
