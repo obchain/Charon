@@ -48,7 +48,43 @@ enabled = true
 bind    = "0.0.0.0:9091"
 
 # ── Chainlink price feeds (per chain, per asset symbol) ───────────────────
-# Chainlink has a limited feed set on BSC testnet; leave empty to fall
-# back to Venus's ResilientOracle for the demo. Populate once a
-# testnet-specific feed map is needed.
+#
+# Source of truth: Chainlink's public data-feeds directory at
+# https://data.chain.link (network filter: "BNB Chain Testnet"). Only
+# aggregator proxy addresses that are *currently listed* on that page
+# for Chapel (chainId 97) should appear below — never a historical
+# mirror, blog post, or third-party aggregator.
+#
+# Verification date: 2026-04-23.
+#
+# Re-verification cadence: Chainlink rarely redeploys feeds on Chapel,
+# but testnet feeds are not covered by the same SLA as mainnet and can
+# be retired or repointed between releases. Spot-check this section on
+# data.chain.link before every demo and after any Chainlink testnet
+# announcement; bump the verification date above when you do.
+#
+# Silent-failure mode if an address drifts: PriceCache::refresh calls
+# `latestRoundData()` on whatever address is wired here. If the address
+# is wrong, not a contract, or the ABI no longer matches, the call
+# reverts or returns zero — the cache silently produces no value for
+# that symbol, and the scanner falls back to Venus's ResilientOracle
+# for that asset. There is no hard error and no panic; the only
+# externally visible symptom is that the Chainlink-vs-protocol price
+# cross-check quietly degrades to a single-source read, which defeats
+# the purpose of wiring Chainlink in the first place. Treat any
+# unexplained absence of a symbol from the cache as a drifted address
+# until proven otherwise.
+#
+# Addresses left as TODOs below were not independently re-verified
+# against data.chain.link at the time of this edit. Per #237's
+# explicit "do not invent addresses" constraint, they stay commented
+# out until an operator confirms the canonical proxy on the Chainlink
+# directory and fills them in with the same inline-comment format.
 [chainlink.bnb]
+# BNB / USD   — TODO(#237): verify on data.chain.link (BNB Chain Testnet)
+# BTC / USD   — TODO(#237): verify on data.chain.link (BNB Chain Testnet)
+# ETH / USD   — TODO(#237): verify on data.chain.link (BNB Chain Testnet)
+# USDT / USD  — TODO(#237): verify on data.chain.link (BNB Chain Testnet)
+# USDC / USD  — TODO(#237): verify on data.chain.link (BNB Chain Testnet)
+# DAI / USD   — TODO(#237): verify on data.chain.link (BNB Chain Testnet)
+# LINK / USD  — TODO(#237): verify on data.chain.link (BNB Chain Testnet)
