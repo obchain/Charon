@@ -52,9 +52,15 @@ services:
     restart: unless-stopped
     # `run` subcommand and the default server port (12345) are enough
     # for a scrape + remote_write topology; we don't expose the UI.
+    #
+    # Admin HTTP binds to loopback inside the container so no other
+    # service on charon_net can reach the config, /-/reload, or
+    # component-graph endpoints. If UI access is ever needed, run
+    # `docker compose exec alloy wget http://127.0.0.1:12345/...` or
+    # tunnel the port on demand.
     command:
       - "run"
-      - "--server.http.listen-addr=0.0.0.0:12345"
+      - "--server.http.listen-addr=127.0.0.1:12345"
       - "--storage.path=/var/lib/alloy/data"
       - "/etc/alloy/config.alloy"
     env_file:
