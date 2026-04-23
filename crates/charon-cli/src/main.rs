@@ -95,6 +95,16 @@ async fn main() -> Result<()> {
     let config = Config::load(&cli.config)
         .with_context(|| format!("failed to load config from {}", cli.config.display()))?;
 
+    // Profile-specific invariants — e.g. `profile_tag = "fork"` must
+    // only point at loopback RPCs. Fail fast before we open any WS /
+    // HTTP connection so an operator who ran `charon --config
+    // config/fork.toml` with stale env pointing at mainnet sees the
+    // actionable error instead of partial startup (#254).
+    if let Err(err) = config.validate() {
+        tracing::error!(error = %err, "config validation failed");
+        std::process::exit(1);
+    }
+
     info!(
         chains = config.chain.len(),
         protocols = config.protocol.len(),

@@ -1,8 +1,9 @@
 # Charon — local anvil fork profile (BSC mainnet state, local host).
 #
 # Pair with `scripts/anvil_fork.sh`. The fork process exposes HTTP+WS
-# on 127.0.0.1:8545 and mirrors every mainnet address the default
-# profile uses, so addresses here match `config/default.toml` exactly.
+# on 127.0.0.1:${CHARON_ANVIL_PORT:-8545} and mirrors every mainnet
+# address the default profile uses, so addresses here match
+# `config/default.toml` exactly.
 #
 # Why a separate file instead of reusing `default.toml`:
 # - RPC URLs point at localhost, not production endpoints.
@@ -10,6 +11,13 @@
 #   fork; the local anvil IS the submission surface.
 # - `min_profit_usd` is lowered so synthetic / partial positions the
 #   operator stages manually aren't filtered out during demos.
+#
+# Running a secondary fork on a different port:
+#   CHARON_ANVIL_PORT=8546 ./scripts/anvil_fork.sh
+#   CHARON_ANVIL_PORT=8546 charon --config config/fork.toml listen
+# Both the script and this profile read `CHARON_ANVIL_PORT` (falling
+# back to 8545) so a dev can spin up parallel forks without editing
+# the TOML.
 
 [bot]
 # Lower gate for demo staging — real ops should use default.toml.
@@ -18,6 +26,10 @@ max_gas_gwei           = 20
 scan_interval_ms       = 1000
 liquidatable_threshold = 1.0
 near_liq_threshold     = 1.05
+# Safety gate: `Config::validate` rejects this profile at startup if any
+# chain points at a non-loopback RPC. Keeps a lowered profit gate from
+# ever pointing at mainnet by accident (#254).
+profile_tag            = "fork"
 
 # ── Chains ────────────────────────────────────────────────────────────────
 [chain.bnb]
@@ -25,8 +37,8 @@ near_liq_threshold     = 1.05
 # transactions remain valid across operator/fork boundaries as long as
 # this matches what the script passes.
 chain_id          = 56
-ws_url            = "ws://127.0.0.1:8545"
-http_url          = "http://127.0.0.1:8545"
+ws_url            = "ws://127.0.0.1:${CHARON_ANVIL_PORT:-8545}"
+http_url          = "http://127.0.0.1:${CHARON_ANVIL_PORT:-8545}"
 priority_fee_gwei = 1
 # No private relay on a local fork.
 # private_rpc_url   = ""

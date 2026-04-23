@@ -7,7 +7,7 @@ pub mod queue;
 pub mod traits;
 pub mod types;
 
-pub use config::{Config, MetricsConfig};
+pub use config::{Config, ConfigError, MetricsConfig};
 pub use flashloan::{FlashLoanProvider, FlashLoanQuote};
 pub use profit::{NetProfit, ProfitInputs, calculate_profit};
 pub use queue::{DEFAULT_TTL_BLOCKS, OpportunityQueue};
