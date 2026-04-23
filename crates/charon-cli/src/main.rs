@@ -20,12 +20,14 @@ use charon_core::{
     ProfitInputs, SwapRoute, calculate_profit,
 };
 use charon_executor::{
-    DEFAULT_SUBMIT_TIMEOUT, GasOracle, NonceManager, SubmitError, Submitter, Simulator, TxBuilder,
+    DEFAULT_SUBMIT_TIMEOUT, GasOracle, GasParams, NonceManager, Simulator, SubmitError, Submitter,
+    TxBuilder, gas_cost_usd_cents,
 };
 use charon_flashloan::{AaveFlashLoan, FlashLoanRouter};
 use charon_protocols::VenusAdapter;
 use charon_scanner::{
     BlockListener, ChainEvent, ChainProvider, DEFAULT_MAX_AGE, HealthScanner, PriceCache,
+    TokenMetaCache,
 };
 use clap::{Parser, Subcommand};
 use tokio::sync::mpsc;
@@ -41,10 +43,19 @@ const CHAIN_EVENT_CHANNEL: usize = 1024;
 /// 0.5% — conservative default for PancakeSwap V3 hot-pair swaps.
 const DEFAULT_SLIPPAGE_BPS: u16 = 50;
 
-/// Placeholder gas estimate per liquidation tx (USD cents). Real
-/// `eth_estimateGas × gas_price × native_price` lands once a gas
-/// oracle is wired up.
-const PLACEHOLDER_GAS_USD_CENTS: u64 = 50;
+/// Pre-broadcast gas-units estimate used by the profit gate. Venus
+/// liquidation path through the Aave flashloan callback empirically
+/// lands in ~1.1-1.6M gas; we use 1.5M to avoid gating out profitable
+/// txs that would comfortably fit under the real `eth_estimateGas`
+/// result fetched inside [`broadcast`]. The actual gas limit sent on
+/// the wire is still `estimate_gas × 1.3` at broadcast time.
+const PROFIT_GATE_ROUGH_GAS_UNITS: u64 = 1_500_000;
+
+/// Native-asset Chainlink feed symbol on BSC. Used to price the gas
+/// cost estimate in USD cents. If this feed is missing from the
+/// config's `[chainlink.bnb]` table the bot refuses to start — a
+/// missing BNB feed means we cannot compute gas cost at all.
+const NATIVE_FEED_SYMBOL: &str = "BNB";
 
 /// Multiplier applied to `eth_estimateGas` before broadcast. 30 %
 /// headroom covers state drift between estimate and inclusion (vToken
@@ -146,7 +157,10 @@ async fn main() -> Result<()> {
 /// Bundle of executor components needed to broadcast a simulated
 /// opportunity. Present only when the operator ran `listen --execute`
 /// and every safety gate passed; `None` means the pipeline is in
-/// scan-only or scan-plus-simulate mode.
+/// scan-only or scan-plus-simulate mode. Holds its own `GasOracle`
+/// clone — the oracle is also used by the profit gate outside
+/// `--execute` mode, so it lives at run-listen scope and the clone
+/// here is just convenience.
 struct ExecHarness {
     gas_oracle: GasOracle,
     nonce_manager: Arc<NonceManager>,
@@ -209,6 +223,37 @@ async fn run_listen(config: Config, borrowers: Vec<Address>, execute: bool) -> R
             info!(symbol = %sym, price = %p.price, decimals = p.decimals, "chainlink feed");
         }
     }
+    if prices.get(NATIVE_FEED_SYMBOL).is_none() {
+        bail!(
+            "chainlink feed for '{NATIVE_FEED_SYMBOL}' missing or stale — gas cost cannot be priced"
+        );
+    }
+
+    // Token metadata (symbol + decimals) for every Venus underlying.
+    // Queried once at startup; the profit gate needs both fields to
+    // convert a raw repay amount into USD cents via the price cache.
+    let token_meta = Arc::new(
+        TokenMetaCache::build(
+            provider.as_ref(),
+            adapter.underlying_to_vtoken.keys().copied(),
+        )
+        .await,
+    );
+    info!(
+        tokens_cached = token_meta.len(),
+        "token metadata cache built"
+    );
+    if token_meta.is_empty() {
+        bail!(
+            "token metadata cache is empty — no Venus underlying resolved its symbol/decimals; \
+             profit gate would drop every opportunity. Check RPC and adapter wiring."
+        );
+    }
+
+    // Gas oracle is needed by both the profit gate (every block) and
+    // the broadcast path (under --execute). Build once, share by
+    // value — `GasOracle` is `Copy`.
+    let gas_oracle = GasOracle::new(config.bot.max_gas_gwei, bnb.priority_fee_gwei);
 
     // ── Flash-loan router (#13) ──
     // Liquidator address may be the placeholder zero — adapter still
@@ -284,7 +329,6 @@ async fn run_listen(config: Config, borrowers: Vec<Address>, execute: bool) -> R
         let nonce_manager = NonceManager::init(provider.as_ref(), signer_address)
             .await
             .context("--execute: failed to initialise nonce manager")?;
-        let gas_oracle = GasOracle::new(config.bot.max_gas_gwei, bnb.priority_fee_gwei);
         warn!(
             signer = %signer_address,
             liquidator = %liquidator_cfg.contract_address,
@@ -345,6 +389,9 @@ async fn run_listen(config: Config, borrowers: Vec<Address>, execute: bool) -> R
                             tx_builder.clone(),
                             simulator.clone(),
                             exec_harness.clone(),
+                            prices.clone(),
+                            token_meta.clone(),
+                            gas_oracle,
                             queue.clone(),
                             provider.clone(),
                             config.bot.min_profit_usd,
@@ -375,6 +422,9 @@ async fn process_block(
     tx_builder: Option<Arc<TxBuilder>>,
     simulator: Option<Arc<Simulator>>,
     exec_harness: Option<Arc<ExecHarness>>,
+    prices: Arc<PriceCache>,
+    token_meta: Arc<TokenMetaCache>,
+    gas_oracle: GasOracle,
     queue: Arc<tokio::sync::Mutex<OpportunityQueue>>,
     provider: Arc<alloy::providers::RootProvider<alloy::pubsub::PubSubFrontend>>,
     min_profit_usd: f64,
@@ -394,7 +444,21 @@ async fn process_block(
     scanner.upsert(positions);
     let counts = scanner.bucket_counts();
 
-    // 3. Per-liquidatable: route flash loan, calc profit, build, simulate, queue.
+    // 3a. One-shot gas snapshot for this block. Shared across every
+    //    opportunity in this tick so we make a single `get_block`
+    //    call no matter how many liquidatable positions fan out.
+    //    `None` means the gas oracle refused to emit (ceiling tripped
+    //    or RPC error); the profit gate treats that as "too expensive
+    //    this block" and drops every candidate.
+    let gas_snapshot = match gas_oracle.fetch_params(provider.as_ref()).await {
+        Ok(params) => params,
+        Err(err) => {
+            warn!(chain = %chain, block, error = ?err, "gas oracle tick failed");
+            None
+        }
+    };
+
+    // 3b. Per-liquidatable: route flash loan, calc profit, build, simulate, queue.
     let liquidatable = scanner.liquidatable();
     let mut queued = 0usize;
     let mut broadcast = 0usize;
@@ -406,6 +470,9 @@ async fn process_block(
             tx_builder.as_deref(),
             simulator.as_deref(),
             exec_harness.as_deref(),
+            prices.as_ref(),
+            token_meta.as_ref(),
+            gas_snapshot,
             provider.as_ref(),
             min_profit_usd,
             block,
@@ -466,6 +533,9 @@ async fn process_opportunity(
     tx_builder: Option<&TxBuilder>,
     simulator: Option<&Simulator>,
     exec_harness: Option<&ExecHarness>,
+    prices: &PriceCache,
+    token_meta: &TokenMetaCache,
+    gas_snapshot: Option<GasParams>,
     provider: &alloy::providers::RootProvider<alloy::pubsub::PubSubFrontend>,
     min_profit_usd: f64,
     queued_at_block: u64,
@@ -481,17 +551,65 @@ async fn process_opportunity(
         return Ok(ProcessOutcome::Dropped);
     };
 
-    // c. Profit calc — placeholder USD math until precise per-token
-    //    pricing lands. Treat repay_amount as 1:1 USD cents-equivalent
-    //    after stripping decimals (works for stablecoin debt; underprices
-    //    BNB/BTC/ETH debt — flagged as a follow-up).
-    let repay_usd_cents = repay_to_usd_cents_placeholder(repay);
-    let flash_fee_usd_cents = repay_to_usd_cents_placeholder(quote.fee);
+    // c. Real profit calc. Any missing piece of price/meta/gas data
+    //    deliberately drops the opportunity rather than falling back
+    //    to an optimistic default — the profit gate is the last line
+    //    of defence against broadcasting an unprofitable tx.
+    let Some(debt_meta) = token_meta.get(&pos.debt_token) else {
+        debug!(
+            borrower = %pos.borrower,
+            debt_token = %pos.debt_token,
+            "no token metadata — dropped"
+        );
+        return Ok(ProcessOutcome::Dropped);
+    };
+    let Some(debt_price) = prices.get(&debt_meta.symbol) else {
+        debug!(
+            borrower = %pos.borrower,
+            symbol = %debt_meta.symbol,
+            "no chainlink price (or stale) — dropped"
+        );
+        return Ok(ProcessOutcome::Dropped);
+    };
+    let Some(native_price) = prices.get(NATIVE_FEED_SYMBOL) else {
+        debug!(
+            borrower = %pos.borrower,
+            "no BNB/USD price (or stale) — dropped"
+        );
+        return Ok(ProcessOutcome::Dropped);
+    };
+    let Some(gas_params) = gas_snapshot else {
+        debug!(
+            borrower = %pos.borrower,
+            "gas snapshot unavailable this block — dropped"
+        );
+        return Ok(ProcessOutcome::Dropped);
+    };
+
+    let repay_usd_cents = amount_to_usd_cents(
+        repay,
+        debt_meta.decimals,
+        debt_price.price,
+        debt_price.decimals,
+    );
+    let flash_fee_usd_cents = amount_to_usd_cents(
+        quote.fee,
+        debt_meta.decimals,
+        debt_price.price,
+        debt_price.decimals,
+    );
+    let gas_cost_usd = gas_cost_usd_cents(
+        PROFIT_GATE_ROUGH_GAS_UNITS,
+        gas_params.max_fee_per_gas,
+        native_price.price,
+        native_price.decimals,
+    );
+
     let profit_inputs = ProfitInputs {
         repay_amount_usd_cents: repay_usd_cents,
         liquidation_bonus_bps: pos.liquidation_bonus_bps,
         flash_fee_usd_cents,
-        gas_cost_usd_cents: PLACEHOLDER_GAS_USD_CENTS,
+        gas_cost_usd_cents: gas_cost_usd,
         slippage_bps: DEFAULT_SLIPPAGE_BPS,
     };
     let net = match calculate_profit(&profit_inputs, min_profit_usd) {
@@ -653,13 +771,77 @@ async fn broadcast(
     }
 }
 
-/// Strip 18 decimals and convert to USD cents (×100), saturating to
-/// `u64`. Treats every token as 1 USD per unit — fine for stablecoin
-/// debt, wildly off for BNB/BTC/ETH. Real per-token pricing replaces
-/// this once a token-decimals + symbol-resolution layer lands.
-fn repay_to_usd_cents_placeholder(amount: U256) -> u64 {
-    // 1 token (18 decimals) ≈ $1 → 100 cents. Divide by 1e16.
-    let scale = U256::from(10u64).pow(U256::from(16u64));
-    let cents = amount / scale;
+/// Convert a token amount into USD cents using a Chainlink price.
+///
+/// Inputs:
+/// - `amount` — raw units of the ERC-20 (`repay_amount`, `flash_fee`, …).
+/// - `token_decimals` — decimals of the ERC-20 itself (`USDT` = 6, `BTCB` = 18).
+/// - `price` — raw Chainlink aggregator answer (non-negative).
+/// - `price_decimals` — feed's `decimals()` (typically 8 on BSC).
+///
+/// Math:
+/// ```text
+/// usd_cents = amount × price × 100 / 10^(token_decimals + price_decimals)
+/// ```
+/// Every step is on `U256` with `saturating_mul`; the final cast
+/// clamps to `u64::MAX` so a pathological amount never panics.
+fn amount_to_usd_cents(
+    amount: U256,
+    token_decimals: u8,
+    price: U256,
+    price_decimals: u8,
+) -> u64 {
+    let numerator = amount
+        .saturating_mul(price)
+        .saturating_mul(U256::from(100u64));
+    let exponent = u64::from(token_decimals) + u64::from(price_decimals);
+    let divisor = U256::from(10u64).pow(U256::from(exponent));
+    if divisor.is_zero() {
+        return 0;
+    }
+    let cents = numerator / divisor;
     u64::try_from(cents).unwrap_or(u64::MAX)
+}
+
+#[cfg(test)]
+mod amount_to_usd_cents_tests {
+    use super::*;
+
+    #[test]
+    fn usdt_6_decimals_at_1_dollar_gives_cents_scaled_by_100() {
+        // 1_000_000 raw USDT = 1 USDT @ 6 decimals × $1.00 = 100 cents
+        let cents = amount_to_usd_cents(U256::from(1_000_000u64), 6, U256::from(100_000_000u64), 8);
+        assert_eq!(cents, 100);
+    }
+
+    #[test]
+    fn btcb_18_decimals_at_60k_dollars_gives_six_million_cents() {
+        // 1 BTCB (1e18 raw) @ price 60_000 × 1e8 → 6_000_000 cents
+        let cents = amount_to_usd_cents(
+            U256::from(10u64).pow(U256::from(18u64)),
+            18,
+            U256::from(60_000u64) * U256::from(100_000_000u64),
+            8,
+        );
+        assert_eq!(cents, 6_000_000);
+    }
+
+    #[test]
+    fn zero_price_returns_zero_cents() {
+        let cents = amount_to_usd_cents(U256::from(1u64), 18, U256::ZERO, 8);
+        assert_eq!(cents, 0);
+    }
+
+    #[test]
+    fn saturates_on_extreme_inputs() {
+        // price ~= 10^30 × amount ~= 10^30 → numerator ~10^62 /
+        // divisor 10^26 = 10^36, overflows u64 → saturates.
+        let cents = amount_to_usd_cents(
+            U256::from(10u64).pow(U256::from(30u64)),
+            18,
+            U256::from(10u64).pow(U256::from(30u64)),
+            8,
+        );
+        assert_eq!(cents, u64::MAX);
+    }
 }
