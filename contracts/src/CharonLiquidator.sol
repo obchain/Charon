@@ -210,8 +210,8 @@ contract CharonLiquidator is IFlashLoanSimpleReceiver {
 
     /// @notice Recovers ERC-20 tokens or native BNB that are stuck in this contract.
     /// @dev Fully implemented — this is a safety hatch, not core liquidation logic.
-    ///      For ERC-20: calls token.transfer(to, amount).
-    ///      For native BNB: uses payable(to).transfer(amount).
+    ///      For ERC-20: calls token.transfer(to, amount) and checks the return value.
+    ///      For native BNB: uses a low-level call{value: amount}("") with success check.
     ///
     ///      Security notes:
     ///        - onlyOwner: only the hot wallet can pull funds.
@@ -219,8 +219,13 @@ contract CharonLiquidator is IFlashLoanSimpleReceiver {
     ///        - Uses IERC20.transfer directly (no SafeERC20) because this is a
     ///          skeleton with no OZ dependency; full impl (#12) should assess
     ///          whether fee-on-transfer tokens need special handling here.
-    ///        - Native transfer uses Solidity's `transfer` which forwards 2300 gas
-    ///          and reverts on failure — appropriate for a trusted owner address.
+    ///        - Native transfer uses `call` rather than `transfer` or `send`.
+    ///          Solidity's `transfer` forwards a hard-coded 2300-gas stipend which
+    ///          reverts against any recipient whose fallback does non-trivial work
+    ///          (Gnosis Safe and most multisigs, smart-contract wallets, any
+    ///          custody solution that logs inbound receipts). `call` forwards the
+    ///          remaining gas and is the EIP-1884-safe primitive; its boolean
+    ///          return value is checked to surface failures as reverts.
     ///
     /// @param token  ERC-20 contract address, or address(0) for native BNB.
     /// @param to     Recipient address. Must be non-zero.
@@ -231,9 +236,12 @@ contract CharonLiquidator is IFlashLoanSimpleReceiver {
 
         if (token == address(0)) {
             // Native BNB path.
-            // `transfer` reverts on failure and caps forwarded gas at 2300,
-            // which is appropriate for a trusted owner EOA.
-            payable(to).transfer(amount);
+            // Use `call` with full remaining gas so the recipient may be a multisig
+            // or smart-contract wallet (Gnosis Safe, etc.). The 2300-gas stipend of
+            // `transfer`/`send` is insufficient post-EIP-1884 for such recipients
+            // and would trap funds in this contract.
+            (bool ok,) = payable(to).call{ value: amount }("");
+            require(ok, "rescue: bnb transfer failed");
         } else {
             // ERC-20 path.
             // The return value is checked to handle tokens that return false rather than reverting.
@@ -247,10 +255,21 @@ contract CharonLiquidator is IFlashLoanSimpleReceiver {
     }
 
     // ─────────────────────────────────────────────────────────────────────────
-    // Receive — accept native BNB
+    // Receive — native BNB is intentionally rejected
     // ─────────────────────────────────────────────────────────────────────────
-
-    /// @notice Allows this contract to receive native BNB (e.g., from vBNB redemption
-    ///         or direct top-up by the operator) so that rescue() can withdraw it.
-    receive() external payable { }
+    //
+    // No `receive()` or `fallback()` is defined. Plain BNB transfers to this
+    // contract revert. Rationale:
+    //   - v0.1 does not liquidate the vBNB native-BNB market; all supported
+    //     Venus markets settle collateral in ERC-20 (WBNB, BUSD, USDT, ...).
+    //   - An open `receive()` would silently accumulate BNB from any sender,
+    //     making misrouted funds hard to notice and providing free storage
+    //     for griefers / mixers.
+    //   - If the vBNB market is added later, reintroduce a gated `receive()`
+    //     that requires `msg.sender == vBNB_MARKET` so only the Venus
+    //     contract can push native BNB into this contract during redeem.
+    //
+    // If BNB is ever trapped here (e.g. as a SELFDESTRUCT beneficiary), the
+    // owner can still recover it via rescue(address(0), ...) because
+    // SELFDESTRUCT credits the balance without invoking `receive()`.
 }
