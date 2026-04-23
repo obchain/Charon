@@ -46,7 +46,14 @@ pub struct Config {
 }
 
 /// Prometheus exporter configuration.
+///
+/// `deny_unknown_fields` guards against TOML field-level typos. Every
+/// field has a serde default, so `bnd = "..."` instead of `bind`
+/// would otherwise silently load the default and the operator would
+/// wonder why their override didn't take. See [`FlashLoanConfig`] for
+/// the full rationale behind this class of hardening.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MetricsConfig {
     /// Start the exporter at bot startup. Set to `false` to run charon
     /// with zero metrics overhead (e.g. one-shot debug runs).
@@ -77,7 +84,15 @@ fn default_metrics_bind() -> SocketAddr {
 }
 
 /// Bot-level knobs — thresholds and intervals.
+///
+/// `deny_unknown_fields` guards against TOML field-level typos.
+/// Several fields (`chain`, `liquidatable_threshold`,
+/// `near_liq_threshold`) are `#[serde(default)]`, so a misspelling
+/// like `liquidatable_threshhold = 0.95` would otherwise silently
+/// keep the default and mis-tune the scanner. See [`FlashLoanConfig`]
+/// for the full rationale.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BotConfig {
     /// Key into `[chain.*]` naming the active chain for this profile
     /// (e.g. `"bnb"` for mainnet, `"bnb_testnet"` for Chapel). The CLI
@@ -119,7 +134,14 @@ fn default_near_liq_threshold() -> f64 {
 }
 
 /// RPC endpoints for a single chain.
+///
+/// `deny_unknown_fields` guards against TOML field-level typos.
+/// `priority_fee_gwei` and `private_rpc_url` are `#[serde(default)]`,
+/// so a typo like `privte_rpc_url = "..."` would otherwise leave the
+/// submitter silently hitting the public mempool. See
+/// [`FlashLoanConfig`] for the full rationale.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ChainConfig {
     pub chain_id: u64,
     pub ws_url: String,
@@ -142,7 +164,11 @@ fn default_priority_fee_gwei() -> u64 {
 }
 
 /// Address and metadata for a lending protocol on a specific chain.
+///
+/// `deny_unknown_fields` for symmetry with the other config structs;
+/// see [`FlashLoanConfig`] for the full rationale.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ProtocolConfig {
     /// Name of the chain this protocol runs on (must match a key in `[chain]`).
     pub chain: String,
@@ -151,7 +177,15 @@ pub struct ProtocolConfig {
 }
 
 /// A flash-loan source available on a given chain.
+///
+/// `deny_unknown_fields` guards against TOML field-level typos.
+/// Both this section and `[liquidator.*]` are now `#[serde(default)]`
+/// at the [`Config`] level, so a misspelled field (e.g. `poo` instead
+/// of `pool`) would otherwise silently deserialize to a zero-address
+/// default. Rejecting unknown keys at load time makes that class of
+/// mistake a startup error rather than a silent skip at runtime.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct FlashLoanConfig {
     pub chain: String,
     /// Pool / vault address (Aave V3 Pool, Balancer Vault, etc.).
@@ -159,7 +193,11 @@ pub struct FlashLoanConfig {
 }
 
 /// Address of the deployed `CharonLiquidator` contract on a chain.
+///
+/// `deny_unknown_fields` guards against TOML field-level typos. See
+/// [`FlashLoanConfig`] for the full rationale.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct LiquidatorConfig {
     pub chain: String,
     pub contract_address: Address,
