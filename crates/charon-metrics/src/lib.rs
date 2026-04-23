@@ -19,10 +19,43 @@
 
 use std::net::SocketAddr;
 
-use anyhow::{Context, Result};
 use metrics::{counter, describe_counter, describe_gauge, describe_histogram, gauge, histogram};
-use metrics_exporter_prometheus::{Matcher, PrometheusBuilder};
+use metrics_exporter_prometheus::{
+    BuildError as PromBuildError, Matcher, PrometheusBuilder,
+};
+use thiserror::Error;
 use tracing::info;
+
+/// Errors returned from [`init`]. Exposed as a `#[non_exhaustive]`
+/// enum so `charon-cli` can distinguish bind failures (port collision
+/// is retryable) from recorder-install failures (caller must abort —
+/// the global recorder can only be set once) without matching on
+/// `Display` strings. New variants may be added without a breaking
+/// semver bump.
+#[derive(Debug, Error)]
+#[non_exhaustive]
+pub enum MetricsError {
+    /// Failed to register custom histogram buckets for a specific
+    /// metric. Carries the metric name so logs pinpoint the offender.
+    #[error("failed to register buckets for {metric}: {source}")]
+    BucketConfig {
+        metric: &'static str,
+        #[source]
+        source: PromBuildError,
+    },
+    /// Installing the global Prometheus recorder failed. Typically a
+    /// port collision on `bind` or a recorder double-install. The
+    /// underlying `BuildError` preserves the original diagnosis.
+    #[error("failed to install Prometheus exporter on {bind}: {source}")]
+    InstallFailed {
+        bind: SocketAddr,
+        #[source]
+        source: PromBuildError,
+    },
+}
+
+/// Convenience alias so helpers and call sites share one return shape.
+pub type Result<T, E = MetricsError> = std::result::Result<T, E>;
 
 // Bucket boundaries for `charon_pipeline_block_duration_seconds`.
 // BSC produces a block every ~3s; resolution is packed around that
@@ -104,24 +137,20 @@ pub async fn init(bind: SocketAddr) -> Result<()> {
             Matcher::Full(names::PIPELINE_BLOCK_DURATION_SECONDS.to_string()),
             BLOCK_DURATION_SECONDS_BUCKETS,
         )
-        .with_context(|| {
-            format!(
-                "failed to register buckets for {}",
-                names::PIPELINE_BLOCK_DURATION_SECONDS
-            )
+        .map_err(|source| MetricsError::BucketConfig {
+            metric: names::PIPELINE_BLOCK_DURATION_SECONDS,
+            source,
         })?
         .set_buckets_for_metric(
             Matcher::Full(names::EXECUTOR_PROFIT_USD_CENTS.to_string()),
             PROFIT_USD_CENTS_BUCKETS,
         )
-        .with_context(|| {
-            format!(
-                "failed to register buckets for {}",
-                names::EXECUTOR_PROFIT_USD_CENTS
-            )
+        .map_err(|source| MetricsError::BucketConfig {
+            metric: names::EXECUTOR_PROFIT_USD_CENTS,
+            source,
         })?
         .install()
-        .with_context(|| format!("failed to install Prometheus exporter on {bind}"))?;
+        .map_err(|source| MetricsError::InstallFailed { bind, source })?;
 
     describe_all();
 
@@ -266,7 +295,10 @@ mod tests {
         // rare in practice on `127.0.0.1`.
         let probe = std::net::TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))
             .expect("probe bind");
-        let port = probe.local_addr().unwrap().port();
+        let port = probe
+            .local_addr()
+            .expect("probe socket must expose its bound local_addr")
+            .port();
         drop(probe);
 
         let bind = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
@@ -279,6 +311,34 @@ mod tests {
         TcpStream::connect(bind)
             .await
             .expect("listener should accept TCP connections");
+    }
+
+    /// `MetricsError::BucketConfig` must render the offending metric
+    /// name in its `Display` string and expose the upstream
+    /// `PromBuildError` through `Error::source()` so operator tooling
+    /// can walk the chain. Reached via the real builder path (empty
+    /// bucket slice → `BuildError::EmptyBucketsOrQuantiles`) rather
+    /// than a hand-rolled variant, so the mapping in `init` stays
+    /// exercised end-to-end.
+    #[test]
+    fn bucket_config_error_display_and_source_chain() {
+        let err = PrometheusBuilder::new()
+            .set_buckets_for_metric(Matcher::Full(names::EXECUTOR_PROFIT_USD_CENTS.to_string()), &[])
+            .map_err(|source| MetricsError::BucketConfig {
+                metric: names::EXECUTOR_PROFIT_USD_CENTS,
+                source,
+            })
+            .expect_err("empty bucket slice must fail");
+
+        let rendered = format!("{err}");
+        assert!(
+            rendered.contains(names::EXECUTOR_PROFIT_USD_CENTS),
+            "Display must name the offending metric, got {rendered:?}"
+        );
+        assert!(
+            std::error::Error::source(&err).is_some(),
+            "BucketConfig must expose its PromBuildError as source()"
+        );
     }
 
     /// Typed helpers must not panic when called — this exercises every
