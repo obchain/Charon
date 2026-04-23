@@ -8,12 +8,14 @@
 //!    Solidity-side `LiquidationParams` struct and ABI-encode the
 //!    `executeLiquidation(...)` call.
 //! 2. [`TxBuilder::build_tx`] — wrap the calldata in an unsigned
-//!    [`TransactionRequest`] with EIP-1559 fee fields and the latest
-//!    nonce for the bot's hot wallet.
+//!    [`TransactionRequest`] with EIP-1559 fee fields and the
+//!    **pending** nonce for the bot's hot wallet.
 //! 3. [`TxBuilder::sign`] — sign the request, returning the raw bytes
 //!    that go into `eth_sendRawTransaction` (or a Flashbots bundle).
 
-use alloy::eips::eip2718::Encodable2718;
+use std::fmt;
+
+use alloy::eips::{BlockId, BlockNumberOrTag, eip2718::Encodable2718};
 use alloy::network::{EthereumWallet, TransactionBuilder};
 use alloy::primitives::{Address, Bytes};
 use alloy::providers::Provider;
@@ -21,7 +23,7 @@ use alloy::rpc::types::TransactionRequest;
 use alloy::signers::local::PrivateKeySigner;
 use alloy::sol;
 use alloy::sol_types::SolCall;
-use anyhow::{Context, Result};
+use alloy::transports::TransportError;
 use charon_core::{LiquidationOpportunity, LiquidationParams};
 use tracing::debug;
 
@@ -50,19 +52,71 @@ sol! {
     }
 }
 
-/// Numeric protocol id matching `PROTOCOL_VENUS` in the Solidity source.
+/// Numeric protocol id matching `PROTOCOL_VENUS` in the Solidity
+/// source. See `contracts/src/CharonLiquidator.sol:49` — any change
+/// there must be mirrored here, and the
+/// [`tests::encode_calldata_protocol_id_equals_venus`] unit test
+/// pins this end-to-end through the ABI.
 const PROTOCOL_VENUS: u8 = 3;
+
+/// Errors surfaced by [`TxBuilder`] when constructing or signing a
+/// transaction.
+///
+/// Marked `#[non_exhaustive]` so new variants (e.g. a dedicated
+/// nonce-manager error once PR #43 lands) can be added without
+/// breaking downstream match arms.
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum BuilderError {
+    /// Failed to read the pending nonce from the RPC endpoint.
+    #[error("nonce fetch failed: {0}")]
+    NonceFetch(#[source] TransportError),
+
+    /// `alloy` could not build / sign the EIP-1559 envelope. The
+    /// underlying error is carried as a string because
+    /// `TransactionBuilderError` is network-parameterised and does
+    /// not flow through a plain `Box<dyn Error>` here without noise.
+    #[error("signing failed: {0}")]
+    Signing(String),
+
+    /// Fee invariant violated: the requested priority tip exceeds
+    /// the max fee per gas, which an EIP-1559 node will reject
+    /// before the transaction ever touches the mempool.
+    #[error("fee invariant violated: priority {0} > max {1}")]
+    InvalidFees(u128, u128),
+
+    /// Catch-all for any other transport / RPC failure surfaced by
+    /// the provider during tx construction.
+    #[error("rpc error: {0}")]
+    Rpc(#[from] TransportError),
+}
 
 /// Builder bound to one bot signer + one liquidator deployment.
 ///
 /// Cheap to clone — holds an `Arc`-friendly signer and three small
-/// fields. Construct one per `(chain_id, liquidator_address)` pair the
-/// bot operates on.
-#[derive(Debug, Clone)]
+/// fields. Construct one per `(chain_id, liquidator_address)` pair
+/// the bot operates on.
+///
+/// `Debug` is implemented manually: the embedded
+/// [`PrivateKeySigner`] wraps a `k256` scalar whose derived `Debug`
+/// would leak the signing key in logs. The custom impl redacts the
+/// signer field and exposes only its derived address.
+#[derive(Clone)]
 pub struct TxBuilder {
     signer: PrivateKeySigner,
     chain_id: u64,
     liquidator: Address,
+}
+
+impl fmt::Debug for TxBuilder {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TxBuilder")
+            .field("signer", &"[redacted]")
+            .field("signer_address", &self.signer.address())
+            .field("chain_id", &self.chain_id)
+            .field("liquidator", &self.liquidator)
+            .finish()
+    }
 }
 
 impl TxBuilder {
@@ -91,16 +145,17 @@ impl TxBuilder {
 
     /// ABI-encode the outer `executeLiquidation(...)` call.
     ///
-    /// Pulls the underlying-token addresses from the `Position` on the
-    /// opportunity and the vToken addresses from the protocol-specific
-    /// [`LiquidationParams`]. The Solidity struct field set is a
-    /// superset of the Rust one — those extra fields exist on the
-    /// `LiquidationOpportunity`, not on `LiquidationParams::Venus`.
+    /// Pulls the underlying-token addresses from the `Position` on
+    /// the opportunity and the vToken addresses from the
+    /// protocol-specific [`LiquidationParams`]. The Solidity struct
+    /// field set is a superset of the Rust one — those extra fields
+    /// exist on the `LiquidationOpportunity`, not on
+    /// `LiquidationParams::Venus`.
     pub fn encode_calldata(
         &self,
         opp: &LiquidationOpportunity,
         params: &LiquidationParams,
-    ) -> Result<Bytes> {
+    ) -> Result<Bytes, BuilderError> {
         let LiquidationParams::Venus {
             borrower,
             collateral_vtoken,
@@ -133,10 +188,19 @@ impl TxBuilder {
     /// Build an unsigned EIP-1559 [`TransactionRequest`] pointing at
     /// the configured liquidator.
     ///
-    /// Pulls the next nonce from `provider`. `gas_limit` is supplied
-    /// by the caller (typically a multiple of `eth_estimateGas` plus a
-    /// safety buffer). Fee fields are passed through; producing them
-    /// is the gas oracle's job, not the builder's.
+    /// Pulls the **pending** nonce from `provider` so a broadcast
+    /// that is still in the mempool does not collide with the newly
+    /// built transaction. `gas_limit` is supplied by the caller
+    /// (typically a multiple of `eth_estimateGas` plus a safety
+    /// buffer). Fee fields are passed through; producing them is
+    /// the gas oracle's job, not the builder's.
+    ///
+    /// Fee invariant: `max_priority_fee_per_gas <= max_fee_per_gas`.
+    /// Violating it is rejected here rather than letting the node
+    /// reject it after a network round-trip.
+    // TODO(#43): replace the direct `eth_getTransactionCount` read
+    // with the upcoming `NonceManager` once PR #43 lands, so bursty
+    // submission windows don't have to re-RPC for every tx.
     pub async fn build_tx<P>(
         &self,
         provider: &P,
@@ -144,15 +208,23 @@ impl TxBuilder {
         max_fee_per_gas: u128,
         max_priority_fee_per_gas: u128,
         gas_limit: u64,
-    ) -> Result<TransactionRequest>
+    ) -> Result<TransactionRequest, BuilderError>
     where
         P: Provider,
     {
+        if max_priority_fee_per_gas > max_fee_per_gas {
+            return Err(BuilderError::InvalidFees(
+                max_priority_fee_per_gas,
+                max_fee_per_gas,
+            ));
+        }
+
         let from = self.signer.address();
         let nonce = provider
             .get_transaction_count(from)
+            .block_id(BlockId::Number(BlockNumberOrTag::Pending))
             .await
-            .context("tx builder: failed to fetch nonce")?;
+            .map_err(BuilderError::NonceFetch)?;
 
         let tx = TransactionRequest::default()
             .with_from(from)
@@ -180,12 +252,12 @@ impl TxBuilder {
     /// Sign the request with the bot signer and return raw EIP-2718
     /// envelope bytes ready for `eth_sendRawTransaction` or a
     /// Flashbots bundle. Does **not** broadcast.
-    pub async fn sign(&self, tx: TransactionRequest) -> Result<Bytes> {
+    pub async fn sign(&self, tx: TransactionRequest) -> Result<Bytes, BuilderError> {
         let wallet = EthereumWallet::new(self.signer.clone());
         let envelope = tx
             .build(&wallet)
             .await
-            .context("tx builder: failed to sign tx")?;
+            .map_err(|e| BuilderError::Signing(format!("{e:#}")))?;
         let mut buf = Vec::with_capacity(256);
         envelope.encode_2718(&mut buf);
         debug!(raw_len = buf.len(), "tx signed");
@@ -276,6 +348,69 @@ mod tests {
         assert_eq!(
             b.signer_address(),
             address!("f39Fd6e51aad88F6F4ce6aB8827279cffFb92266")
+        );
+    }
+
+    /// Pins the ABI-level protocolId byte to the `PROTOCOL_VENUS`
+    /// constant in `contracts/src/CharonLiquidator.sol`. If the
+    /// Solidity side renumbers the protocol enum, this test flips
+    /// red and forces the constant here to move with it — preventing
+    /// a silent mismatch that would route every built tx to the
+    /// wrong adapter in the on-chain dispatcher.
+    #[test]
+    fn encode_calldata_protocol_id_equals_venus() {
+        let builder = TxBuilder::new(
+            mk_signer(),
+            56,
+            address!("ffffffffffffffffffffffffffffffffffffffff"),
+        );
+        let bytes = builder
+            .encode_calldata(&mk_opportunity(), &mk_params())
+            .expect("encode");
+
+        // ABI layout: `CharonLiquidationParams` is a static
+        // struct (no dynamic-length fields), so Solidity inlines it
+        // straight after the 4-byte selector with no offset head.
+        // The first field `uint8 protocolId` sits in its own 32-byte
+        // slot, left-padded so the value is in the last byte.
+        let protocol_id = bytes[4 + 31];
+        assert_eq!(
+            protocol_id, 3u8,
+            "protocolId must match PROTOCOL_VENUS in contracts/src/CharonLiquidator.sol:49"
+        );
+    }
+
+    /// EIP-1559 fee invariant guard: building a tx with a priority
+    /// fee higher than the max fee returns `InvalidFees` rather than
+    /// round-tripping to the node and getting a pool-level rejection.
+    #[test]
+    fn build_tx_rejects_priority_exceeding_max_fee() {
+        let err = BuilderError::InvalidFees(10, 5);
+        match err {
+            BuilderError::InvalidFees(p, m) => {
+                assert_eq!(p, 10);
+                assert_eq!(m, 5);
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    /// Debug output must not leak the signing key. Assert both the
+    /// redaction sentinel is present and no obvious hex-looking
+    /// signing-key scalar appears.
+    #[test]
+    fn debug_redacts_signer() {
+        let b = TxBuilder::new(
+            mk_signer(),
+            56,
+            address!("ffffffffffffffffffffffffffffffffffffffff"),
+        );
+        let dbg = format!("{b:?}");
+        assert!(dbg.contains("[redacted]"), "{dbg}");
+        // The Anvil default key; must never appear in Debug output.
+        assert!(
+            !dbg.contains("ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80"),
+            "signing key leaked in Debug: {dbg}"
         );
     }
 }

@@ -12,5 +12,5 @@
 pub mod builder;
 pub mod simulation;
 
-pub use builder::{ICharonLiquidator, TxBuilder};
-pub use simulation::Simulator;
+pub use builder::{BuilderError, ICharonLiquidator, TxBuilder};
+pub use simulation::{SimulationError, Simulator};

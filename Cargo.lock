@@ -1155,6 +1155,8 @@ dependencies = [
  "alloy",
  "anyhow",
  "charon-core",
+ "dotenvy",
+ "thiserror 1.0.69",
  "tokio",
  "tracing",
 ]
