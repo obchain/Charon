@@ -19,7 +19,8 @@ import { IWETH } from "./interfaces/IWETH.sol";
 //        b. Call vToken.liquidateBorrow() — repay debt, seize collateral vTokens.
 //        c. Call vToken.redeem() — convert ALL seized vTokens to underlying.
 //           Special case: vBNB returns native BNB, which we wrap into WBNB.
-//        d. Swap collateral → debt asset via PancakeSwap V3.
+//        d. Swap collateral → debt asset via PancakeSwap V3 at the caller-supplied
+//           fee tier (500 / 3000 / 10000 depending on the pool).
 //        e. Sweep profit to the COLD wallet — hot wallet (owner) holds gas only.
 //        f. Approve Aave for repayment (amount + premium); Aave pulls it after return.
 //
@@ -108,6 +109,9 @@ contract CharonLiquidator is IFlashLoanSimpleReceiver {
     /// @dev Packed into `bytes` and forwarded through Aave's flashLoanSimple `params`
     ///      argument so executeOperation can decode them without extra storage.
     ///      Field layout must remain stable — the Rust side abi-encodes this struct.
+    ///      NOTE: the companion Rust `LiquidationParams` builder lives in the
+    ///      charon-executor crate (landing in a later PR). When that crate is added
+    ///      it must mirror this layout exactly, including `swapPoolFee`.
     struct LiquidationParams {
         /// @dev Protocol identifier. Must equal PROTOCOL_VENUS (3) for v0.1.
         uint8 protocolId;
@@ -128,6 +132,13 @@ contract CharonLiquidator is IFlashLoanSimpleReceiver {
         /// @dev Minimum amount of debtToken to receive from the collateral swap.
         ///      Acts as a slippage floor — revert if swap output falls below this.
         uint256 minSwapOut;
+        /// @dev PancakeSwap V3 pool fee tier (hundredths of a bip) for the
+        ///      collateral → debt swap. Live tiers on PCS V3: 100 / 500 / 2500 /
+        ///      10000; Uniswap-equivalent 3000 is also deployed. BTCB, ETH and XVS
+        ///      deep pools are at 500 or 10000, not 3000 — hardcoding would route
+        ///      through an empty pool and revert. Supplied per-opportunity by the
+        ///      off-chain router. Must be non-zero.
+        uint24 swapPoolFee;
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -228,6 +239,7 @@ contract CharonLiquidator is IFlashLoanSimpleReceiver {
         require(params.debtVToken != address(0), "!debtVToken");
         require(params.collateralVToken != address(0), "!collateralVToken");
         require(params.repayAmount > 0, "!repayAmount");
+        require(params.swapPoolFee > 0, "!swapPoolFee");
         // On the vBNB path the underlying returned by Venus is native BNB, which
         // the contract wraps into WBNB before swapping. Enforce that the caller
         // declared WBNB as collateralToken so the swap leg routes through a real
@@ -270,7 +282,8 @@ contract CharonLiquidator is IFlashLoanSimpleReceiver {
     ///        d. Zero out debtVToken approval (consumed).
     ///        e. Redeem all seized collateral vTokens for underlying.
     ///           If the seized vToken is vBNB, wrap the returned native BNB into WBNB.
-    ///        f. Swap collateral underlying → debt token via PancakeSwap V3.
+    ///        f. Swap collateral underlying → debt token via PancakeSwap V3 at the
+    ///           caller-supplied pool fee tier.
     ///        g. Zero out SwapRouter approval (consumed).
     ///        h. Verify post-swap balance covers totalOwed.
     ///        i. Sweep profit to COLD_WALLET (NEVER to the hot wallet / owner).
@@ -364,7 +377,7 @@ contract CharonLiquidator is IFlashLoanSimpleReceiver {
                 ISwapRouter.ExactInputSingleParams({
                     tokenIn: p.collateralToken,
                     tokenOut: p.debtToken,
-                    fee: 3000, // 0.30 % pool — most liquid tier on PCS V3 for major pairs
+                    fee: p.swapPoolFee, // caller-supplied — 500 / 2500 / 3000 / 10000 depending on pool
                     recipient: address(this),
                     deadline: block.timestamp,
                     amountIn: collateralBal,
