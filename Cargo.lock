@@ -1197,6 +1197,8 @@ dependencies = [
  "dashmap",
  "dotenvy",
  "futures-util",
+ "rand 0.8.6",
+ "thiserror 1.0.69",
  "tokio",
  "tracing",
 ]

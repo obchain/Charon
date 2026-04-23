@@ -9,10 +9,12 @@ description = "Chain listener and health-factor scanner for Charon"
 charon-core = { workspace = true }
 alloy = { workspace = true }
 anyhow = { workspace = true }
+thiserror = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 futures-util = { workspace = true }
 dashmap = { workspace = true }
+rand = { workspace = true }
 
 [dev-dependencies]
 dotenvy = { workspace = true }
