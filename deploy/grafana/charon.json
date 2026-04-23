@@ -193,7 +193,7 @@
     },
     {
       "datasource": { "type": "prometheus", "uid": "${datasource}" },
-      "description": "Cumulative profit across all opportunities that cleared the profit gate (USD).",
+      "description": "Profit across all opportunities that cleared the profit gate (USD), summed over the selected dashboard time range. Uses increase() over the histogram _sum accumulator so process restarts do not appear as negative steps; the window follows the top-right time picker.",
       "fieldConfig": {
         "defaults": {
           "color": { "mode": "thresholds" },
@@ -223,13 +223,13 @@
         {
           "datasource": { "type": "prometheus", "uid": "${datasource}" },
           "editorMode": "code",
-          "expr": "sum(charon_executor_profit_usd_cents_sum{instance=~\"$instance\",chain=~\"$chain\"}) / 100",
-          "legendFormat": "total profit",
+          "expr": "sum(increase(charon_executor_profit_usd_cents_sum{instance=~\"$instance\",chain=~\"$chain\"}[$__range])) / 100",
+          "legendFormat": "profit (selected range)",
           "range": true,
           "refId": "A"
         }
       ],
-      "title": "Cumulative profit",
+      "title": "Profit (selected range)",
       "type": "stat"
     },
     {
