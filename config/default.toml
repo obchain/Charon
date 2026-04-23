@@ -14,6 +14,9 @@ scan_interval_ms = 1000
 liquidatable_threshold = 1.0
 # Upper bound of the near-liquidation watch band.
 near_liq_threshold     = 1.05
+# Hot-wallet signer private key (hex, optional). Unset = scan-only mode:
+# no tx signing, no simulation, nothing gets enqueued. See `.env.example`.
+signer_key = "${CHARON_SIGNER_KEY:-}"
 
 # ── Chains ────────────────────────────────────────────────────────────────
 [chain.bnb]

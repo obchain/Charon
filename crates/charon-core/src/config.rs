@@ -8,6 +8,7 @@
 
 use alloy::primitives::Address;
 use anyhow::{Context, anyhow};
+use secrecy::SecretString;
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::path::Path;
@@ -50,6 +51,12 @@ pub struct BotConfig {
     /// the bot can fire immediately on the next adverse price move.
     #[serde(default = "default_near_liq_threshold")]
     pub near_liq_threshold: f64,
+    /// Hot-wallet signer key used by the tx builder + simulator. Supplied
+    /// via the `${CHARON_SIGNER_KEY}` env substitution so it never sits in
+    /// the config file on disk. Unset = scan-only mode (no signing, no
+    /// simulation, no enqueueing — see the CLI pipeline for the gate).
+    #[serde(default)]
+    pub signer_key: Option<SecretString>,
 }
 
 fn default_liquidatable_threshold() -> f64 {
@@ -109,9 +116,17 @@ impl Config {
     }
 }
 
-/// Replace every `${NAME}` in `input` with the value of environment variable
-/// `NAME`. Returns an error if any referenced variable is unset or if a
-/// `${` is not closed by `}`.
+/// Replace every `${NAME}` (or `${NAME:-default}`) in `input` with the
+/// value of environment variable `NAME`.
+///
+/// The `${NAME:-default}` form is borrowed from shell parameter
+/// expansion: when `NAME` is unset the literal `default` is substituted
+/// instead. `default` may be empty (`${NAME:-}`), which lets an
+/// operator-optional secret omit the env var entirely and surface as
+/// an empty string at parse time.
+///
+/// Returns an error if any required variable is unset or if a `${` is
+/// not closed by `}`.
 fn substitute_env_vars(input: &str) -> anyhow::Result<String> {
     let mut output = String::with_capacity(input.len());
     let mut rest = input;
@@ -121,9 +136,23 @@ fn substitute_env_vars(input: &str) -> anyhow::Result<String> {
         let end = after
             .find('}')
             .ok_or_else(|| anyhow!("unterminated `${{` in config"))?;
-        let var_name = &after[..end];
-        let value =
-            std::env::var(var_name).with_context(|| format!("env var `{var_name}` is not set"))?;
+        let expr = &after[..end];
+
+        let (var_name, default) = match expr.find(":-") {
+            Some(idx) => (&expr[..idx], Some(&expr[idx + 2..])),
+            None => (expr, None),
+        };
+
+        let value = match std::env::var(var_name) {
+            Ok(v) => v,
+            Err(_) => match default {
+                Some(d) => d.to_string(),
+                None => {
+                    return Err(anyhow!("env var `{var_name}` is not set"))
+                        .with_context(|| format!("resolving `${{{var_name}}}` in config"));
+                }
+            },
+        };
         output.push_str(&value);
         rest = &after[end + 1..];
     }
