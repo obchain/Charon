@@ -3,6 +3,12 @@ src = "src"
 out = "out"
 libs = ["lib"]
 solc_version = "0.8.24"
+# BSC does not support PUSH0 (0x5f). solc 0.8.24 defaults to Shanghai
+# and emits PUSH0, so the target EVM must be pinned to Paris or every
+# deploy faults on-chain at the first PUSH0 site. The in-process
+# revm used by `forge test` accepts PUSH0, which is why a fork-test
+# pass is NOT equivalent to a BSC-deploy pass without this pin.
+evm_version = "paris"
 optimizer = true
 optimizer_runs = 1_000_000
 via_ir = false
