@@ -190,6 +190,18 @@ async fn run_listen(config: Config, borrowers: Vec<Address>) -> Result<()> {
     };
     charon_metrics::set_run_mode(run_mode);
     info!(chain = %chain_key, mode = run_mode, "charon run mode");
+    // Human-readable banner for the read-only path. An operator
+    // watching Grafana cannot otherwise distinguish "no liquidatable
+    // positions" from "bot wouldn't act on them anyway" because every
+    // execution-path counter is wired behind the opportunity-processing
+    // arm. The log line above carries the same info in a structured
+    // field; the banner below is the thing that catches a skimming
+    // eye in a `docker logs` tail (see #262).
+    if run_mode == charon_metrics::run_mode::READ_ONLY {
+        info!(
+            "running in READ-ONLY mode: block listener + scanner + metrics active, no liquidations will be submitted (flashloan and/or liquidator not configured)"
+        );
+    }
 
     // Single shared pub-sub provider — adapter, price cache, flash-loan
     // adapter, and tx builder all hang off it. Cuts WS connection
