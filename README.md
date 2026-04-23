@@ -82,7 +82,9 @@ The exporter binds `:9091` (not `:9090`) so it doesn't collide with a co-located
 
 ### Grafana dashboard
 
-A ready-to-import dashboard lives at [`deploy/grafana/charon.json`](deploy/grafana/charon.json). Three steps to load it into Grafana or Grafana Cloud:
+A ready-to-import dashboard lives at [`deploy/grafana/charon.json`](deploy/grafana/charon.json). The dashboard is built against **Grafana 10.4.x or newer** (panel schema v39 and Grafana Cloud both satisfy this); older 9.x installs will reject the import or silently drop panels.
+
+Three steps to load it into Grafana or Grafana Cloud:
 
 1. Add a Prometheus data source that scrapes `http://<charon-host>:9091/metrics` (every ~10 s is fine).
 2. In Grafana, **Dashboards → New → Import → Upload JSON file** and pick the file above.
