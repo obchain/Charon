@@ -32,6 +32,9 @@ comptroller = "0xfd36e2c2a6789db23113685031d7f16329158384"
 chain = "bnb"
 # Aave V3 Pool on BSC (used for flashLoanSimple — 0.05% fee)
 pool  = "0x6807dc923806fe8fd134338eabca509979a7e0cb"
+# Aave V3 PoolDataProvider on BSC — resolves aTokens and reserve
+# configuration bitmaps (paused / frozen flags) for the adapter.
+data_provider = "0x41393e5e337606dc3821075Af65AeE84D7688CBD"
 
 # ── Deployed liquidator contracts ─────────────────────────────────────────
 [liquidator.bnb]

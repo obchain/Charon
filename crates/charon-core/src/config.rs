@@ -83,6 +83,12 @@ pub struct FlashLoanConfig {
     pub chain: String,
     /// Pool / vault address (Aave V3 Pool, Balancer Vault, etc.).
     pub pool: Address,
+    /// Optional auxiliary data-provider address used by some sources
+    /// to resolve per-asset state (e.g. Aave V3 `PoolDataProvider`
+    /// for aToken lookup and reserve configuration bitmaps). `None`
+    /// for sources that don't need one (Balancer, Uniswap).
+    #[serde(default)]
+    pub data_provider: Option<Address>,
 }
 
 /// Address of the deployed `CharonLiquidator` contract on a chain.

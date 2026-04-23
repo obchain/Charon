@@ -9,5 +9,6 @@ description = "Shared types, traits, and config for Charon"
 alloy = { workspace = true }
 serde = { workspace = true }
 anyhow = { workspace = true }
+thiserror = { workspace = true }
 async-trait = { workspace = true }
 toml = { workspace = true }

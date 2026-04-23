@@ -6,7 +6,7 @@ pub mod traits;
 pub mod types;
 
 pub use config::Config;
-pub use flashloan::{FlashLoanProvider, FlashLoanQuote};
+pub use flashloan::{FlashLoanError, FlashLoanProvider, FlashLoanQuote};
 pub use traits::LendingProtocol;
 pub use types::{
     FlashLoanSource, LiquidationOpportunity, LiquidationParams, Position, ProtocolId, SwapRoute,

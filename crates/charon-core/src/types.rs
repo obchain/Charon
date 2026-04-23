@@ -40,6 +40,7 @@ pub struct Position {
 ///
 /// Router picks cheapest available: Balancer (0%) → Aave (0.05%) → Uniswap (pool fee).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub enum FlashLoanSource {
     /// Balancer V2 Vault — 0% fee.
     BalancerV2,
