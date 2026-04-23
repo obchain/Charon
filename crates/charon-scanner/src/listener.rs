@@ -7,6 +7,7 @@
 
 use std::time::Duration;
 
+use alloy::primitives::B256;
 use alloy::providers::Provider;
 use anyhow::{Context, Result};
 use charon_core::config::ChainConfig;
@@ -29,6 +30,11 @@ pub enum ChainEvent {
         number: u64,
         /// Unix timestamp from the block header.
         timestamp: u64,
+        /// Canonical block hash of the new head. Required by the
+        /// mempool pre-sign drain so it can correlate its log with the
+        /// block that triggered the drain and to let consumers fetch
+        /// the block's confirmed tx-hash set in a follow-up call.
+        block_hash: B256,
     },
 }
 
@@ -97,11 +103,13 @@ impl BlockListener {
         while let Some(header) = stream.next().await {
             let number = header.number;
             let timestamp = header.timestamp;
+            let block_hash = header.hash;
 
             info!(
                 chain = %self.name,
                 block = number,
                 timestamp = timestamp,
+                %block_hash,
                 "new block"
             );
 
@@ -109,6 +117,7 @@ impl BlockListener {
                 chain: self.name.clone(),
                 number,
                 timestamp,
+                block_hash,
             };
 
             if self.tx.send(event).await.is_err() {
