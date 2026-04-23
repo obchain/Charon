@@ -12,6 +12,11 @@ target/
 *.log
 docs/
 NOTES.md
+# `config/` belongs on the host and is bind-mounted at runtime (see
+# Dockerfile + deploy/compose/docker-compose.yml). Excluding it from
+# the build context keeps TOML values out of the image layer even if
+# a future Dockerfile re-adds a COPY by mistake — see #287.
+config/
 README.md
 CLAUDE.md
 Dockerfile

@@ -51,7 +51,13 @@ RUN apt-get update \
 
 WORKDIR /app
 COPY --from=builder /charon /usr/local/bin/charon
-COPY config ./config
+
+# `config/` is deliberately not copied into the image: compose always
+# bind-mounts `../../config:/app/config:ro` at runtime, and a
+# `docker run` without a mount would otherwise launch silently against
+# stale TOML (contract addresses, RPC endpoints) or leak secrets
+# baked into a layer. Running the image without a config mount fails
+# at startup, which is the intended behaviour — see #287.
 
 USER charon
 
