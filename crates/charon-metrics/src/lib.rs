@@ -151,7 +151,7 @@ fn describe_all() {
     );
     describe_counter!(
         names::EXECUTOR_OPPS_QUEUED_TOTAL,
-        "Liquidation opportunities that passed every gate and landed in the queue."
+        "Liquidation opportunities that landed in the queue, labelled `simulated=true|false` to distinguish sim-gated entries from dry-run pushes (BOT_SIGNER_KEY unset)."
     );
     describe_counter!(
         names::EXECUTOR_OPPS_DROPPED_TOTAL,
@@ -200,8 +200,19 @@ pub fn record_simulation(chain: &str, result: &str) {
 }
 
 /// Record one opportunity that made it into the queue.
-pub fn record_opportunity_queued(chain: &str, profit_usd_cents: u64) {
-    counter!(names::EXECUTOR_OPPS_QUEUED_TOTAL, "chain" => chain.to_owned()).increment(1);
+///
+/// `simulated` distinguishes entries that cleared the `eth_call`
+/// simulation gate from entries enqueued without simulation (dry-run
+/// mode when `BOT_SIGNER_KEY` is unset). Splitting on this label keeps
+/// the gate bypass observable from dashboards instead of letting
+/// unsimulated pushes masquerade as healthy throughput.
+pub fn record_opportunity_queued(chain: &str, profit_usd_cents: u64, simulated: bool) {
+    counter!(
+        names::EXECUTOR_OPPS_QUEUED_TOTAL,
+        "chain" => chain.to_owned(),
+        "simulated" => if simulated { "true" } else { "false" }.to_owned(),
+    )
+    .increment(1);
     histogram!(names::EXECUTOR_PROFIT_USD_CENTS, "chain" => chain.to_owned())
         .record(profit_usd_cents as f64);
 }
@@ -281,7 +292,8 @@ mod tests {
         record_simulation("bnb", sim_result::OK);
         record_simulation("bnb", sim_result::REVERT);
         record_simulation("bnb", sim_result::ERROR);
-        record_opportunity_queued("bnb", 1_234);
+        record_opportunity_queued("bnb", 1_234, true);
+        record_opportunity_queued("bnb", 9, false);
         record_opportunity_dropped("bnb", drop_stage::ROUTER);
         record_opportunity_dropped("bnb", drop_stage::PROFIT);
         record_opportunity_dropped("bnb", drop_stage::SIMULATION);

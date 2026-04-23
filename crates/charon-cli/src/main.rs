@@ -457,11 +457,16 @@ async fn process_opportunity(
 
     // e. Tx builder + simulator — only if the operator supplied
     //    BOT_SIGNER_KEY. Without it, push to the queue based on profit
-    //    alone so dry-runs still surface ranked candidates.
-    if let (Some(builder), Some(sim)) = (tx_builder, simulator) {
+    //    alone so dry-runs still surface ranked candidates. `simulated`
+    //    propagates to the queued-counter label so dashboards can tell
+    //    sim'd entries from dry-run entries (see #220).
+    let simulated = if let (Some(builder), Some(sim)) = (tx_builder, simulator) {
         let calldata = builder.encode_calldata(&opp, &params)?;
         match sim.simulate(provider, calldata).await {
-            Ok(()) => charon_metrics::record_simulation(chain, sim_result::OK),
+            Ok(()) => {
+                charon_metrics::record_simulation(chain, sim_result::OK);
+                true
+            }
             Err(err) => {
                 charon_metrics::record_simulation(chain, sim_result::REVERT);
                 charon_metrics::record_opportunity_dropped(chain, drop_stage::SIMULATION);
@@ -469,13 +474,15 @@ async fn process_opportunity(
                 return Ok(false);
             }
         }
-    }
+    } else {
+        false
+    };
 
     // f. Push to the profit-ordered queue.
     let profit_cents = opp.net_profit_usd_cents;
     let mut q = queue.lock().await;
     q.push(opp, queued_at_block);
-    charon_metrics::record_opportunity_queued(chain, profit_cents);
+    charon_metrics::record_opportunity_queued(chain, profit_cents, simulated);
     Ok(true)
 }
 
