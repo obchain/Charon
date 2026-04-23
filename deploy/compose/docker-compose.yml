@@ -46,6 +46,15 @@ services:
         limits:
           cpus: "1.5"
           memory: 1G
+    # Cap per-service log storage — json-file driver has no default
+    # rotation and charon emits ~1 info/block on a 3s BSC cadence.
+    # 5 × 50 MB keeps ~a week of history on a 40 GB CX22 without
+    # filling the disk (see #291).
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "5"
 
   alloy:
     image: grafana/alloy:v1.4.3
@@ -78,6 +87,13 @@ services:
         limits:
           cpus: "0.5"
           memory: 256M
+    # Match charon's rotation policy so a Grafana Cloud outage
+    # (every scrape logs a remote_write retry) cannot fill the disk.
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "5"
 
 networks:
   charon_net: {}
