@@ -49,8 +49,8 @@ fn default_profile_parses() {
 #[test]
 fn testnet_profile_parses_and_omits_flashloan() {
     set_env(&[
-        ("BNB_TESTNET_WS_URL", "wss://example/chapel"),
-        ("BNB_TESTNET_HTTP_URL", "https://example/chapel"),
+        ("CHARON_BNB_TESTNET_WS_URL", "wss://example/chapel"),
+        ("CHARON_BNB_TESTNET_HTTP_URL", "https://example/chapel"),
     ]);
 
     let path = workspace_root().join("config/testnet.toml");

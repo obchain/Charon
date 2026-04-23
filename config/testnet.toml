@@ -24,8 +24,8 @@ near_liq_threshold     = 1.05
 # ── Chains ────────────────────────────────────────────────────────────────
 [chain.bnb]
 chain_id          = 97
-ws_url            = "${BNB_TESTNET_WS_URL}"
-http_url          = "${BNB_TESTNET_HTTP_URL}"
+ws_url            = "${CHARON_BNB_TESTNET_WS_URL}"
+http_url          = "${CHARON_BNB_TESTNET_HTTP_URL}"
 priority_fee_gwei = 1
 # No private RPC on testnet — leave unset.
 # private_rpc_url   = ""
