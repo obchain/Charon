@@ -84,9 +84,11 @@ The exporter binds `:9091` (not `:9090`) so it doesn't collide with a co-located
 
 A ready-to-import dashboard lives at [`deploy/grafana/charon.json`](deploy/grafana/charon.json). The dashboard is built against **Grafana 10.4.x or newer** (panel schema v39 and Grafana Cloud both satisfy this); older 9.x installs will reject the import or silently drop panels.
 
+> **Security — read before exposing `:9091`.** The metrics endpoint ships unauthenticated and binds `0.0.0.0` by default. On a public VPS (Hetzner CX22, the documented target) that exposes profit histograms, build SHA, queue depth, and simulation results to the internet. Before scraping from a remote Prometheus, either bind the exporter to `127.0.0.1` and scrape over a local socket / SSH tunnel / Tailscale, or put a reverse proxy with basic auth (or mTLS) in front of `:9091`. See tracking issues [#213](https://github.com/obchain/Charon/issues/213) and [#214](https://github.com/obchain/Charon/issues/214).
+
 Three steps to load it into Grafana or Grafana Cloud:
 
-1. Add a Prometheus data source that scrapes `http://<charon-host>:9091/metrics` (every ~10 s is fine).
+1. Add a Prometheus data source that scrapes `http://<charon-host>:9091/metrics` (every ~10 s is fine). Use a loopback address, a VPN endpoint, or an authenticated reverse-proxy URL here — never a raw public-internet address.
 2. In Grafana, **Dashboards → New → Import → Upload JSON file** and pick the file above.
 3. On the import screen, select the Prometheus data source you created and click **Import**.
 
