@@ -3,6 +3,10 @@ src = "src"
 out = "out"
 libs = ["lib"]
 solc_version = "0.8.24"
+# Pin EVM target to paris — BNB Chain does not yet support the PUSH0 opcode
+# introduced by the shanghai upgrade. Building with the default (shanghai/
+# cancun) would emit PUSH0 bytecodes that revert at deploy time on BSC.
+evm_version = "paris"
 optimizer = true
 optimizer_runs = 1_000_000
 via_ir = false
