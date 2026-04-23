@@ -275,7 +275,7 @@
     },
     {
       "datasource": { "type": "prometheus", "uid": "${datasource}" },
-      "description": "Opportunity outcomes: queued (passed every gate) vs dropped (and at which stage).",
+      "description": "Opportunity funnel, per minute, grouped by stage. `queued` counts entries that cleared the profit gate and landed in the queue (the #220 `simulated` label is rolled up here); `router`, `profit`, `simulation`, and `build` are drop stages. Both series share the same `stage` axis so intake and losses are directly comparable.",
       "fieldConfig": {
         "defaults": {
           "color": { "mode": "palette-classic" },
@@ -301,8 +301,8 @@
         {
           "datasource": { "type": "prometheus", "uid": "${datasource}" },
           "editorMode": "code",
-          "expr": "sum(rate(charon_executor_opportunities_queued_total{instance=~\"$instance\",chain=~\"$chain\"}[1m])) * 60",
-          "legendFormat": "queued",
+          "expr": "label_replace(sum(rate(charon_executor_opportunities_queued_total{instance=~\"$instance\",chain=~\"$chain\"}[1m])) * 60, \"stage\", \"queued\", \"\", \"\")",
+          "legendFormat": "{{stage}}",
           "range": true,
           "refId": "A"
         },
@@ -310,7 +310,7 @@
           "datasource": { "type": "prometheus", "uid": "${datasource}" },
           "editorMode": "code",
           "expr": "sum by (stage) (rate(charon_executor_opportunities_dropped_total{instance=~\"$instance\",chain=~\"$chain\"}[1m])) * 60",
-          "legendFormat": "dropped — {{stage}}",
+          "legendFormat": "{{stage}}",
           "range": true,
           "refId": "B"
         }
