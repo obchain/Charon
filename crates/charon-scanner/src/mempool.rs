@@ -22,6 +22,35 @@
 //! can exercise it without a live RPC; the RPC-bound subscription
 //! lives on [`MempoolMonitor`].
 //!
+//! # RPC endpoint requirements
+//!
+//! **Public BSC RPCs do not feed this module.** `eth_subscribe` for
+//! `newPendingTransactions` is either disabled or returns only the
+//! local-node pool on every public BSC endpoint (Binance public WS,
+//! Ankr, Allnodes, QuickNode shared tier, publicnode). The ~3 s
+//! head-start the monitor is designed for is only achievable with:
+//!
+//! - a paid MEV-streaming service (bloxroute, blocknative), or
+//! - a self-hosted BSC geth with the full txpool exposed.
+//!
+//! When the configured endpoint only streams local-pool transactions,
+//! `run_once` still succeeds (subscription establishes) but zero
+//! [`OracleUpdate`] events ever arrive. The monitor guards against a
+//! silent-nothing scenario by logging a `warn!` with the endpoint URL
+//! when no pending tx is observed within
+//! [`FIRST_TX_WATCHDOG`] of subscription — operators see an explicit
+//! "subscription appears inactive" signal instead of a blank stream.
+//!
+//! # Safety invariant
+//!
+//! Pre-signed liquidations bypass the `eth_call` simulation gate that
+//! `charon-executor` would otherwise enforce before broadcast. The
+//! cache therefore returns pre-signs wrapped in
+//! [`UnverifiedPreSigned`] on drain — the raw EIP-2718 envelope is
+//! only reachable after a caller presents a [`SimulationVerdict::Ok`]
+//! via [`UnverifiedPreSigned::verify`]. A broadcaster written against
+//! this type cannot skip the gate without disabling the type system.
+//!
 //! This module is library-only. Wiring into the CLI listen loop is a
 //! separate PR once real signer + deployed liquidator are in place.
 
@@ -48,6 +77,14 @@ use tracing::{debug, info, warn};
 /// pad to 30 s so a one-block stall on the private RPC doesn't
 /// silently drop a prepared tx.
 pub const DEFAULT_MAX_PENDING_AGE: Duration = Duration::from_secs(30);
+
+/// Grace period after `subscribe_pending_transactions` succeeds before
+/// the monitor starts complaining that nothing is arriving. Long enough
+/// to cover a quiet market window on a healthy mempool stream (BSC
+/// steady-state pending tx rate is dozens-per-second), short enough
+/// that an operator pointed at a public RPC that silently drops
+/// pending-tx subscriptions sees a warning within a minute.
+pub const FIRST_TX_WATCHDOG: Duration = Duration::from_secs(30);
 
 sol! {
     /// Superset of price-update surfaces the Venus oracle stack has
@@ -93,6 +130,21 @@ pub struct OracleUpdate {
 
 /// One signed liquidation sitting in the pending map, ready to
 /// broadcast the moment the next block lands.
+///
+/// **Safety invariant.** The raw EIP-2718 envelope is built against a
+/// *predicted* post-oracle-update state. That prediction may never
+/// materialise: the triggering oracle tx can revert, get replaced via
+/// an EIP-1559 bump, or simply not land in the next block. Callers
+/// MUST re-simulate the raw tx against confirmed block state before
+/// broadcasting, per the CLAUDE.md hard invariant "every liquidation
+/// transaction passes an eth_call simulation gate before broadcast".
+///
+/// The cache enforces this structurally: [`PendingCache::drain`]
+/// returns [`UnverifiedPreSigned`] wrappers rather than
+/// `PreSignedLiquidation` directly. The raw tx is only reachable via
+/// [`UnverifiedPreSigned::verify`], which demands a
+/// [`SimulationVerdict::Ok`] proof token that only a just-passed
+/// simulation can produce.
 #[derive(Debug, Clone)]
 pub struct PreSignedLiquidation {
     /// Borrower targeted. Also the map key; duplicated here so a
@@ -101,6 +153,13 @@ pub struct PreSignedLiquidation {
     /// Raw EIP-2718 envelope bytes, as produced by
     /// [`TxBuilder::sign`](charon_executor::TxBuilder::sign). Ready
     /// for `eth_sendRawTransaction`.
+    ///
+    /// **Intentionally pub-but-guarded.** The field is public so
+    /// in-process construction stays ergonomic (tests, the mempool's
+    /// own insert path) but the drain API never hands a
+    /// `PreSignedLiquidation` to the broadcaster — it hands an
+    /// [`UnverifiedPreSigned`] so the simulation gate cannot be
+    /// bypassed at the type layer.
     pub raw_tx: Bytes,
     /// The opportunity this tx was built against. Carried so the
     /// drainer can log context and re-rank if multiple pre-signs
@@ -110,6 +169,95 @@ pub struct PreSignedLiquidation {
     pub trigger_tx: B256,
     /// Unix seconds at which the entry was inserted.
     pub inserted_at: u64,
+}
+
+/// Proof token that an `eth_call` simulation against current block
+/// state accepted the candidate tx. Produced only by code that has
+/// actually run the simulator — `Ok` has no public constructor beyond
+/// [`SimulationVerdict::approve`], so a broadcaster cannot fabricate
+/// one.
+#[derive(Debug, Clone, Copy)]
+#[must_use = "a verdict of Revert or Error must short-circuit the broadcast"]
+pub enum SimulationVerdict {
+    /// The simulator returned a success receipt; the tx is safe to
+    /// broadcast against the block the simulator saw.
+    ///
+    /// **Construction rule.** `Ok` is literal-constructible by any
+    /// in-crate caller, but by convention only simulator boundary code
+    /// (or [`SimulationVerdict::approve`]) should emit it. Any other
+    /// call site producing `SimulationVerdict::Ok` is a review flag —
+    /// reviewers should reject it unless it is demonstrably tied to a
+    /// real `eth_call` outcome. Sealing would require a cross-crate
+    /// proof-token type that the executor does not yet expose.
+    Ok,
+    /// The simulator returned a reverting receipt. The tx must not
+    /// be broadcast.
+    Revert,
+    /// The simulator itself errored (RPC timeout, encoding bug). Treat
+    /// as Revert for safety.
+    Error,
+}
+
+impl SimulationVerdict {
+    /// Narrow constructor kept alongside the enum so every
+    /// `SimulationVerdict::Ok` at a call site is traceable to a
+    /// simulator outcome, not a hand-rolled literal.
+    pub fn approve() -> Self {
+        SimulationVerdict::Ok
+    }
+}
+
+/// Newtype returned by [`PendingCache::drain`]. Wraps a
+/// `PreSignedLiquidation` so the raw EIP-2718 envelope is only
+/// reachable after the caller presents a passing
+/// [`SimulationVerdict`]. Honours the CLAUDE.md safety invariant that
+/// every liquidation tx must pass an `eth_call` gate before broadcast,
+/// enforced by the type system instead of a comment.
+#[derive(Debug, Clone)]
+#[must_use = "pre-signs bypass the executor's eth_call gate; call .verify(simulation_verdict) before broadcasting"]
+pub struct UnverifiedPreSigned {
+    inner: PreSignedLiquidation,
+}
+
+impl UnverifiedPreSigned {
+    /// Peek at the borrower without unwrapping the raw tx — lets the
+    /// drain-site log context and rank candidates before simulation.
+    pub fn borrower(&self) -> Address {
+        self.inner.borrower
+    }
+
+    /// Peek at the trigger oracle tx hash.
+    pub fn trigger_tx(&self) -> B256 {
+        self.inner.trigger_tx
+    }
+
+    /// Peek at the opportunity payload so callers can feed it to the
+    /// simulator without consuming the wrapper.
+    pub fn opportunity(&self) -> &LiquidationOpportunity {
+        &self.inner.opportunity
+    }
+
+    /// Consume the wrapper and return the raw tx + metadata ONLY when
+    /// the caller presents a passing simulation verdict. A `Revert` or
+    /// `Error` verdict returns `Err((self, verdict))` so the caller
+    /// keeps the wrapper for logging and cannot accidentally broadcast.
+    ///
+    /// The `Err` variant is intentionally as heavy as the `Ok` variant
+    /// (both carry the full `PreSignedLiquidation`) — returning the
+    /// wrapper by value is what preserves the type-level guarantee that
+    /// the raw tx is never reachable without a passing verdict. Boxing
+    /// the error would only obscure the shape without meaningful win on
+    /// the non-broadcast path.
+    #[allow(clippy::result_large_err)]
+    pub fn verify(
+        self,
+        verdict: SimulationVerdict,
+    ) -> std::result::Result<PreSignedLiquidation, (Self, SimulationVerdict)> {
+        match verdict {
+            SimulationVerdict::Ok => Ok(self.inner),
+            SimulationVerdict::Revert | SimulationVerdict::Error => Err((self, verdict)),
+        }
+    }
 }
 
 /// Pure decode + pre-sign storage. Separated from the RPC layer so
@@ -174,7 +322,14 @@ impl PendingCache {
     /// older than `max_pending_age_secs`. Called by the block-listener
     /// task on each `NewBlock` event — pre-signs only live for one
     /// block window, so anything that didn't fire is stale.
-    pub fn drain(&self) -> Vec<PreSignedLiquidation> {
+    ///
+    /// Each returned [`UnverifiedPreSigned`] requires a
+    /// [`SimulationVerdict::Ok`] from the caller before its raw tx is
+    /// reachable. This mirrors the CLAUDE.md safety invariant in the
+    /// type system: a broadcaster written against this API cannot
+    /// skip the `eth_call` gate without disabling the type checker.
+    #[must_use = "dropping the drained vec discards pre-signs without broadcasting; at minimum log and re-insert"]
+    pub fn drain(&self) -> Vec<UnverifiedPreSigned> {
         let now = unix_now();
         let max_age = self.max_pending_age_secs;
         let mut out = Vec::with_capacity(self.pending.len());
@@ -189,7 +344,7 @@ impl PendingCache {
                     );
                     continue;
                 }
-                out.push(entry);
+                out.push(UnverifiedPreSigned { inner: entry });
             }
         }
         debug!(drained = out.len(), "mempool cache drained");
@@ -268,7 +423,8 @@ impl MempoolMonitor {
         self.cache.insert(tx);
     }
 
-    pub fn drain(&self) -> Vec<PreSignedLiquidation> {
+    #[must_use = "dropping the drained vec discards pre-signs without broadcasting; at minimum log and re-insert"]
+    pub fn drain(&self) -> Vec<UnverifiedPreSigned> {
         self.cache.drain()
     }
 
@@ -315,42 +471,85 @@ impl MempoolMonitor {
         info!(oracle = %self.oracle(), "pending-tx subscription established");
 
         let mut stream = sub.into_stream();
-        while let Some(hash) = stream.next().await {
-            // Lookup failures are common for txs that dropped out of
-            // the pool between the hash push and our get — log at
-            // debug, keep going.
-            let full = match self.provider.get_transaction_by_hash(hash).await {
-                Ok(Some(t)) => t,
-                Ok(None) => {
-                    debug!(%hash, "pending tx vanished before fetch");
-                    continue;
+
+        // First-tx watchdog. If the configured endpoint silently drops
+        // `newPendingTransactions` (every public BSC RPC) the
+        // subscription call above still succeeds but the stream never
+        // yields. Nudge the operator at `FIRST_TX_WATCHDOG` with a
+        // diagnosis pointing at the likely cause.
+        let mut saw_first_tx = false;
+        let mut watchdog =
+            Box::pin(tokio::time::sleep(FIRST_TX_WATCHDOG));
+
+        loop {
+            tokio::select! {
+                biased;
+                maybe_hash = stream.next() => {
+                    let Some(hash) = maybe_hash else { break; };
+                    if !saw_first_tx {
+                        saw_first_tx = true;
+                        debug!(%hash, "first pending tx received, watchdog disarmed");
+                    }
+                    if !self.handle_pending_hash(hash, tx).await? {
+                        return Ok(());
+                    }
                 }
-                Err(err) => {
-                    debug!(%hash, ?err, "get_transaction_by_hash failed");
-                    continue;
+                _ = &mut watchdog, if !saw_first_tx => {
+                    warn!(
+                        oracle = %self.oracle(),
+                        watchdog_secs = FIRST_TX_WATCHDOG.as_secs(),
+                        "no pending tx received after subscribe — the endpoint is likely a public RPC that disables newPendingTransactions or exposes only its local pool. MempoolMonitor requires a paid MEV stream (bloxroute/blocknative) or a self-hosted BSC geth with the txpool exposed. See module docs."
+                    );
                 }
-            };
-
-            let to = full.inner.kind().to().copied();
-            let input = full.inner.input();
-            let Some(update) = self.cache.decode(hash, to, input) else {
-                continue;
-            };
-
-            info!(
-                %hash,
-                asset = %update.asset,
-                selector = %format_selector(update.selector),
-                price = ?update.new_price,
-                "venus oracle update seen in mempool"
-            );
-
-            if tx.send(update).await.is_err() {
-                return Ok(());
             }
         }
 
         anyhow::bail!("mempool: pending-tx subscription stream ended")
+    }
+
+    /// Look up a pending tx hash, decode it, and forward any decoded
+    /// [`OracleUpdate`] on `tx`. Returns `Ok(false)` when the receiver
+    /// has been dropped (caller should exit cleanly), `Ok(true)`
+    /// otherwise. Extracted from `run_once` so the watchdog loop stays
+    /// readable.
+    async fn handle_pending_hash(
+        &self,
+        hash: B256,
+        tx: &mpsc::Sender<OracleUpdate>,
+    ) -> Result<bool> {
+        // Lookup failures are common for txs that dropped out of the
+        // pool between the hash push and our get — log at debug, keep
+        // going.
+        let full = match self.provider.get_transaction_by_hash(hash).await {
+            Ok(Some(t)) => t,
+            Ok(None) => {
+                debug!(%hash, "pending tx vanished before fetch");
+                return Ok(true);
+            }
+            Err(err) => {
+                debug!(%hash, ?err, "get_transaction_by_hash failed");
+                return Ok(true);
+            }
+        };
+
+        let to = full.inner.kind().to().copied();
+        let input = full.inner.input();
+        let Some(update) = self.cache.decode(hash, to, input) else {
+            return Ok(true);
+        };
+
+        info!(
+            %hash,
+            asset = %update.asset,
+            selector = %format_selector(update.selector),
+            price = ?update.new_price,
+            "venus oracle update seen in mempool"
+        );
+
+        if tx.send(update).await.is_err() {
+            return Ok(false);
+        }
+        Ok(true)
     }
 }
 
@@ -571,7 +770,7 @@ mod tests {
         assert_eq!(c.pending_len(), 1);
         let drained = c.drain();
         assert_eq!(drained.len(), 1);
-        assert_eq!(drained[0].borrower, borrower);
+        assert_eq!(drained[0].borrower(), borrower);
         assert_eq!(c.pending_len(), 0);
         // Second drain yields nothing.
         assert!(c.drain().is_empty());
@@ -616,7 +815,128 @@ mod tests {
         assert_eq!(c.pending_len(), 1);
         let drained = c.drain();
         assert_eq!(drained.len(), 1);
-        assert_eq!(drained[0].raw_tx.as_ref(), &[0x02]);
+        // To read raw_tx the caller must present a passing verdict —
+        // that's the whole point of the wrapper (see #226).
+        let unwrapped = drained
+            .into_iter()
+            .next()
+            .unwrap()
+            .verify(SimulationVerdict::approve())
+            .expect("approved verdict must unwrap");
+        assert_eq!(unwrapped.raw_tx.as_ref(), &[0x02]);
+    }
+
+    #[test]
+    fn verify_ok_returns_inner_signed() {
+        let c = mk_cache();
+        let opp = mk_opp();
+        c.insert(PreSignedLiquidation {
+            borrower: opp.position.borrower,
+            raw_tx: Bytes::from_static(&[0xaa]),
+            opportunity: opp,
+            trigger_tx: HASH,
+            inserted_at: unix_now(),
+        });
+        let drained = c.drain();
+        let verified = drained
+            .into_iter()
+            .next()
+            .unwrap()
+            .verify(SimulationVerdict::Ok)
+            .expect("Ok verdict unwraps");
+        assert_eq!(verified.raw_tx.as_ref(), &[0xaa]);
+    }
+
+    #[test]
+    fn verify_revert_keeps_wrapper_and_hides_raw_tx() {
+        let c = mk_cache();
+        let opp = mk_opp();
+        c.insert(PreSignedLiquidation {
+            borrower: opp.position.borrower,
+            raw_tx: Bytes::from_static(&[0xbb]),
+            opportunity: opp,
+            trigger_tx: HASH,
+            inserted_at: unix_now(),
+        });
+        let drained = c.drain();
+        let wrapped = drained.into_iter().next().unwrap();
+        let borrower_before = wrapped.borrower();
+        match wrapped.verify(SimulationVerdict::Revert) {
+            Err((still_wrapped, v)) => {
+                assert!(matches!(v, SimulationVerdict::Revert));
+                assert_eq!(still_wrapped.borrower(), borrower_before);
+            }
+            Ok(_) => panic!("Revert must not unwrap"),
+        }
+    }
+
+    #[test]
+    fn verify_revert_then_ok_roundtrips() {
+        // A rejected verdict must leave the wrapper usable for a retry
+        // simulation. Without this, a transient RPC error on the first
+        // simulate would permanently strand the pre-sign.
+        let c = mk_cache();
+        let opp = mk_opp();
+        c.insert(PreSignedLiquidation {
+            borrower: opp.position.borrower,
+            raw_tx: Bytes::from_static(&[0xdd]),
+            opportunity: opp,
+            trigger_tx: HASH,
+            inserted_at: unix_now(),
+        });
+        let wrapped = c.drain().into_iter().next().unwrap();
+        let (retry, _) = match wrapped.verify(SimulationVerdict::Revert) {
+            Err(pair) => pair,
+            Ok(_) => panic!("Revert must not unwrap"),
+        };
+        let verified = retry
+            .verify(SimulationVerdict::Ok)
+            .expect("retry with Ok must unwrap");
+        assert_eq!(verified.raw_tx.as_ref(), &[0xdd]);
+    }
+
+    #[test]
+    fn peek_accessors_survive_failed_verify() {
+        // Confirm every read-only accessor is still reachable on the
+        // wrapper after a failed verdict — the logging/ranking path
+        // must not be blocked by the failure.
+        let c = mk_cache();
+        let opp = mk_opp();
+        let borrower_expected = opp.position.borrower;
+        c.insert(PreSignedLiquidation {
+            borrower: borrower_expected,
+            raw_tx: Bytes::from_static(&[0xee]),
+            opportunity: opp,
+            trigger_tx: HASH,
+            inserted_at: unix_now(),
+        });
+        let wrapped = c.drain().into_iter().next().unwrap();
+        let (still_wrapped, _) = match wrapped.verify(SimulationVerdict::Error) {
+            Err(pair) => pair,
+            Ok(_) => panic!("Error must not unwrap"),
+        };
+        assert_eq!(still_wrapped.borrower(), borrower_expected);
+        assert_eq!(still_wrapped.trigger_tx(), HASH);
+        assert_eq!(still_wrapped.opportunity().position.borrower, borrower_expected);
+    }
+
+    #[test]
+    fn verify_error_keeps_wrapper_and_hides_raw_tx() {
+        let c = mk_cache();
+        let opp = mk_opp();
+        c.insert(PreSignedLiquidation {
+            borrower: opp.position.borrower,
+            raw_tx: Bytes::from_static(&[0xcc]),
+            opportunity: opp,
+            trigger_tx: HASH,
+            inserted_at: unix_now(),
+        });
+        let drained = c.drain();
+        let wrapped = drained.into_iter().next().unwrap();
+        assert!(matches!(
+            wrapped.verify(SimulationVerdict::Error),
+            Err((_, SimulationVerdict::Error))
+        ));
     }
 
     #[test]
