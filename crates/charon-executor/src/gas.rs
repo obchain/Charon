@@ -131,14 +131,22 @@ pub fn gas_cost_usd_cents(
     native_price: U256,
     native_decimals: u8,
 ) -> u64 {
-    let wei_cost: u128 = (gas_units as u128).saturating_mul(max_fee_per_gas);
+    let wei_cost: u128 = u128::from(gas_units).saturating_mul(max_fee_per_gas);
     // wei (1e18 = 1 native) × price (10^decimals = $1) → cents.
     // Divide by 10^(18 + decimals - 2) to land in cents.
-    let exponent = 18u32 + u32::from(native_decimals) - 2;
+    //
+    // Use saturating / checked arithmetic so the workspace
+    // `arithmetic_side_effects` lint passes. A pathologically large
+    // `native_decimals` (> u32::MAX - 16) saturates to u32::MAX, and a
+    // zero divisor (unreachable while exponent >= 0) falls back to zero
+    // cents rather than panicking inside the oracle.
+    let exponent = 18u32
+        .saturating_add(u32::from(native_decimals))
+        .saturating_sub(2);
     let divisor = U256::from(10u64).pow(U256::from(exponent));
 
     let numerator = U256::from(wei_cost).saturating_mul(native_price);
-    let cents = numerator / divisor;
+    let cents = numerator.checked_div(divisor).unwrap_or(U256::ZERO);
     u64::try_from(cents).unwrap_or(u64::MAX)
 }
 
