@@ -70,6 +70,21 @@ contract CharonLiquidator is IFlashLoanSimpleReceiver {
     /// @notice The bot's hot wallet. Only address authorised to call executeLiquidation and rescue.
     address public immutable owner;
 
+    /// @notice Cold wallet — recipient of every liquidation profit sweep.
+    /// @dev    Intentionally distinct from `owner` (hot wallet). Parking profit
+    ///         at the hot wallet would make a bot-key compromise immediately
+    ///         cashable; sweeping to a cold wallet (ideally a hardware wallet
+    ///         or multisig) bounds the blast radius of a hot-key leak to the
+    ///         funds owed by an in-flight liquidation — none of the accumulated
+    ///         profit is reachable without the cold key. Immutable: deploying
+    ///         with a new cold wallet requires a new contract.
+    ///
+    ///         Closes the CLAUDE.md safety invariant "profit must leave the
+    ///         hot wallet every tx" at the type layer: `owner` stays on the
+    ///         rescue/auth path, `coldWallet` owns the profit path, and no
+    ///         code path writes profit to `owner` (see #120, #265).
+    address public immutable coldWallet;
+
     /// @notice Aave V3 Pool proxy on BNB Chain.
     ///         Mainnet: 0x6807dc923806fE8Fd134338EABCA509979a7e08
     address public immutable AAVE_POOL;
@@ -157,18 +172,28 @@ contract CharonLiquidator is IFlashLoanSimpleReceiver {
     // Constructor
     // ─────────────────────────────────────────────────────────────────────────
 
-    /// @notice Deploys CharonLiquidator and permanently binds it to one Aave Pool
-    ///         and one PancakeSwap V3 router.
+    /// @notice Deploys CharonLiquidator and permanently binds it to one Aave Pool,
+    ///         one PancakeSwap V3 router, and one cold-wallet profit sink.
     /// @dev msg.sender becomes the immutable owner (the bot's hot wallet).
-    ///      Both addresses are validated non-zero at construction.
+    ///      All three addresses are validated non-zero at construction.
+    ///      `_coldWallet` must differ from `msg.sender` so a compromised bot key
+    ///      cannot drain accumulated profit — enforced at construction time
+    ///      rather than as runtime overhead, because immutability makes this a
+    ///      one-shot check.
     /// @param _aavePool   Aave V3 Pool proxy address on BNB Chain.
     /// @param _swapRouter PancakeSwap V3 SwapRouter address on BNB Chain.
-    constructor(address _aavePool, address _swapRouter) {
+    /// @param _coldWallet Profit recipient. Must be distinct from msg.sender
+    ///                    (the hot wallet / owner). Ideally a hardware wallet
+    ///                    or multisig held by a different key than the bot's.
+    constructor(address _aavePool, address _swapRouter, address _coldWallet) {
         require(_aavePool != address(0), "!aavePool");
         require(_swapRouter != address(0), "!swapRouter");
+        require(_coldWallet != address(0), "!coldWallet");
+        require(_coldWallet != msg.sender, "coldWallet==owner");
         owner = msg.sender;
         AAVE_POOL = _aavePool;
         SWAP_ROUTER = _swapRouter;
+        coldWallet = _coldWallet;
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -337,15 +362,21 @@ contract CharonLiquidator is IFlashLoanSimpleReceiver {
         // minSwapOut was set below totalOwed by the caller.
         require(finalBal >= totalOwed, "swap output below repayment");
 
-        // ── Step 7: sweep profit to owner ─────────────────────────────────────
-        // Profit must leave this contract before we approve Aave, otherwise Aave
-        // could theoretically pull more than totalOwed if the token has quirks.
+        // ── Step 7: sweep profit to cold wallet ───────────────────────────────
+        // Profit must leave this contract — and specifically the hot-wallet
+        // owner — before we approve Aave, otherwise Aave could theoretically
+        // pull more than totalOwed if the token has quirks, and an attacker
+        // who has compromised the owner key could silently drain accumulated
+        // profit. Sweeping to the cold wallet honours the CLAUDE.md safety
+        // invariant (see #120, #265); the cold wallet address is immutable,
+        // set at construction, and never equals the owner.
         uint256 profit = finalBal - totalOwed;
         if (profit > 0) {
-            // transfer return value not checked: owner is a trusted address set at
-            // construction; a failure here reverts the whole tx (excess funds stay
-            // in the contract until rescued). Standard ERC-20s revert on failure.
-            IERC20(p.debtToken).transfer(owner, profit);
+            // transfer return value not checked: coldWallet is a trusted address
+            // set at construction; a failure here reverts the whole tx (excess
+            // funds stay in the contract until rescued). Standard ERC-20s
+            // revert on failure.
+            IERC20(p.debtToken).transfer(coldWallet, profit);
         }
 
         // ── Step 8: emit before the final approval so logs reflect the full state ─

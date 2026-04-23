@@ -148,6 +148,13 @@ contract CharonLiquidatorForkTest is Test {
     address internal owner;
     address internal borrower;
 
+    /// @dev Profit recipient, distinct from `owner` (hot wallet). Proves
+    ///      the CLAUDE.md safety invariant ("profit must not park at the
+    ///      hot wallet") end-to-end across every market: each market's
+    ///      happy-path asserts the cold wallet balance grew and — crucially
+    ///      — that the hot wallet balance did NOT grow. See #120 / #265.
+    address internal coldWallet;
+
     /// @dev Per-market gas ceiling used by `_assertGasWithin`. Set to
     ///      roughly 1.25x observed usage on the pinned fork — tight
     ///      enough to catch regressions, loose enough to absorb normal
@@ -275,7 +282,8 @@ contract CharonLiquidatorForkTest is Test {
 
         owner = address(this);
         borrower = makeAddr("borrower");
-        liquidator = new CharonLiquidator(AAVE_V3_POOL, PCS_V3_ROUTER);
+        coldWallet = makeAddr("coldWallet");
+        liquidator = new CharonLiquidator(AAVE_V3_POOL, PCS_V3_ROUTER, coldWallet);
     }
 
     // ─────────────────────────────────────────────────────────────────────
@@ -363,18 +371,18 @@ contract CharonLiquidatorForkTest is Test {
     /// @dev Runs one liquidation against a freshly-redeployed contract,
     ///      asserts the expected `LiquidationExecuted` event fires with
     ///      compiler-checked selector matching (#273), enforces the
-    ///      per-market gas ceiling (#274), and verifies owner balance
-    ///      grew (legacy invariant — the #265 cold-wallet assertion is
-    ///      blocked on the `COLD_WALLET` constructor-arg landing and
-    ///      will be re-tightened when that change reaches this branch).
+    ///      per-market gas ceiling (#274), and verifies the CLAUDE.md
+    ///      safety invariant end-to-end: profit lands at the cold
+    ///      wallet, not the hot wallet (#120 / #265).
     function _executeAndAssert(Market memory m) internal {
         // Redeploy so every test starts with a clean liquidator.
-        liquidator = new CharonLiquidator(AAVE_V3_POOL, PCS_V3_ROUTER);
+        liquidator = new CharonLiquidator(AAVE_V3_POOL, PCS_V3_ROUTER, coldWallet);
         _mockVenusAndSeedCollateral(m);
 
         (, uint256 minOut) = _minOutFromQuoter(m, 50); // 50bps floor
 
         uint256 ownerBalBefore = IERC20(m.debtToken).balanceOf(owner);
+        uint256 coldBalBefore = IERC20(m.debtToken).balanceOf(coldWallet);
 
         // Typed event expect: the signature is compiler-checked, so
         // renaming the event breaks the test at compile time rather than
@@ -393,8 +401,26 @@ contract CharonLiquidatorForkTest is Test {
         emit log_named_uint("gas_used_liquidation", gasUsed);
         assertLt(gasUsed, GAS_CEILING_SINGLE, "liquidation gas regression");
 
+        // Cold wallet must receive the profit (#265). Hot wallet (owner)
+        // must not grow — parking any profit at the hot wallet violates
+        // the CLAUDE.md safety invariant and is the exact bug #120 this
+        // assertion pair is meant to catch before it hits mainnet. The
+        // double assertion (coldBalAfter > coldBalBefore AND
+        // ownerBalAfter == ownerBalBefore) is load-bearing: a future
+        // contract change that splits profit would silently pass a
+        // single-sided check.
         uint256 ownerBalAfter = IERC20(m.debtToken).balanceOf(owner);
-        assertGt(ownerBalAfter, ownerBalBefore, "owner should have received profit");
+        uint256 coldBalAfter = IERC20(m.debtToken).balanceOf(coldWallet);
+        assertGt(
+            coldBalAfter,
+            coldBalBefore,
+            "profit must sweep to cold wallet (CLAUDE.md, #120, #265)"
+        );
+        assertEq(
+            ownerBalAfter,
+            ownerBalBefore,
+            "hot wallet must not receive profit (CLAUDE.md, #120, #265)"
+        );
 
         // Contract should end with a zero collateral-token balance — the
         // full seized amount was swapped, nothing should be left behind.
@@ -568,5 +594,46 @@ contract CharonLiquidatorForkTest is Test {
         assertGt(PCS_V3_QUOTER.code.length, 0, "PancakeSwap V3 quoter has no code on fork");
         assertGt(USDT.code.length, 0, "USDT has no code on fork");
         assertGt(VUSDT.code.length, 0, "vUSDT has no code on fork");
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // E. Placeholders for known-missing coverage — fail-loud scaffolds
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// @dev Tracking stub for #270: vBNB native-collateral fork coverage.
+    ///
+    ///      Context: the current `CharonLiquidator._swapCollateralToDebt`
+    ///      path assumes the collateral token implements ERC-20 directly,
+    ///      which is not true for Venus's vBNB market — redeeming vBNB
+    ///      returns native BNB, and PancakeSwap V3 `exactInputSingle`
+    ///      requires WBNB. Issue #121 tracks the fix (wrap native BNB →
+    ///      WBNB before the swap, and account for the post-redeem native
+    ///      balance separately from the ERC-20 balance).
+    ///
+    ///      This test is intentionally `vm.skip(true)` so CI is green
+    ///      until #121 lands, but the function is discoverable by
+    ///      `forge test --list` and its body describes the exact wiring
+    ///      needed. The engineer who closes #121 removes the `vm.skip`
+    ///      line, implements the native-collateral fixture, and this
+    ///      scaffold becomes the regression guard that should have
+    ///      existed from day one (see #123 for the broader pattern).
+    ///
+    ///      vBNB address on BSC mainnet (Venus Core Pool):
+    ///        0xA07c5b74C9B40447a954e1466938b865b6BBea36
+    ///      WBNB on BSC mainnet:
+    ///        0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c
+    function test_fork_vBNB_nativeCollateral_SKIP() public {
+        vm.skip(true);
+        // TODO(#121): once the native-BNB collateral path lands in
+        //   CharonLiquidator.sol, build out this fixture:
+        //     1. Seed the liquidator with `seizedUnderlying` wei of native
+        //        BNB (vm.deal) representing a post-redeem Venus payout.
+        //     2. Mock IVToken(vBNB).redeem → uint256(0) so the flow
+        //        proceeds to the swap leg.
+        //     3. Assert the wrap-to-WBNB helper was called with
+        //        the seeded balance.
+        //     4. Run executeLiquidation and assert profit sweeps to the
+        //        cold wallet (same invariant as every other market —
+        //        #265 / CLAUDE.md).
     }
 }

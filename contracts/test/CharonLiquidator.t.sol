@@ -57,7 +57,10 @@ contract ReentrantPool {
         // Deploy liquidator with this contract as AAVE_POOL — and msg.sender here
         // is the test contract, but we want ReentrantPool to be owner.  We deploy
         // from inside this constructor so msg.sender to CharonLiquidator is this.
-        liquidator = new CharonLiquidator(address(this), stubRouter);
+        // `coldWallet` distinct from msg.sender (this contract == owner).
+        // Use a fixed low address so the reentrancy-path asserts stay
+        // deterministic across fuzz runs.
+        liquidator = new CharonLiquidator(address(this), stubRouter, address(0xC01D));
     }
 
     function buildParams(CharonLiquidator.LiquidationParams calldata p) external {
@@ -99,13 +102,17 @@ contract CharonLiquidatorTest is Test {
     // Addresses used across multiple sections — initialized in setUp.
     address internal alice;
     address internal recipient;
+    address internal coldWallet;
 
     // ── setUp creates one unforked liquidator; fork test makes its own ────────
     function setUp() public {
         alice = makeAddr("alice"); // non-owner attacker
         recipient = makeAddr("recipient");
-        liquidator = new CharonLiquidator(STUB_POOL, STUB_ROUTER);
+        coldWallet = makeAddr("coldWallet");
+        liquidator = new CharonLiquidator(STUB_POOL, STUB_ROUTER, coldWallet);
         // address(this) == owner because msg.sender at deploy is the test contract.
+        // coldWallet is distinct by construction (makeAddr) so the
+        // `coldWallet==owner` guard in the constructor never trips here.
     }
 
     // ── Internal helper: returns a fully-valid LiquidationParams ─────────────
