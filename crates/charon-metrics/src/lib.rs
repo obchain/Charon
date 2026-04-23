@@ -19,8 +19,30 @@ use std::net::SocketAddr;
 
 use anyhow::{Context, Result};
 use metrics::{counter, describe_counter, describe_gauge, describe_histogram, gauge, histogram};
-use metrics_exporter_prometheus::PrometheusBuilder;
+use metrics_exporter_prometheus::{Matcher, PrometheusBuilder};
 use tracing::info;
+
+// Bucket boundaries for `charon_pipeline_block_duration_seconds`.
+// BSC produces a block every ~3s; resolution is packed around that
+// threshold so p50/p95 quantiles stay meaningful instead of piling
+// into `+Inf` with the exporter's default HTTP-latency buckets.
+const BLOCK_DURATION_SECONDS_BUCKETS: &[f64] =
+    &[0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 3.0, 5.0, 10.0];
+
+// Bucket boundaries for `charon_executor_profit_usd_cents`.
+// Realistic Venus liquidation profit spans ~$0.05 dust to ~$10k
+// windfalls; buckets are in cents (5 → 1_000_000) so histogram_quantile
+// returns finite values across that range.
+const PROFIT_USD_CENTS_BUCKETS: &[f64] = &[
+    5.0,
+    50.0,
+    500.0,
+    2_500.0,
+    10_000.0,
+    50_000.0,
+    250_000.0,
+    1_000_000.0,
+];
 
 /// Single-source-of-truth metric names. Kept as constants so call
 /// sites, dashboard JSON, and alert rules refer to the same strings.
@@ -76,6 +98,26 @@ pub mod drop_stage {
 pub async fn init(bind: SocketAddr) -> Result<()> {
     PrometheusBuilder::new()
         .with_http_listener(bind)
+        .set_buckets_for_metric(
+            Matcher::Full(names::PIPELINE_BLOCK_DURATION_SECONDS.to_string()),
+            BLOCK_DURATION_SECONDS_BUCKETS,
+        )
+        .with_context(|| {
+            format!(
+                "failed to register buckets for {}",
+                names::PIPELINE_BLOCK_DURATION_SECONDS
+            )
+        })?
+        .set_buckets_for_metric(
+            Matcher::Full(names::EXECUTOR_PROFIT_USD_CENTS.to_string()),
+            PROFIT_USD_CENTS_BUCKETS,
+        )
+        .with_context(|| {
+            format!(
+                "failed to register buckets for {}",
+                names::EXECUTOR_PROFIT_USD_CENTS
+            )
+        })?
         .install()
         .with_context(|| format!("failed to install Prometheus exporter on {bind}"))?;
 
