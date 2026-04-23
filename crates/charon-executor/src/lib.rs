@@ -19,4 +19,4 @@ pub use builder::{ICharonLiquidator, TxBuilder};
 pub use gas::{GasOracle, GasParams, gas_cost_usd_cents};
 pub use nonce::NonceManager;
 pub use simulation::Simulator;
-pub use submit::{DEFAULT_SUBMIT_TIMEOUT, Submitter};
+pub use submit::{DEFAULT_SUBMIT_TIMEOUT, SubmitError, Submitter};
