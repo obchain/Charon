@@ -64,7 +64,7 @@
     },
     {
       "datasource": { "type": "prometheus", "uid": "${datasource}" },
-      "description": "Per-block pipeline wall-clock latency. p50 and p95 from the histogram.",
+      "description": "Per-block pipeline wall-clock latency. p50 and p95 from the histogram. BSC produces a block every ~3s; quantiles use a [5m] range (~100 observations) so they stay stable across scrapes.",
       "fieldConfig": {
         "defaults": {
           "color": { "mode": "palette-classic" },
