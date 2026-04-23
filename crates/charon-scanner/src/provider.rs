@@ -7,7 +7,7 @@
 
 use alloy::providers::{Provider, ProviderBuilder, RootProvider, WsConnect};
 use alloy::pubsub::PubSubFrontend;
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use charon_core::config::ChainConfig;
 use tracing::debug;
 
@@ -27,7 +27,13 @@ impl ChainProvider {
     ///
     /// Takes the chain's short name (for logging) and its [`ChainConfig`].
     /// Fails with a contextualized error if the WS handshake does not
-    /// succeed — no panics, no silent fallbacks.
+    /// succeed — no panics, no silent fallbacks. After the handshake
+    /// succeeds, the remote chain id is read via `eth_chainId` and
+    /// compared against [`ChainConfig::chain_id`]; a mismatch aborts
+    /// startup with a diagnostic naming both values. Without this
+    /// check, a testnet profile accidentally paired with a mainnet
+    /// RPC URL (or vice versa) would connect cleanly and then silently
+    /// hit the wrong addresses with zero visible symptom (see #248).
     pub async fn connect(name: impl Into<String>, config: &ChainConfig) -> Result<Self> {
         let name = name.into();
         debug!(chain = %name, url = %config.ws_url, "connecting ws provider");
@@ -39,6 +45,20 @@ impl ChainProvider {
                 config.ws_url
             )
         })?;
+
+        let rpc_chain_id = provider
+            .get_chain_id()
+            .await
+            .with_context(|| format!("chain '{name}': eth_chainId read failed"))?;
+        if rpc_chain_id != config.chain_id {
+            bail!(
+                "chain '{name}': chain_id mismatch — config declares {} but RPC {} reports {}. \
+                 Check that [chain.{name}].chain_id and the RPC URL point at the same network.",
+                config.chain_id,
+                config.ws_url,
+                rpc_chain_id
+            );
+        }
 
         Ok(Self { name, ws: provider })
     }
