@@ -33,8 +33,13 @@ priority_fee_gwei = 1
 # ── Lending protocols ─────────────────────────────────────────────────────
 [protocol.venus]
 chain = "bnb"
-# Venus Unitroller on Chapel (Core Pool comptroller proxy).
-# Source: github.com/VenusProtocol/venus-protocol/deployments/bsctestnet
+# Venus Unitroller proxy on BSC testnet (Chapel, Core Pool comptroller).
+# Source: VenusProtocol/venus-protocol → deployments/bsctestnet/Unitroller.json
+# Verified: 2026-03-02. Chapel contracts redeploy more frequently than BSC
+# mainnet during Venus protocol upgrades — re-verify this address after any
+# Venus release and bump the date above. A stale address here is silent:
+# every RPC call returns empty/revert and the scanner reports zero positions,
+# which is indistinguishable from "no liquidatable borrowers."
 comptroller = "0x94d1820b2D1c7c7452A163983Dc888CEC546b77D"
 
 # ── Prometheus metrics exporter ───────────────────────────────────────────
