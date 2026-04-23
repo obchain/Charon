@@ -12,7 +12,7 @@
       }
     ]
   },
-  "description": "Charon liquidation bot — scanner, executor, and profit telemetry. Scrapes the charon-metrics Prometheus exporter (default :9091). Chain/Instance variables default to All (.*) so panels render before the first scrape populates label_values; they auto-refine once metrics flow.",
+  "description": "Charon liquidation bot — scanner, executor, and profit telemetry. Scrapes the charon-metrics Prometheus exporter (default :9091). Chain/Instance variables default to All (.*) so panels render before the first scrape populates label_values; they auto-refine once metrics flow. Mempool / gas / RPC-latency panels deferred pending backing series: mempool #300, gas #301, rpc-latency #302. Alerting rules live in deploy/grafana/alerts.yaml.",
   "editable": true,
   "fiscalYearStartMonth": 0,
   "graphTooltip": 1,
@@ -365,7 +365,7 @@
     },
     {
       "datasource": { "type": "prometheus", "uid": "${datasource}" },
-      "description": "Running build metadata. `version` and `git_sha` come from the Charon process at startup.",
+      "description": "Running build metadata. Only `version` is surfaced; `git_sha` is intentionally hidden via transform exclusion until /metrics has auth (open #214) and LAN exposure is addressed (#213). Surfacing the exact SHA of a running binary to anyone with Grafana read access is an intelligence leak while those are unresolved.",
       "fieldConfig": {
         "defaults": { "custom": { "align": "auto" } },
         "overrides": []
@@ -395,7 +395,7 @@
         {
           "id": "organize",
           "options": {
-            "excludeByName": { "Time": true, "Value": true, "__name__": true, "job": true },
+            "excludeByName": { "Time": true, "Value": true, "__name__": true, "job": true, "git_sha": true },
             "indexByName": {},
             "renameByName": {}
           }
