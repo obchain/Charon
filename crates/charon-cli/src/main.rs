@@ -142,10 +142,14 @@ async fn main() -> Result<()> {
 /// MEV / private-RPC submission tasks (#18).
 async fn run_listen(config: Config, borrowers: Vec<Address>) -> Result<()> {
     // ── Adapters + scanner + price cache (existing #8/#9/#10 wiring) ──
+    // Active chain comes from `[bot] chain = "..."` so testnet and
+    // mainnet profiles share this code path — the testnet profile
+    // uses `chain = "bnb_testnet"`, mainnet stays `"bnb"`. See #239.
+    let chain_key = config.bot.chain.as_str();
     let bnb = config
         .chain
-        .get("bnb")
-        .context("chain 'bnb' not configured — required for v0.1")?;
+        .get(chain_key)
+        .with_context(|| format!("chain '{chain_key}' (from [bot] chain) not configured"))?;
     let venus_cfg = config
         .protocol
         .get("venus")
@@ -154,9 +158,25 @@ async fn run_listen(config: Config, borrowers: Vec<Address>) -> Result<()> {
     // targeting chains with no flash-loan venue (e.g. BSC testnet, where
     // Aave V3 is not deployed) omit both, and the bot runs in
     // read-only mode: listener + scanner + metrics stay live, but the
-    // opportunity-processing arm short-circuits.
-    let aave_cfg = config.flashloan.get("aave_v3_bsc");
-    let liquidator_cfg = config.liquidator.get("bnb");
+    // opportunity-processing arm short-circuits. `Config::validate`
+    // rejects a half-wired state (one side present, the other absent)
+    // at load time (#243), so below lookups only need to handle the
+    // both-present and both-absent cases.
+    // Both flashloan and liquidator are keyed by arbitrary labels in
+    // TOML (`[flashloan.aave_v3_bsc]`, `[liquidator.bnb]`) but the
+    // pipeline pivots on the inner `chain` field, not the map key.
+    // Matching on the inner field keeps this aligned with
+    // `Config::validate`, which checks inner-field pairing: using
+    // `.get(chain_key)` on liquidator previously coupled the code path
+    // to the convention that liquidator maps are keyed by chain name,
+    // and a profile that chose a different label (e.g.
+    // `[liquidator.charon_bnb_v1]`) would pass validation and then
+    // silently short-circuit at runtime.
+    let aave_cfg = config.flashloan.values().find(|f| f.chain == chain_key);
+    let liquidator_cfg = config
+        .liquidator
+        .values()
+        .find(|l| l.chain == chain_key);
 
     // Single shared pub-sub provider — adapter, price cache, flash-loan
     // adapter, and tx builder all hang off it. Cuts WS connection
@@ -175,7 +195,7 @@ async fn run_listen(config: Config, borrowers: Vec<Address>) -> Result<()> {
         config.bot.near_liq_threshold,
     )?);
 
-    let price_feeds = config.chainlink.get("bnb").cloned().unwrap_or_default();
+    let price_feeds = config.chainlink.get(chain_key).cloned().unwrap_or_default();
     let prices = Arc::new(PriceCache::new(
         provider.clone(),
         price_feeds,
