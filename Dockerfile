@@ -20,10 +20,12 @@ RUN apt-get update \
 
 WORKDIR /build
 
-# Manifests first so the dep layer caches separately from source.
-# Dummy `src/main.rs` is cheaper than copying the full workspace when
-# only Cargo.* changes — iteration speed on `docker build` during
-# compose tuning.
+# Copy the full workspace. The BuildKit cache mount on `/build/target`
+# below is what preserves incremental compilation across rebuilds —
+# `COPY crates` invalidates this layer on any source change, but the
+# RUN layer reuses the cached `target/` so cargo only recompiles
+# crates whose source actually changed. `Cargo.lock` churn still
+# forces a full dep recompile (5-15 min on CX22 2 vCPU).
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
 
