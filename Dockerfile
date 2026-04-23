@@ -45,6 +45,7 @@ FROM debian:bookworm-slim@sha256:f9c6a2fd2ddbc23e336b6257a5245e31f996953ef06cd13
 RUN apt-get update \
     && apt-get install --no-install-recommends -y \
         ca-certificates \
+        curl \
         libssl3 \
     && rm -rf /var/lib/apt/lists/* \
     && useradd --system --uid 10001 --home /app --shell /usr/sbin/nologin charon
@@ -62,6 +63,13 @@ COPY --from=builder /charon /usr/local/bin/charon
 USER charon
 
 EXPOSE 9091
+
+# Probe the Prometheus exporter — the final step in the bot's startup
+# sequence, so a 200 on /metrics implies RPC connect + chain-id check
+# + listener bind all succeeded. `start-period` covers the WS
+# handshake + first block drain on a cold start.
+HEALTHCHECK --interval=10s --timeout=5s --start-period=30s --retries=3 \
+    CMD curl -sf http://localhost:9091/metrics > /dev/null || exit 1
 
 ENTRYPOINT ["charon"]
 CMD ["--config", "config/default.toml", "listen"]
