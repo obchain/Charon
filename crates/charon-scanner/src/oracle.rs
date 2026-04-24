@@ -2,14 +2,13 @@
 //!
 //! Polls `IAggregatorV3.latestRoundData()` for a configured set of
 //! `(symbol → feed address)` entries and caches the result. Every read
-//! carries a staleness check against the feed's own `updatedAt`
-//! timestamp — if the on-chain round is older than `max_age`, the cache
-//! treats it as missing so the scanner can fall back to the protocol
-//! oracle or skip the position entirely.
+//! carries:
+//!   - round-completeness check (`answeredInRound >= roundId`),
+//!   - `updatedAt > 0` uninitialized-feed check,
+//!   - per-feed staleness window (heartbeat-aware).
 //!
 //! Storage is a `DashMap<String, CachedPrice>`, same lock-free pattern
-//! as the health scanner — prices get read from a different task than
-//! the one refreshing them.
+//! as the health scanner.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -23,9 +22,8 @@ use anyhow::{Context, Result};
 use dashmap::DashMap;
 use tracing::{debug, warn};
 
-/// Default freshness window: 10 minutes. Chainlink feeds on BSC update
-/// faster than this in normal market conditions; when they don't, we'd
-/// rather reject than price a liquidation on stale data.
+/// Default freshness window: 10 minutes. Used only for feeds that do not
+/// have an explicit per-symbol override in the config.
 pub const DEFAULT_MAX_AGE: Duration = Duration::from_secs(10 * 60);
 
 sol! {
@@ -35,8 +33,11 @@ sol! {
         function decimals() external view returns (uint8);
 
         /// Returns the latest round data for this feed.
-        /// `answer` is int256; callers should treat negative values as
-        /// bad data and skip the update.
+        ///
+        /// `answer` is int256; callers must reject negative values.
+        /// `answeredInRound < roundId` means the round is still being
+        /// aggregated — the returned answer is a carry-over from an
+        /// older round and must not be trusted.
         function latestRoundData()
             external view returns (
                 uint80 roundId,
@@ -48,10 +49,11 @@ sol! {
     }
 }
 
-/// One cached price reading with enough metadata to judge freshness.
+/// One cached price reading with enough metadata to judge freshness and
+/// to normalize across oracle scale conventions.
 #[derive(Debug, Clone)]
 pub struct CachedPrice {
-    /// Raw Chainlink answer, sign-checked (always non-negative here).
+    /// Raw Chainlink answer in the feed's native decimals.
     pub price: U256,
     /// Number of decimals the feed reports (typically 8 on BSC).
     pub decimals: u8,
@@ -61,41 +63,80 @@ pub struct CachedPrice {
     pub fetched_at: u64,
 }
 
-/// Thin wrapper around a provider + a per-symbol feed map + a
-/// concurrent cache.
-///
-/// Construction via [`PriceCache::new`] captures the provider handle
-/// but does not make any RPCs; prices are populated by
-/// [`refresh`](Self::refresh) or [`refresh_all`](Self::refresh_all).
+impl CachedPrice {
+    /// Return `price` re-scaled from its native decimals to
+    /// `target_decimals`. Integer arithmetic — no f64.
+    ///
+    /// Callers converting to Venus oracle scale pass `target_decimals`
+    /// equal to the underlying token's decimals + (36 - 18) etc. For
+    /// Aave-style 18-decimal consumers, pass 18.
+    pub fn scaled_to(&self, target_decimals: u8) -> U256 {
+        use std::cmp::Ordering;
+        match target_decimals.cmp(&self.decimals) {
+            Ordering::Equal => self.price,
+            Ordering::Greater => {
+                let diff = target_decimals - self.decimals;
+                self.price * U256::from(10u64).pow(U256::from(diff))
+            }
+            Ordering::Less => {
+                let diff = self.decimals - target_decimals;
+                self.price / U256::from(10u64).pow(U256::from(diff))
+            }
+        }
+    }
+}
+
+/// Thin wrapper around a provider + a per-symbol feed map + per-feed
+/// staleness overrides + a concurrent cache.
 pub struct PriceCache {
     provider: Arc<RootProvider<PubSubFrontend>>,
     feeds: HashMap<String, Address>,
-    max_age: Duration,
+    default_max_age: Duration,
+    per_symbol_max_age: HashMap<String, Duration>,
     cache: DashMap<String, CachedPrice>,
 }
 
 impl PriceCache {
-    /// Build a cache for the given `(symbol → feed address)` map.
+    /// Build a cache with a default staleness window. Equivalent to
+    /// `with_per_symbol_max_age(provider, feeds, default_max_age, {})`.
     pub fn new(
         provider: Arc<RootProvider<PubSubFrontend>>,
         feeds: HashMap<String, Address>,
-        max_age: Duration,
+        default_max_age: Duration,
+    ) -> Self {
+        Self::with_per_symbol_max_age(provider, feeds, default_max_age, HashMap::new())
+    }
+
+    /// Build a cache with per-symbol staleness overrides (e.g. stablecoin
+    /// feeds accept 24h, volatile pairs 2min).
+    pub fn with_per_symbol_max_age(
+        provider: Arc<RootProvider<PubSubFrontend>>,
+        feeds: HashMap<String, Address>,
+        default_max_age: Duration,
+        per_symbol_max_age: HashMap<String, Duration>,
     ) -> Self {
         Self {
             provider,
             feeds,
-            max_age,
+            default_max_age,
+            per_symbol_max_age,
             cache: DashMap::new(),
         }
     }
 
-    /// Symbols the cache is configured to track.
     pub fn symbols(&self) -> impl Iterator<Item = &str> {
         self.feeds.keys().map(String::as_str)
     }
 
-    /// Fetch one feed by symbol, staleness-check it, insert into the
-    /// cache, return the parsed reading.
+    fn max_age_for(&self, symbol: &str) -> Duration {
+        self.per_symbol_max_age
+            .get(symbol)
+            .copied()
+            .unwrap_or(self.default_max_age)
+    }
+
+    /// Fetch one feed by symbol, validate round completeness and
+    /// freshness, insert into the cache, return the parsed reading.
     pub async fn refresh(&self, symbol: &str) -> Result<CachedPrice> {
         let feed = self
             .feeds
@@ -115,9 +156,8 @@ impl PriceCache {
             .await
             .with_context(|| format!("feed '{symbol}' ({feed}): latestRoundData() failed"))?;
 
-        // Chainlink returns `int256`; a negative answer means "feed
-        // degraded" on most aggregators. Reject it rather than silently
-        // coercing — an underflow here would be a big mispricing.
+        // Reject negative answers: most aggregators emit negative on
+        // degraded state; coercing to U256 would produce a huge number.
         let raw_answer = round.answer;
         let price = if raw_answer < I256::ZERO {
             anyhow::bail!("feed '{symbol}' returned negative answer: {raw_answer}");
@@ -126,25 +166,36 @@ impl PriceCache {
                 .with_context(|| format!("feed '{symbol}': answer {raw_answer} → U256"))?
         };
 
+        // Round-completeness: answeredInRound < roundId ⇒ current round
+        // has not finished aggregating. The returned answer is the
+        // previous round's value; reject to avoid stale pricing passed
+        // off as fresh updatedAt.
+        if round.answeredInRound < round.roundId {
+            anyhow::bail!(
+                "feed '{symbol}': round not complete (answeredInRound={}, roundId={})",
+                round.answeredInRound,
+                round.roundId
+            );
+        }
+
         let updated_at: u64 = round.updatedAt.try_into().with_context(|| {
             format!(
                 "feed '{symbol}': updatedAt {:?} does not fit in u64",
                 round.updatedAt
             )
         })?;
+        if updated_at == 0 {
+            anyhow::bail!("feed '{symbol}': updatedAt=0, aggregator is uninitialized");
+        }
 
-        let now = unix_now();
-        if updated_at + self.max_age.as_secs() < now {
-            warn!(
-                symbol,
-                %feed, updated_at, now,
-                max_age_secs = self.max_age.as_secs(),
-                "chainlink feed is stale"
-            );
+        let now = unix_now().context("system clock unavailable, cannot judge freshness")?;
+        let max_age = self.max_age_for(symbol);
+        let age = now.saturating_sub(updated_at);
+        if age > max_age.as_secs() {
             anyhow::bail!(
                 "feed '{symbol}' is stale (updated {} s ago, max_age {} s)",
-                now.saturating_sub(updated_at),
-                self.max_age.as_secs()
+                age,
+                max_age.as_secs()
             );
         }
 
@@ -158,7 +209,7 @@ impl PriceCache {
             symbol,
             price = %cached.price,
             decimals,
-            age_secs = now.saturating_sub(updated_at),
+            age_secs = age,
             "chainlink price refreshed"
         );
         self.cache.insert(symbol.to_string(), cached.clone());
@@ -166,8 +217,7 @@ impl PriceCache {
     }
 
     /// Refresh every configured feed. Individual failures are logged
-    /// and do not abort the batch — one dark feed shouldn't block
-    /// other scans.
+    /// and do not abort the batch.
     pub async fn refresh_all(&self) {
         for symbol in self.feeds.keys() {
             if let Err(err) = self.refresh(symbol).await {
@@ -176,32 +226,40 @@ impl PriceCache {
         }
     }
 
-    /// Return the most recently cached price, provided it is still
-    /// fresh against `max_age`. Stale entries yield `None`.
+    /// Return the most recently cached price iff it is still fresh.
+    /// Stale entries, entries from an uninitialized feed, or an
+    /// unusable system clock all yield `None`.
     pub fn get(&self, symbol: &str) -> Option<CachedPrice> {
         let entry = self.cache.get(symbol)?;
-        if self.is_fresh(&entry) {
+        if self.is_fresh(symbol, &entry) {
             Some(entry.clone())
         } else {
             None
         }
     }
 
-    /// Freshness predicate — exposed for tests and for callers that
-    /// already hold a `CachedPrice` (e.g. after `refresh`).
-    pub fn is_fresh(&self, cached: &CachedPrice) -> bool {
-        let now = unix_now();
-        cached.updated_at + self.max_age.as_secs() >= now
+    /// Freshness predicate. Returns `false` if the system clock fails;
+    /// better to treat stale as stale than to serve old prices to the
+    /// liquidation path.
+    pub fn is_fresh(&self, symbol: &str, cached: &CachedPrice) -> bool {
+        match unix_now() {
+            Ok(now) => {
+                let max_age = self.max_age_for(symbol);
+                cached.updated_at + max_age.as_secs() >= now
+            }
+            Err(_) => false,
+        }
     }
 }
 
-/// Unix seconds since epoch. Returns 0 on the (impossible) clock-skew
-/// case rather than panicking.
-fn unix_now() -> u64 {
-    SystemTime::now()
+/// Unix seconds since epoch. Errors on clock skew / pre-epoch so callers
+/// can treat the failure distinctly (e.g. treat all cache entries as
+/// stale rather than silently serve any entry because `now = 0`).
+fn unix_now() -> Result<u64> {
+    let d = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
+        .context("system clock is before UNIX_EPOCH")?;
+    Ok(d.as_secs())
 }
 
 #[cfg(test)]
@@ -219,38 +277,21 @@ mod tests {
     }
 
     #[test]
-    fn is_fresh_accepts_recent_and_rejects_old() {
-        // Provider is never touched in this test — use a dummy via
-        // `ProviderBuilder::new().on_anvil_with_wallet_and_config(...)`
-        // would be overkill. Build an empty cache another way:
-        // construct via a cheap `MaybeUninit`-free path using `new()`
-        // with a real but unconnected provider is not trivial, so this
-        // test focuses purely on the pure `is_fresh` arithmetic by
-        // calling it through a cache we build with a *minimal* stub.
-        //
-        // We work around by skipping construction and exercising
-        // `is_fresh` via a free helper: expose freshness as a pure fn.
-        let max_age = Duration::from_secs(600);
-        let now = unix_now();
-
-        let fresh = CachedPrice {
-            price: U256::from(1u64),
+    fn scaled_to_up_and_down() {
+        // 300.00000000 in 8 decimals.
+        let p = CachedPrice {
+            price: U256::from(300_00000000u64),
             decimals: 8,
-            updated_at: now.saturating_sub(30),
-            fetched_at: now,
+            updated_at: 1,
+            fetched_at: 1,
         };
-        let stale = CachedPrice {
-            price: U256::from(1u64),
-            decimals: 8,
-            updated_at: now.saturating_sub(601),
-            fetched_at: now,
-        };
-
-        // Inline `is_fresh` semantics mirror the struct method — kept
-        // identical in the production path.
-        let ok = |c: &CachedPrice| c.updated_at + max_age.as_secs() >= now;
-        assert!(ok(&fresh));
-        assert!(!ok(&stale));
+        // 300 * 1e18 when scaled to 18 decimals.
+        assert_eq!(
+            p.scaled_to(18),
+            U256::from(300u64) * U256::from(10u64).pow(U256::from(18u64))
+        );
+        // 300 (no decimals) when scaled down.
+        assert_eq!(p.scaled_to(0), U256::from(300u64));
     }
 
     #[test]

@@ -15,8 +15,10 @@ pub mod nonce;
 pub mod simulation;
 pub mod submit;
 
-pub use builder::{ICharonLiquidator, TxBuilder};
-pub use gas::{GasOracle, GasParams, gas_cost_usd_cents};
-pub use nonce::NonceManager;
-pub use simulation::Simulator;
+pub use builder::{BuilderError, ICharonLiquidator, TxBuilder};
+pub use gas::{
+    CHAINLINK_DECIMALS, GasDecision, GasError, GasOracle, GasParams, gas_cost_usd_cents,
+};
+pub use nonce::{NonceError, NonceManager};
+pub use simulation::{SimulationError, Simulator};
 pub use submit::{DEFAULT_SUBMIT_TIMEOUT, SubmitError, Submitter};
