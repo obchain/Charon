@@ -1,14 +1,15 @@
 //! Flash-loan router.
 //!
 //! Walks configured [`FlashLoanProvider`]s in ascending fee-rate order
-//! (Balancer 0% -> Aave 0.05% -> Uniswap pool fee). Returns the first
+//! (Aave V3 0.05% -> PancakeSwap V3 pool fee tier). Returns the first
 //! source that can cover the requested borrow. If none can, returns
 //! `None` — the caller skips the liquidation rather than sourcing
 //! capital from elsewhere.
 //!
-//! Single-source-on-BSC today means Aave V3 is the only entry in the
-//! provider list; the abstraction is here so adding Balancer / Uniswap
-//! on a second chain is a config change, not a refactor.
+//! BSC-only for v0.1: the two entries are Aave V3 (`flashLoanSimple`,
+//! 5 bps) and PancakeSwap V3 (flash-swap, pool-tier fee). The provider
+//! list is built from config so onboarding additional sources or chains
+//! is a config change, not a refactor.
 
 use std::sync::Arc;
 
@@ -192,66 +193,70 @@ mod tests {
 
     #[tokio::test]
     async fn picks_cheapest_source_with_sufficient_liquidity() {
-        let balancer = Arc::new(StubProvider {
-            source: FlashLoanSource::BalancerV2,
-            fee_rate_millionths: 0,
-            liquidity: U256::from(1_000u64),
-            chain: 56,
-        });
+        // Cheaper source: Aave V3 at 5 bps (500 millionths).
         let aave = Arc::new(StubProvider {
             source: FlashLoanSource::AaveV3,
             fee_rate_millionths: 500,
+            liquidity: U256::from(1_000u64),
+            chain: 56,
+        });
+        // Pricier source: PancakeSwap V3 at the 25 bps pool tier (2500 millionths).
+        let pancake = Arc::new(StubProvider {
+            source: FlashLoanSource::PancakeSwapV3,
+            fee_rate_millionths: 2500,
             liquidity: U256::from(1_000_000u64),
             chain: 56,
         });
 
         // Pass them in reverse order; router should sort internally.
-        let router = FlashLoanRouter::new(vec![aave, balancer]);
-        let quote = router
-            .route(token(), U256::from(500u64))
-            .await
-            .expect("route");
-        assert_eq!(quote.source, FlashLoanSource::BalancerV2);
-        assert_eq!(quote.fee_rate_millionths, 0);
-    }
-
-    #[tokio::test]
-    async fn falls_through_to_next_source_when_cheaper_has_no_liquidity() {
-        let balancer = Arc::new(StubProvider {
-            source: FlashLoanSource::BalancerV2,
-            fee_rate_millionths: 0,
-            liquidity: U256::from(10u64), // too small
-            chain: 56,
-        });
-        let aave = Arc::new(StubProvider {
-            source: FlashLoanSource::AaveV3,
-            fee_rate_millionths: 500,
-            liquidity: U256::from(1_000_000u64),
-            chain: 56,
-        });
-        let router = FlashLoanRouter::new(vec![balancer, aave]);
+        let router = FlashLoanRouter::new(vec![pancake, aave]);
         let quote = router
             .route(token(), U256::from(500u64))
             .await
             .expect("route");
         assert_eq!(quote.source, FlashLoanSource::AaveV3);
+        assert_eq!(quote.fee_rate_millionths, 500);
+    }
+
+    #[tokio::test]
+    async fn falls_through_to_next_source_when_cheaper_has_no_liquidity() {
+        // Cheaper source (Aave at 5 bps) cannot cover the ask.
+        let aave = Arc::new(StubProvider {
+            source: FlashLoanSource::AaveV3,
+            fee_rate_millionths: 500,
+            liquidity: U256::from(10u64), // too small
+            chain: 56,
+        });
+        // Pricier fallback (PancakeSwap V3 at 25 bps) has deep liquidity.
+        let pancake = Arc::new(StubProvider {
+            source: FlashLoanSource::PancakeSwapV3,
+            fee_rate_millionths: 2500,
+            liquidity: U256::from(1_000_000u64),
+            chain: 56,
+        });
+        let router = FlashLoanRouter::new(vec![aave, pancake]);
+        let quote = router
+            .route(token(), U256::from(500u64))
+            .await
+            .expect("route");
+        assert_eq!(quote.source, FlashLoanSource::PancakeSwapV3);
     }
 
     #[tokio::test]
     async fn returns_none_when_no_source_has_liquidity() {
-        let balancer = Arc::new(StubProvider {
-            source: FlashLoanSource::BalancerV2,
-            fee_rate_millionths: 0,
-            liquidity: U256::ZERO,
-            chain: 56,
-        });
         let aave = Arc::new(StubProvider {
             source: FlashLoanSource::AaveV3,
             fee_rate_millionths: 500,
+            liquidity: U256::ZERO,
+            chain: 56,
+        });
+        let pancake = Arc::new(StubProvider {
+            source: FlashLoanSource::PancakeSwapV3,
+            fee_rate_millionths: 2500,
             liquidity: U256::from(100u64),
             chain: 56,
         });
-        let router = FlashLoanRouter::new(vec![balancer, aave]);
+        let router = FlashLoanRouter::new(vec![aave, pancake]);
         assert!(router.route(token(), U256::from(10_000u64)).await.is_none());
     }
 
@@ -272,13 +277,13 @@ mod tests {
             chain: 56,
         });
         let deep = Arc::new(StubProvider {
-            source: FlashLoanSource::UniswapV3,
+            source: FlashLoanSource::PancakeSwapV3,
             fee_rate_millionths: 500,
             liquidity: U256::from(1_000_000u64),
             chain: 56,
         });
         let router = FlashLoanRouter::with_liquidity_tiebreaker(vec![shallow, deep], token()).await;
-        assert_eq!(router.providers()[0].source(), FlashLoanSource::UniswapV3);
+        assert_eq!(router.providers()[0].source(), FlashLoanSource::PancakeSwapV3);
         assert_eq!(router.providers()[1].source(), FlashLoanSource::AaveV3);
     }
 }
