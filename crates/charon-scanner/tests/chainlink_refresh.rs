@@ -36,7 +36,7 @@ async fn refresh_pulls_live_bnb_usd_price() {
     let price = cache.refresh("BNB").await.expect("refresh BNB");
     assert!(price.price > U256::ZERO, "BNB price should be positive");
     assert!(price.decimals >= 6, "Chainlink decimals are typically 8");
-    assert!(cache.is_fresh(&price));
+    assert!(cache.is_fresh("BNB", &price));
 
     let cached = cache.get("BNB").expect("cached after refresh");
     assert_eq!(cached.price, price.price);

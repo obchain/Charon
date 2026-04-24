@@ -4,16 +4,27 @@
 # load time — see `.env.example` for the full list of expected vars.
 
 [bot]
-# Drop opportunities below this USD profit threshold.
-min_profit_usd   = 5.0
-# Skip liquidations when gas price exceeds this (gwei).
-max_gas_gwei     = 10
+# Drop opportunities below this USD profit threshold, in USD × 1e6.
+# 5_000_000 = $5.00. Integer fixed-point to avoid f64 precision.
+min_profit_usd_1e6 = 5000000
+# Skip liquidations when gas price exceeds this, in wei (decimal string).
+# "3000000000" = 3 gwei. Sub-gwei priority fees are representable.
+max_gas_wei = "3000000000"
 # Polling cadence for protocols without push events (ms).
 scan_interval_ms = 1000
-# Health factor at or below which a position is liquidatable (1e18 = 1.0).
-liquidatable_threshold = 1.0
-# Upper bound of the near-liquidation watch band.
-near_liq_threshold     = 1.05
+# Health-factor band (bps of 1e18): liquidatable ≤ 10_000, near-liq window
+# up to `near_liq_threshold_bps`. Omitted keys fall back to serde defaults:
+#   liquidatable_threshold_bps = 10000  (HF = 1.00)
+#   near_liq_threshold_bps     = 10500  (HF = 1.05)
+# Scan cadences per bucket (blocks): defaults hot=1 / warm=10 / cold=100.
+#   hot_scan_blocks  = 1
+#   warm_scan_blocks = 10
+#   cold_scan_blocks = 100
+# Hot-wallet signer private key (hex, optional). Sourced from the
+# `${CHARON_SIGNER_KEY}` env var — empty/unset puts the bot in
+# scan-only mode: no tx signing, no simulation, nothing gets enqueued.
+# Never commit a literal key here; see `.env.example` for the env var.
+signer_key = "${CHARON_SIGNER_KEY:-}"
 
 # ── Chains ────────────────────────────────────────────────────────────────
 [chain.bnb]
@@ -22,10 +33,19 @@ ws_url             = "${BNB_WS_URL}"
 http_url           = "${BNB_HTTP_URL}"
 # Validator-friendly tip on BSC; raise during congestion.
 priority_fee_gwei  = 1
-# Optional private-RPC endpoint (bloxroute / blocknative). When set,
-# tx submission bypasses the public mempool. Leave unset to fall back
-# to `http_url`.
-private_rpc_url    = "${BSC_PRIVATE_RPC_URL}"
+# Private-RPC endpoint (bloxroute / blocknative). Required for any
+# chain that has a deployed liquidator — Config::validate refuses to
+# start otherwise. Leave the env var unset only on testnet / dev
+# runs where `allow_public_mempool = true` is also set below.
+private_rpc_url    = "${CHARON_BSC_PRIVATE_RPC_URL}"
+# Optional bearer token attached as `Authorization: Bearer <token>`
+# to every private-RPC request. Use when the vendor prefers a header
+# over a URL-embedded API key. Unset = no Authorization header.
+private_rpc_auth   = "${CHARON_BSC_PRIVATE_RPC_AUTH}"
+# Escape hatch for local anvil / testnet runs with no private RPC.
+# NEVER enable on mainnet — submitting liquidation calldata to the
+# public mempool is a guaranteed front-run.
+allow_public_mempool = false
 
 # ── Lending protocols ─────────────────────────────────────────────────────
 [protocol.venus]
@@ -38,12 +58,13 @@ comptroller = "0xfd36e2c2a6789db23113685031d7f16329158384"
 chain = "bnb"
 # Aave V3 Pool on BSC (used for flashLoanSimple — 0.05% fee)
 pool  = "0x6807dc923806fe8fd134338eabca509979a7e0cb"
+# Aave V3 PoolDataProvider on BSC — resolves aTokens and reserve
+# configuration bitmaps (paused / frozen flags) for the adapter.
+data_provider = "0x41393e5e337606dc3821075Af65AeE84D7688CBD"
 
 # ── Deployed liquidator contracts ─────────────────────────────────────────
-[liquidator.bnb]
-chain            = "bnb"
-# Placeholder — replaced once CharonLiquidator.sol is deployed on BSC.
-contract_address = "0x0000000000000000000000000000000000000000"
+# Populated once CharonLiquidator.sol is deployed on BSC mainnet. Do not
+# add a zero-address placeholder — config validation rejects it.
 
 # ── Prometheus metrics exporter ───────────────────────────────────────────
 # Exposes `/metrics` in Prometheus text format for Grafana / Grafana
@@ -71,7 +92,7 @@ bind       = "127.0.0.1:9091"
 # Venus markets become relevant. Feed addresses from docs.chain.link.
 [chainlink.bnb]
 BNB  = "0x0567F2323251f0Aab15c8dFb1967E4e8A7D42aeE"
-BTCB = "0x264990fbd0A4796A3E3d8E37C4d5F87a3aCa5Ebf"
+BTCB = "0x264990fbd0A4796A3E3d8E37022BdAf1A5a4C1f0" # BTC / USD (canonical, docs.chain.link)
 ETH  = "0x9ef1B8c0E4F7dc8bF5719Ea496883DC6401d5b2e"
 USDT = "0xB97Ad0E74fa7d920791E90258A6E2085088b4320"
 USDC = "0x51597f405303C4377E36123cBc172b13269EA163"
