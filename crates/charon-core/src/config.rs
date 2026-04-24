@@ -1,4 +1,6 @@
-//! TOML config loader with `${ENV_VAR}` substitution for secrets.
+//! TOML config loader with `${ENV_VAR}` / `${ENV_VAR:-default}` substitution
+//! for secrets, structured error variants, secret redaction in `Debug`, and
+//! cross-reference validation.
 //!
 //! Usage:
 //! ```no_run
@@ -6,83 +8,57 @@
 //! let cfg = Config::load("config/default.toml").unwrap();
 //! ```
 
-use alloy::primitives::Address;
+use alloy::primitives::{Address, U256};
+use secrecy::SecretString;
 use serde::Deserialize;
 use std::collections::HashMap;
+use std::fmt;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use thiserror::Error;
 
-/// Typed errors returned by [`Config::load`] and [`Config::validate`].
+/// Structured error returned by `Config::load` / `Config::from_str`.
 ///
-/// Replaces the previous `anyhow::Error` surface so the CLI can
-/// pattern-match on the failure mode and render actionable recovery
-/// hints instead of a flat chain string. Every variant carries the
-/// config path (when known) and the specific fields needed to debug
-/// the issue without re-reading the file. `#[non_exhaustive]` so new
-/// variants can land without a semver bump.
-#[derive(Debug, Error)]
+/// Callers match on the variant to choose exit code or remediation.
+#[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum ConfigError {
-    /// The config file could not be read (missing, unreadable, EIO).
-    #[error("failed to read config file {}: {source}", path.display())]
-    FileRead {
-        /// Absolute or caller-supplied path the loader tried to open.
+    #[error("config file not found: {0}")]
+    NotFound(PathBuf),
+    #[error("io error reading {path}: {source}")]
+    Io {
         path: PathBuf,
-        /// Underlying OS error.
         #[source]
         source: std::io::Error,
     },
-
-    /// A `${NAME}` placeholder referenced an environment variable that
-    /// is not set at load time.
-    #[error("env var `{var}` is not set (referenced in config at {})", path.display())]
-    EnvVarMissing {
-        /// Name of the missing environment variable.
-        var: String,
-        /// Path of the config file that contained the reference.
-        path: PathBuf,
-    },
-
-    /// A `${` was opened but never closed by a matching `}`.
-    #[error("unterminated `${{` placeholder in config {}", path.display())]
-    UnterminatedPlaceholder {
-        /// Path of the offending config file.
-        path: PathBuf,
-    },
-
-    /// TOML parse failure after substitution. Wraps the `toml` crate's
-    /// error so the caller keeps line/column diagnostics.
-    #[error("failed to parse TOML at {}: {source}", path.display())]
-    TomlParse {
-        /// Path of the config file that failed to parse.
-        path: PathBuf,
-        /// Underlying parse error.
-        #[source]
-        source: toml::de::Error,
-    },
-
-    /// [`Config::validate`] found a chain that supplies exactly one
-    /// side of the flashloan/liquidator pair. See the rustdoc on
-    /// `validate` for why that's rejected.
+    #[error("env var `{0}` not set")]
+    UnsetEnvVar(String),
+    #[error("invalid env var name `{0}` — must match [A-Z_][A-Z0-9_]*")]
+    InvalidEnvVarName(String),
+    #[error("unterminated `${{` in config")]
+    UnterminatedInterp,
+    #[error("toml parse: {0}")]
+    Parse(#[from] toml::de::Error),
+    #[error("validation: {0}")]
+    Validation(String),
+    /// A chain has no `private_rpc_url` and did not opt in to
+    /// public-mempool submission via `allow_public_mempool = true`.
+    /// Refusing to start is deliberate: broadcasting liquidation
+    /// calldata to the public mempool is a guaranteed front-run.
     #[error(
-        "half-wired config: chain '{chain}' has {present} but not {missing}"
+        "chain '{chain}' has no private_rpc_url; set one, or set allow_public_mempool = true to opt in (testnet/dev only)"
     )]
-    HalfWired {
-        /// Chain short name pulled from the inner `chain` field.
+    PrivateRpcRequired {
+        /// Chain key (matches a `[chain.<name>]` section).
         chain: String,
-        /// Section present in the config.
-        present: &'static str,
-        /// Section absent from the config.
-        missing: &'static str,
     },
 }
 
-/// Convenience alias for `Result<T, ConfigError>` used throughout this module.
-pub type Result<T, E = ConfigError> = std::result::Result<T, E>;
+/// Shorthand `Result`.
+pub type Result<T> = std::result::Result<T, ConfigError>;
 
 /// Top-level Charon config loaded from `config/default.toml`.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Config {
     pub bot: BotConfig,
     /// Chains keyed by short name (e.g. `"bnb"`).
@@ -90,16 +66,24 @@ pub struct Config {
     /// Lending protocols keyed by short name (e.g. `"venus"`).
     pub protocol: HashMap<String, ProtocolConfig>,
     /// Flash-loan sources keyed by short name (e.g. `"aave_v3_bsc"`).
-    /// Optional so profiles targeting chains without a deployed
+    ///
+    /// `#[serde(default)]` so profiles targeting chains with no
     /// flash-loan venue (e.g. BSC testnet / Chapel, where Aave V3 is
-    /// not live) can omit the section entirely. Missing map ⇒ bot runs
-    /// read-only: block listener + scanner populate, but the executor
-    /// path short-circuits because no opportunity can be routed.
+    /// not deployed) can omit the section entirely. When empty, the
+    /// off-chain pipeline short-circuits at the router gate: the
+    /// scanner still runs, but no opportunity is enqueued because
+    /// [`FlashLoanRouter::route`] has no source to quote. Mainnet
+    /// profiles continue to populate this section in the usual way;
+    /// the default does not relax any mainnet invariant.
     #[serde(default)]
     pub flashloan: HashMap<String, FlashLoanConfig>,
-    /// Deployed liquidator contracts keyed by chain name. Optional for
-    /// the same reason as `flashloan` — testnet profiles have no
-    /// liquidator deployed yet.
+    /// Deployed liquidator contracts keyed by chain name.
+    ///
+    /// `#[serde(default)]` so profiles without a deployed liquidator
+    /// (testnet, or mainnet pre-deploy) can omit the section without
+    /// wedging the loader. Absence forces read-only mode: the CLI
+    /// refuses to build a `TxBuilder` because it has no receiver
+    /// address, so no calldata is signed or simulated.
     #[serde(default)]
     pub liquidator: HashMap<String, LiquidatorConfig>,
     /// Chainlink feed addresses per chain, keyed by asset symbol
@@ -115,23 +99,66 @@ pub struct Config {
 
 /// Prometheus exporter configuration.
 ///
-/// `deny_unknown_fields` guards against TOML field-level typos. Every
-/// field has a serde default, so `bnd = "..."` instead of `bind`
-/// would otherwise silently load the default and the operator would
-/// wonder why their override didn't take. See [`FlashLoanConfig`] for
-/// the full rationale behind this class of hardening.
+/// `#[serde(deny_unknown_fields)]` makes typos in
+/// `config/default.toml` a hard load-time error — a stray
+/// `metrics.bindd = …` used to be silently ignored, leaving the
+/// exporter on its default loopback bind while the operator
+/// assumed the override took effect. `#[non_exhaustive]` reserves
+/// room to add fields (e.g. TLS, scrape-path override) without a
+/// breaking semver bump; external callers must construct via
+/// [`MetricsConfig::default`] and mutate the fields they care
+/// about rather than using a struct literal.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[non_exhaustive]
 pub struct MetricsConfig {
     /// Start the exporter at bot startup. Set to `false` to run charon
     /// with zero metrics overhead (e.g. one-shot debug runs).
     #[serde(default = "default_metrics_enabled")]
     pub enabled: bool,
-    /// Bind address for the `/metrics` HTTP listener. `0.0.0.0:9091`
-    /// keeps it off the Prometheus-server default port (`9090`) so a
-    /// local compose stack doesn't collide.
+    /// Bind address for the `/metrics` HTTP listener. Defaults to
+    /// `127.0.0.1:9091` so the endpoint is unreachable from the public
+    /// internet on a bare VPS. Non-loopback binds must pair with a
+    /// `auth_token` (enforced by [`MetricsConfig::validate`]).
     #[serde(default = "default_metrics_bind")]
     pub bind: SocketAddr,
+    /// Shared secret expected on `Authorization: Bearer <token>` when
+    /// the exporter is reached over a non-loopback bind. The exporter
+    /// itself does not yet terminate auth — the token is enforced by
+    /// the reverse proxy (nginx, caddy, etc.) that sits in front of
+    /// `bind`. Holding the value in config makes the proxy + bot share
+    /// one source of truth.
+    #[serde(default)]
+    pub auth_token: Option<String>,
+}
+
+impl MetricsConfig {
+    /// Refuse to start when the exporter is bound to a non-loopback
+    /// address without an accompanying `auth_token`. Stops silent
+    /// deployment of an unauthenticated `/metrics` endpoint to any
+    /// caller with network reach — see tracking issues #213 #214.
+    pub fn validate(&self) -> Result<()> {
+        if !self.enabled {
+            return Ok(());
+        }
+        let ip = self.bind.ip();
+        if !ip.is_loopback()
+            && self
+                .auth_token
+                .as_deref()
+                .map(str::is_empty)
+                .unwrap_or(true)
+        {
+            return Err(ConfigError::Validation(format!(
+                "metrics.bind {} is non-loopback but metrics.auth_token is empty — \
+                 either bind to 127.0.0.1 (scrape via reverse proxy / VPN) or set \
+                 CHARON_METRICS_AUTH_TOKEN and front the exporter with a proxy that \
+                 enforces Authorization: Bearer on /metrics",
+                self.bind
+            )));
+        }
+        Ok(())
+    }
 }
 
 impl Default for MetricsConfig {
@@ -139,6 +166,7 @@ impl Default for MetricsConfig {
         Self {
             enabled: default_metrics_enabled(),
             bind: default_metrics_bind(),
+            auth_token: None,
         }
     }
 }
@@ -148,93 +176,214 @@ fn default_metrics_enabled() -> bool {
 }
 
 fn default_metrics_bind() -> SocketAddr {
-    "0.0.0.0:9091".parse().expect("valid default metrics bind")
+    "127.0.0.1:9091"
+        .parse()
+        .expect("valid default metrics bind")
+}
+
+impl fmt::Debug for Config {
+    // Redact the contents of `chain` — it carries full RPC URLs with API keys.
+    // Everything else is scalar thresholds and public addresses, safe to print.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Config")
+            .field("bot", &self.bot)
+            .field("chain", &ChainCount(self.chain.len()))
+            .field("protocol", &self.protocol)
+            .field("flashloan", &self.flashloan)
+            .field("liquidator", &self.liquidator)
+            .finish()
+    }
+}
+
+struct ChainCount(usize);
+impl fmt::Debug for ChainCount {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "<{} chains redacted>", self.0)
+    }
 }
 
 /// Bot-level knobs — thresholds and intervals.
 ///
-/// `deny_unknown_fields` guards against TOML field-level typos.
-/// Several fields (`chain`, `liquidatable_threshold`,
-/// `near_liq_threshold`) are `#[serde(default)]`, so a misspelling
-/// like `liquidatable_threshhold = 0.95` would otherwise silently
-/// keep the default and mis-tune the scanner. See [`FlashLoanConfig`]
-/// for the full rationale.
-#[derive(Debug, Clone, Deserialize)]
+/// Money values are stored as integers to avoid f64 precision and NaN hazards.
+///
+/// `signer_key` is the only field whose *value* is a secret. It is stored
+/// in a [`SecretString`] so the raw hex is never materialised in `Debug`
+/// output; the raw bytes are exposed only at the signing site, via
+/// `expose_secret()`. A hand-written `Debug` impl is provided below so the
+/// field is rendered as `<redacted>` / `<unset>` instead of relying on
+/// `secrecy`'s default `Secret(...)` rendering — any future change that
+/// would expose the key therefore has to first delete a visible redaction
+/// marker in source.
+#[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BotConfig {
-    /// Key into `[chain.*]` naming the active chain for this profile
-    /// (e.g. `"bnb"` for mainnet, `"bnb_testnet"` for Chapel). The CLI
-    /// `listen` command resolves every chain-scoped lookup (RPC,
-    /// flashloan, liquidator, chainlink feeds) through this key so a
-    /// profile that uses a non-mainnet key does not panic on a
-    /// hard-coded `"bnb"` lookup. Defaults to `"bnb"` for backwards
-    /// compatibility with the v0.1 mainnet profile.
-    #[serde(default = "default_bot_chain")]
-    pub chain: String,
-    /// Drop opportunities below this USD profit threshold.
-    pub min_profit_usd: f64,
-    /// Skip liquidations when gas price exceeds this (gwei).
-    pub max_gas_gwei: u64,
+    /// Minimum profit threshold in USD × 1e6 (six decimals of USD).
+    /// A value of `5_000_000` means `$5.00`. Fixed-point over f64 so
+    /// comparisons against oracle-denominated profit are deterministic.
+    pub min_profit_usd_1e6: u64,
+    /// Maximum acceptable gas price, in wei (decimal string or integer).
+    /// Stored as U256 so sub-gwei priority fees are representable and
+    /// EIP-1559 math stays exact.
+    #[serde(deserialize_with = "deser_u256_string")]
+    pub max_gas_wei: U256,
     /// Polling interval for protocols that don't push events.
     pub scan_interval_ms: u64,
-    /// Health factor at or below which a position becomes liquidatable.
-    /// Stored as a float for readability (e.g. `1.0`); the scanner
-    /// scales it to a 1e18-fixed `U256` internally.
-    #[serde(default = "default_liquidatable_threshold")]
-    pub liquidatable_threshold: f64,
-    /// Upper bound of the near-liquidation watch band. Positions in
-    /// `[liquidatable_threshold, near_liq_threshold)` are pre-cached so
-    /// the bot can fire immediately on the next adverse price move.
-    #[serde(default = "default_near_liq_threshold")]
-    pub near_liq_threshold: f64,
+    /// Health factor at or below which a position becomes liquidatable,
+    /// in basis points of 1e18 (10_000 = 1.0). Integer bps over f64 so
+    /// the boundary has no ULP-level drift (1.05 as f64 truncates to
+    /// 1_049_999_999_999_999_872 in 1e18 scale and silently leaks
+    /// positions out of the NearLiquidation bucket).
+    #[serde(default = "default_liquidatable_threshold_bps")]
+    pub liquidatable_threshold_bps: u32,
+    /// Upper bound of the near-liquidation watch band, same bps space.
+    #[serde(default = "default_near_liq_threshold_bps")]
+    pub near_liq_threshold_bps: u32,
+    /// HOT (Liquidatable) bucket scan cadence, in blocks. Default 1.
+    #[serde(default = "default_hot_scan_blocks")]
+    pub hot_scan_blocks: u64,
+    /// WARM (NearLiquidation) bucket scan cadence. Default every 10 blocks.
+    #[serde(default = "default_warm_scan_blocks")]
+    pub warm_scan_blocks: u64,
+    /// COLD (Healthy) bucket scan cadence. Default every 100 blocks.
+    #[serde(default = "default_cold_scan_blocks")]
+    pub cold_scan_blocks: u64,
+    /// Hot-wallet signer key, fed in via `${CHARON_SIGNER_KEY}` env
+    /// substitution in `config/default.toml`. Held in a
+    /// [`SecretString`] so the raw hex never reaches `Debug` output or
+    /// log lines — `expose_secret()` is called only at the signing
+    /// site in the CLI pipeline, never stored back.
+    ///
+    /// An empty or missing value puts the bot in **scan-only** mode:
+    /// the CLI pipeline refuses to build / simulate / enqueue anything
+    /// that would require a signature (the simulation gate is hard —
+    /// no signer → no enqueue, ever). Production runs must supply a
+    /// non-empty value via the env var, never a literal in the file.
+    #[serde(default, deserialize_with = "deser_optional_secret")]
+    pub signer_key: Option<SecretString>,
 }
 
-fn default_bot_chain() -> String {
-    "bnb".to_string()
+impl fmt::Debug for BotConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("BotConfig")
+            .field("min_profit_usd_1e6", &self.min_profit_usd_1e6)
+            .field("max_gas_wei", &self.max_gas_wei)
+            .field("scan_interval_ms", &self.scan_interval_ms)
+            .field("liquidatable_threshold_bps", &self.liquidatable_threshold_bps)
+            .field("near_liq_threshold_bps", &self.near_liq_threshold_bps)
+            .field("hot_scan_blocks", &self.hot_scan_blocks)
+            .field("warm_scan_blocks", &self.warm_scan_blocks)
+            .field("cold_scan_blocks", &self.cold_scan_blocks)
+            .field(
+                "signer_key",
+                &if self.signer_key.is_some() {
+                    "<redacted>"
+                } else {
+                    "<unset>"
+                },
+            )
+            .finish()
+    }
 }
 
-fn default_liquidatable_threshold() -> f64 {
-    1.0
+fn default_liquidatable_threshold_bps() -> u32 {
+    10_000 // 1.0000
+}
+fn default_near_liq_threshold_bps() -> u32 {
+    10_500 // 1.0500
+}
+fn default_hot_scan_blocks() -> u64 {
+    1
+}
+fn default_warm_scan_blocks() -> u64 {
+    10
+}
+fn default_cold_scan_blocks() -> u64 {
+    100
 }
 
-fn default_near_liq_threshold() -> f64 {
-    1.05
-}
-
-/// RPC endpoints for a single chain.
+/// RPC endpoints for a single chain. **The URLs typically embed API keys;
+/// `Debug` prints `<redacted>` rather than the URL.**
 ///
-/// `deny_unknown_fields` guards against TOML field-level typos.
-/// `priority_fee_gwei` and `private_rpc_url` are `#[serde(default)]`,
-/// so a typo like `privte_rpc_url = "..."` would otherwise leave the
-/// submitter silently hitting the public mempool. See
-/// [`FlashLoanConfig`] for the full rationale.
-#[derive(Debug, Clone, Deserialize)]
+/// `priority_fee_gwei` is the EIP-1559 priority fee (tip) the gas
+/// oracle attaches per chain, expressed in gwei for operator
+/// readability. Defaults to `1` — BSC validators are fine with a
+/// 1 gwei tip; L2s running sub-gwei tips should override explicitly.
+/// The oracle converts to wei internally; mixing units silently
+/// under-filters at 1e9×.
+#[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ChainConfig {
     pub chain_id: u64,
     pub ws_url: String,
     pub http_url: String,
-    /// EIP-1559 priority fee (tip) in gwei. Per chain because BSC's
-    /// validator-friendly tip is ~1 gwei whereas L2 tips run sub-gwei.
     #[serde(default = "default_priority_fee_gwei")]
     pub priority_fee_gwei: u64,
     /// Optional private-RPC endpoint for transaction submission
     /// (bloxroute / blocknative on BSC, sequencer endpoints on L2s).
     /// When set, the submitter posts `eth_sendRawTransaction` here
-    /// instead of the public `http_url` so pending txs skip the
+    /// instead of the public `http_url`, so pending txs skip the
     /// public mempool and front-runners.
+    ///
+    /// Held in a [`SecretString`] because vendor URLs typically embed
+    /// an API key in the path (e.g. `https://.../?auth=<key>`). Call
+    /// `expose_secret()` only at the single point of use (the
+    /// submitter); never log the raw string.
+    ///
+    /// An empty env-substituted string is treated as `None`, so
+    /// `CHARON_<CHAIN>_PRIVATE_RPC_URL=` in `.env` produces an unset
+    /// endpoint (caught by validation unless `allow_public_mempool`
+    /// is set) rather than a nonsense empty-URL submitter.
+    #[serde(default, deserialize_with = "deser_optional_secret")]
+    pub private_rpc_url: Option<SecretString>,
+    /// Optional bearer token for the private RPC. Attached verbatim
+    /// as `Authorization: Bearer <token>`. Use this when the vendor
+    /// prefers a header over a URL-embedded key. Loaded from
+    /// `CHARON_<CHAIN>_PRIVATE_RPC_AUTH` via env substitution. Empty
+    /// string = unset.
+    #[serde(default, deserialize_with = "deser_optional_secret")]
+    pub private_rpc_auth: Option<SecretString>,
+    /// Escape hatch for local / testnet runs where no private RPC
+    /// exists. When `false` (the default) [`Config::validate`]
+    /// refuses to start a chain with no `private_rpc_url`, because
+    /// submitting liquidation calldata to the public mempool is a
+    /// guaranteed front-run. NEVER enable on mainnet.
     #[serde(default)]
-    pub private_rpc_url: Option<String>,
+    pub allow_public_mempool: bool,
 }
 
 fn default_priority_fee_gwei() -> u64 {
     1
 }
 
+impl fmt::Debug for ChainConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ChainConfig")
+            .field("chain_id", &self.chain_id)
+            .field("ws_url", &"<redacted>")
+            .field("http_url", &"<redacted>")
+            .field("priority_fee_gwei", &self.priority_fee_gwei)
+            .field(
+                "private_rpc_url",
+                &if self.private_rpc_url.is_some() {
+                    "<redacted>"
+                } else {
+                    "<unset>"
+                },
+            )
+            .field(
+                "private_rpc_auth",
+                &if self.private_rpc_auth.is_some() {
+                    "<redacted>"
+                } else {
+                    "<unset>"
+                },
+            )
+            .field("allow_public_mempool", &self.allow_public_mempool)
+            .finish()
+    }
+}
+
 /// Address and metadata for a lending protocol on a specific chain.
-///
-/// `deny_unknown_fields` for symmetry with the other config structs;
-/// see [`FlashLoanConfig`] for the full rationale.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProtocolConfig {
@@ -245,25 +394,21 @@ pub struct ProtocolConfig {
 }
 
 /// A flash-loan source available on a given chain.
-///
-/// `deny_unknown_fields` guards against TOML field-level typos.
-/// Both this section and `[liquidator.*]` are now `#[serde(default)]`
-/// at the [`Config`] level, so a misspelled field (e.g. `poo` instead
-/// of `pool`) would otherwise silently deserialize to a zero-address
-/// default. Rejecting unknown keys at load time makes that class of
-/// mistake a startup error rather than a silent skip at runtime.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FlashLoanConfig {
     pub chain: String,
     /// Pool / vault address (Aave V3 Pool, Balancer Vault, etc.).
     pub pool: Address,
+    /// Optional auxiliary data-provider address used by some sources
+    /// to resolve per-asset state (e.g. Aave V3 `PoolDataProvider`
+    /// for aToken lookup and reserve configuration bitmaps). `None`
+    /// for sources that don't need one (Balancer, Uniswap).
+    #[serde(default)]
+    pub data_provider: Option<Address>,
 }
 
 /// Address of the deployed `CharonLiquidator` contract on a chain.
-///
-/// `deny_unknown_fields` guards against TOML field-level typos. See
-/// [`FlashLoanConfig`] for the full rationale.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct LiquidatorConfig {
@@ -272,96 +417,327 @@ pub struct LiquidatorConfig {
 }
 
 impl Config {
-    /// Read a TOML config file, substitute `${ENV_VAR}` placeholders, parse.
-    ///
-    /// Returns an error if the file is missing, malformed, or references an
-    /// environment variable that isn't set.
+    /// Read a TOML config file, substitute `${ENV_VAR}` placeholders, parse
+    /// and validate.
     pub fn load(path: impl AsRef<Path>) -> Result<Self> {
-        let path_ref = path.as_ref();
-        let raw = std::fs::read_to_string(path_ref).map_err(|source| ConfigError::FileRead {
-            path: path_ref.to_path_buf(),
-            source,
+        let path_buf = path.as_ref().to_path_buf();
+        let raw = std::fs::read_to_string(&path_buf).map_err(|source| {
+            if source.kind() == std::io::ErrorKind::NotFound {
+                ConfigError::NotFound(path_buf.clone())
+            } else {
+                ConfigError::Io {
+                    path: path_buf.clone(),
+                    source,
+                }
+            }
         })?;
-        let substituted = substitute_env_vars(&raw, path_ref)?;
-        let config: Config =
-            toml::from_str(&substituted).map_err(|source| ConfigError::TomlParse {
-                path: path_ref.to_path_buf(),
-                source,
-            })?;
+        Self::from_str(&raw)
+    }
+
+    /// Parse an already-loaded TOML string (used by tests and embedded configs).
+    pub fn from_str(raw: &str) -> Result<Self> {
+        let substituted = substitute_env_vars(raw)?;
+        let config: Config = toml::from_str(&substituted)?;
         config.validate()?;
         Ok(config)
     }
 
-    /// Reject configurations whose liquidation path is half-wired.
+    /// Cross-reference chain keys, reject sentinel zero addresses, and
+    /// sanity-check scanner bucket thresholds + cadence. Also enforces
+    /// the private-mempool gate: every chain must either carry a
+    /// `private_rpc_url` or opt in to `allow_public_mempool`.
     ///
-    /// `flashloan` and `liquidator` are both `#[serde(default)]` so a
-    /// profile (e.g. testnet) can omit both and run in read-only mode.
-    /// A profile that supplies exactly one of the two is almost
-    /// always an accidental omission: the bot starts, every
-    /// opportunity silently short-circuits at the missing half, and
-    /// the operator sees no error. Fail fast at load time instead,
-    /// naming the offending chain so the mismatch is obvious.
-    ///
-    /// Symmetric: for every `flashloan` entry on chain X, require a
-    /// `liquidator` entry on chain X, and vice versa. All mismatches are
-    /// collected into a single error (sorted) rather than short-circuiting
-    /// on the first one, so an operator fixing a broken profile sees
-    /// every offending chain in one pass instead of running `charon` N
-    /// times to surface N problems.
+    /// Called from `from_str` on every load, and additionally exposed
+    /// for callers (CLI) that want an explicit belt-and-braces check
+    /// after any programmatic override.
     pub fn validate(&self) -> Result<()> {
-        use std::collections::BTreeSet;
-        let fl_chains: BTreeSet<&str> =
-            self.flashloan.values().map(|f| f.chain.as_str()).collect();
-        let liq_chains: BTreeSet<&str> = self
-            .liquidator
-            .values()
-            .map(|l| l.chain.as_str())
-            .collect();
-
-        // Return on the first mismatched chain we encounter. The typed
-        // variant names the offending chain plus the section that is
-        // present/missing; operators fixing multiple half-wired chains
-        // re-run once per fix, which is preferable to a catch-all
-        // string that callers cannot pattern-match on. The lexicographic
-        // order (from BTreeSet) makes the first-offender deterministic.
-        if let Some(chain) = fl_chains.difference(&liq_chains).next() {
-            return Err(ConfigError::HalfWired {
-                chain: (*chain).to_string(),
-                present: "[flashloan.*]",
-                missing: "[liquidator.*]",
-            });
+        if self.chain.is_empty() {
+            return Err(ConfigError::Validation("no [chain.*] entries".into()));
         }
-        if let Some(chain) = liq_chains.difference(&fl_chains).next() {
-            return Err(ConfigError::HalfWired {
-                chain: (*chain).to_string(),
-                present: "[liquidator.*]",
-                missing: "[flashloan.*]",
-            });
+        // Private-mempool gate: every configured chain must either carry
+        // a `private_rpc_url` or explicitly opt in to the public mempool
+        // via `allow_public_mempool = true`. Applying the check per
+        // chain (rather than only per deployed liquidator) means a
+        // misconfigured chain can never fall back to public broadcast
+        // later in the pipeline.
+        for (name, c) in &self.chain {
+            if c.private_rpc_url.is_none() && !c.allow_public_mempool {
+                return Err(ConfigError::PrivateRpcRequired {
+                    chain: name.clone(),
+                });
+            }
         }
+        if self.bot.near_liq_threshold_bps <= self.bot.liquidatable_threshold_bps {
+            return Err(ConfigError::Validation(format!(
+                "near_liq_threshold_bps ({}) must be > liquidatable_threshold_bps ({})",
+                self.bot.near_liq_threshold_bps, self.bot.liquidatable_threshold_bps
+            )));
+        }
+        if self.bot.hot_scan_blocks == 0
+            || self.bot.warm_scan_blocks == 0
+            || self.bot.cold_scan_blocks == 0
+        {
+            return Err(ConfigError::Validation(
+                "hot/warm/cold_scan_blocks must all be > 0".into(),
+            ));
+        }
+        for (name, p) in &self.protocol {
+            if !self.chain.contains_key(&p.chain) {
+                return Err(ConfigError::Validation(format!(
+                    "protocol `{name}` references unknown chain `{}`",
+                    p.chain
+                )));
+            }
+            if p.comptroller == Address::ZERO {
+                return Err(ConfigError::Validation(format!(
+                    "protocol `{name}` has zero comptroller address"
+                )));
+            }
+        }
+        for (name, f) in &self.flashloan {
+            if !self.chain.contains_key(&f.chain) {
+                return Err(ConfigError::Validation(format!(
+                    "flashloan `{name}` references unknown chain `{}`",
+                    f.chain
+                )));
+            }
+            if f.pool == Address::ZERO {
+                return Err(ConfigError::Validation(format!(
+                    "flashloan `{name}` has zero pool address"
+                )));
+            }
+        }
+        for (name, l) in &self.liquidator {
+            if !self.chain.contains_key(&l.chain) {
+                return Err(ConfigError::Validation(format!(
+                    "liquidator `{name}` references unknown chain `{}`",
+                    l.chain
+                )));
+            }
+            if l.contract_address == Address::ZERO {
+                return Err(ConfigError::Validation(format!(
+                    "liquidator `{name}` has zero contract address — deploy the contract first"
+                )));
+            }
+        }
+        // Metrics exporter: loopback binds are always safe; non-loopback
+        // binds must carry a non-empty `auth_token` so an operator
+        // never leaks an unauthenticated `/metrics` endpoint onto the
+        // public internet (see issues #213 / #214 on feat/22).
+        self.metrics.validate()?;
         Ok(())
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use alloy::primitives::address;
+fn deser_u256_string<'de, D>(d: D) -> std::result::Result<U256, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Error;
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum StringOrInt {
+        String(String),
+        Int(u128),
+    }
+    match StringOrInt::deserialize(d)? {
+        StringOrInt::String(s) => {
+            let trimmed = s.trim();
+            if let Some(hex) = trimmed.strip_prefix("0x").or_else(|| trimmed.strip_prefix("0X")) {
+                U256::from_str_radix(hex, 16).map_err(D::Error::custom)
+            } else {
+                U256::from_str_radix(trimmed, 10).map_err(D::Error::custom)
+            }
+        }
+        StringOrInt::Int(n) => Ok(U256::from(n)),
+    }
+}
 
-    fn bot() -> BotConfig {
-        BotConfig {
-            chain: "bnb".to_string(),
-            min_profit_usd: 5.0,
-            max_gas_gwei: 10,
-            scan_interval_ms: 1000,
-            liquidatable_threshold: 1.0,
-            near_liq_threshold: 1.05,
+/// Treat an empty string as "unset" and return `None`. Non-empty strings
+/// become `Some(SecretString)` so the env substitution form
+/// `${CHARON_SIGNER_KEY:-}` (env-optional secret) flows naturally from
+/// the env-var layer to the typed config without the caller having to
+/// distinguish "missing" from "explicitly empty".
+fn deser_optional_secret<'de, D>(d: D) -> std::result::Result<Option<SecretString>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let s = Option::<String>::deserialize(d)?;
+    Ok(match s {
+        Some(v) if !v.trim().is_empty() => Some(SecretString::from(v)),
+        _ => None,
+    })
+}
+
+/// Replace every `${NAME}` or `${NAME:-default}` in `input` with the value of
+/// the environment variable `NAME`. Values are escaped so that TOML-special
+/// characters (`"`, `\`, newline) inside env values cannot corrupt the parse.
+///
+/// Values are expected to be placed inside double-quoted TOML strings.
+fn substitute_env_vars(input: &str) -> Result<String> {
+    let mut output = String::with_capacity(input.len());
+    let mut rest = input;
+    while let Some(start) = rest.find("${") {
+        output.push_str(&rest[..start]);
+        let after = &rest[start + 2..];
+        let end = after
+            .find('}')
+            .ok_or(ConfigError::UnterminatedInterp)?;
+        let token = &after[..end];
+        let (var_name, default) = match token.split_once(":-") {
+            Some((name, def)) => (name, Some(def)),
+            None => (token, None),
+        };
+        if !is_valid_env_name(var_name) {
+            return Err(ConfigError::InvalidEnvVarName(var_name.to_string()));
+        }
+        let value = match std::env::var(var_name) {
+            Ok(v) => v,
+            Err(_) => match default {
+                Some(d) => d.to_string(),
+                None => return Err(ConfigError::UnsetEnvVar(var_name.to_string())),
+            },
+        };
+        for c in value.chars() {
+            match c {
+                '\\' => output.push_str("\\\\"),
+                '"' => output.push_str("\\\""),
+                '\n' => output.push_str("\\n"),
+                '\r' => output.push_str("\\r"),
+                '\t' => output.push_str("\\t"),
+                _ => output.push(c),
+            }
+        }
+        rest = &after[end + 1..];
+    }
+    output.push_str(rest);
+    Ok(output)
+}
+
+fn is_valid_env_name(s: &str) -> bool {
+    let mut chars = s.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_uppercase() || c == '_' => {}
+        _ => return false,
+    }
+    chars.all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
+}
+
+#[cfg(test)]
+mod metrics_tests {
+    //! Tests for `MetricsConfig::validate`, graft from feat/22. These
+    //! exercise the non-loopback/auth-token gate (#213 / #214) that
+    //! blocks deploy-time leaks of an unauthenticated `/metrics`
+    //! endpoint, and the `enabled = false` bypass.
+
+    use super::*;
+
+    /// Loopback bind is safe on its own — no auth token required,
+    /// because the endpoint is unreachable off-box.
+    #[test]
+    fn validate_allows_loopback_without_token() {
+        let cfg = MetricsConfig {
+            enabled: true,
+            bind: "127.0.0.1:9091".parse().expect("loopback parse"),
+            auth_token: None,
+        };
+        cfg.validate().expect("loopback + no token must pass");
+
+        let cfg_v6 = MetricsConfig {
+            enabled: true,
+            bind: "[::1]:9091".parse().expect("loopback v6 parse"),
+            auth_token: None,
+        };
+        cfg_v6.validate().expect("IPv6 loopback must pass");
+    }
+
+    /// Non-loopback bind with a non-empty token is the documented
+    /// "front with a reverse proxy" escape hatch.
+    #[test]
+    fn validate_allows_non_loopback_with_token() {
+        let cfg = MetricsConfig {
+            enabled: true,
+            bind: "0.0.0.0:9091".parse().expect("non-loopback parse"),
+            auth_token: Some("not-a-real-token".into()),
+        };
+        cfg.validate()
+            .expect("non-loopback + token must pass (proxy enforces)");
+    }
+
+    /// Non-loopback with missing or empty token must fail — covers
+    /// both `auth_token = None` (unset in TOML) and `auth_token =
+    /// Some("")` (the nasty case where `CHARON_METRICS_AUTH_TOKEN=`
+    /// is exported empty and env substitution silently yields a
+    /// blank string). This is the regression gate for #213/#214.
+    #[test]
+    fn validate_rejects_non_loopback_without_token() {
+        let none_cfg = MetricsConfig {
+            enabled: true,
+            bind: "0.0.0.0:9091".parse().expect("non-loopback parse"),
+            auth_token: None,
+        };
+        assert!(none_cfg.validate().is_err(), "None token must fail");
+
+        let empty_cfg = MetricsConfig {
+            enabled: true,
+            bind: "0.0.0.0:9091".parse().expect("non-loopback parse"),
+            auth_token: Some(String::new()),
+        };
+        assert!(empty_cfg.validate().is_err(), "empty token must fail");
+    }
+
+    /// `enabled = false` bypasses validation: a disabled exporter
+    /// never opens a socket, so bind/token combinations are moot.
+    #[test]
+    fn validate_skipped_when_disabled() {
+        let cfg = MetricsConfig {
+            enabled: false,
+            bind: "0.0.0.0:9091".parse().expect("non-loopback parse"),
+            auth_token: None,
+        };
+        cfg.validate()
+            .expect("disabled exporter must skip bind checks");
+    }
+}
+
+#[cfg(test)]
+mod private_rpc_tests {
+    //! Tests for the private-RPC gate and secret redaction on
+    //! `ChainConfig`. These tests are isolated from the file-loading
+    //! `substitute_env_vars` path so they do not race with any other
+    //! `std::env::set_var` usage in the crate.
+
+    use super::*;
+    use secrecy::ExposeSecret;
+
+    fn chain_cfg(private_rpc: Option<&str>, allow_public: bool) -> ChainConfig {
+        ChainConfig {
+            chain_id: 56,
+            ws_url: "wss://example/ws".into(),
+            http_url: "https://example/http".into(),
+            priority_fee_gwei: 1,
+            private_rpc_url: private_rpc.map(|s| SecretString::from(s.to_string())),
+            private_rpc_auth: None,
+            allow_public_mempool: allow_public,
         }
     }
 
-    fn base_config() -> Config {
+    fn base(chain: ChainConfig) -> Config {
+        let mut chains = HashMap::new();
+        chains.insert("bnb".to_string(), chain);
         Config {
-            bot: bot(),
-            chain: HashMap::new(),
+            bot: BotConfig {
+                min_profit_usd_1e6: 5_000_000,
+                max_gas_wei: U256::from(3_000_000_000u64),
+                scan_interval_ms: 1000,
+                liquidatable_threshold_bps: 10_000,
+                near_liq_threshold_bps: 10_500,
+                hot_scan_blocks: 1,
+                warm_scan_blocks: 10,
+                cold_scan_blocks: 100,
+                signer_key: None,
+            },
+            chain: chains,
             protocol: HashMap::new(),
             flashloan: HashMap::new(),
             liquidator: HashMap::new(),
@@ -370,171 +746,74 @@ mod tests {
         }
     }
 
-    fn fl(chain: &str) -> FlashLoanConfig {
-        FlashLoanConfig {
-            chain: chain.to_string(),
-            pool: address!("6807dc923806fe8fd134338eabca509979a7e0cb"),
-        }
-    }
-
-    fn liq(chain: &str) -> LiquidatorConfig {
-        LiquidatorConfig {
-            chain: chain.to_string(),
-            contract_address: address!("0000000000000000000000000000000000000001"),
-        }
-    }
-
     #[test]
-    fn validate_passes_when_both_sides_empty() {
-        // Testnet profile: no flashloan, no liquidator ⇒ read-only OK.
-        base_config().validate().expect("fully-empty profile valid");
-    }
-
-    #[test]
-    fn validate_passes_when_both_sides_paired() {
-        let mut cfg = base_config();
-        cfg.flashloan.insert("aave_v3_bsc".into(), fl("bnb"));
-        cfg.liquidator.insert("bnb".into(), liq("bnb"));
-        cfg.validate().expect("paired profile valid");
-    }
-
-    #[test]
-    fn validate_passes_when_map_keys_differ_but_inner_chain_matches() {
-        // Map keys are labels; the inner `chain` field is what the
-        // pipeline pivots on. A profile keyed under arbitrary labels is
-        // still valid as long as the chain tags pair up.
-        let mut cfg = base_config();
-        cfg.flashloan.insert("primary_source".into(), fl("bnb"));
-        cfg.liquidator.insert("mainnet_liq".into(), liq("bnb"));
-        cfg.validate().expect("inner-chain match is sufficient");
-    }
-
-    #[test]
-    fn validate_rejects_flashloan_without_liquidator() {
-        let mut cfg = base_config();
-        cfg.flashloan.insert("aave_v3_bsc".into(), fl("bnb"));
-        let err = cfg.validate().expect_err("flashloan-only must fail");
+    fn validate_rejects_chain_without_private_rpc() {
+        let cfg = base(chain_cfg(None, false));
+        let err = cfg.validate().expect_err("must refuse public mempool");
         match err {
-            ConfigError::HalfWired { chain, present, missing } => {
-                assert_eq!(chain, "bnb");
-                assert_eq!(present, "[flashloan.*]");
-                assert_eq!(missing, "[liquidator.*]");
-            }
-            other => panic!("wrong variant: {other:?}"),
+            ConfigError::PrivateRpcRequired { chain } => assert_eq!(chain, "bnb"),
+            other => panic!("unexpected: {other:?}"),
         }
     }
 
     #[test]
-    fn validate_rejects_liquidator_without_flashloan() {
-        let mut cfg = base_config();
-        cfg.liquidator.insert("bnb".into(), liq("bnb"));
-        let err = cfg.validate().expect_err("liquidator-only must fail");
-        match err {
-            ConfigError::HalfWired { chain, present, missing } => {
-                assert_eq!(chain, "bnb");
-                assert_eq!(present, "[liquidator.*]");
-                assert_eq!(missing, "[flashloan.*]");
-            }
-            other => panic!("wrong variant: {other:?}"),
-        }
+    fn validate_allows_public_mempool_opt_in() {
+        let cfg = base(chain_cfg(None, true));
+        cfg.validate().expect("opt-in must be honoured");
     }
 
     #[test]
-    fn validate_reports_first_mismatched_chain_deterministically() {
-        // Two half-wired chains on opposite sides. `BTreeSet::difference`
-        // iterates in lexicographic order so the first variant emitted is
-        // stable across runs. Operators fix, re-run, see the next one.
-        let mut cfg = base_config();
-        cfg.flashloan.insert("src_a".into(), fl("bnb"));
-        cfg.liquidator.insert("liq_b".into(), liq("polygon"));
-        let err = cfg.validate().expect_err("two mismatches must fail");
-        match err {
-            ConfigError::HalfWired { chain, .. } => {
-                assert_eq!(chain, "bnb", "flashloan-only branch reports first");
-            }
-            other => panic!("wrong variant: {other:?}"),
-        }
+    fn validate_passes_with_private_rpc_configured() {
+        let cfg = base(chain_cfg(Some("https://private.example"), false));
+        cfg.validate().expect("private rpc present -> valid");
     }
 
     #[test]
-    fn load_reports_missing_file_as_file_read() {
-        let err = Config::load("/nonexistent/path/charon-config-missing.toml")
-            .expect_err("missing file must error");
-        assert!(matches!(err, ConfigError::FileRead { .. }));
+    fn debug_redacts_private_rpc_url_and_auth() {
+        let mut c = chain_cfg(Some("https://key.example/?auth=SUPER_SECRET_KEY"), false);
+        c.private_rpc_auth = Some(SecretString::from("SECRET_TOKEN".to_string()));
+        let dbg = format!("{c:?}");
+        assert!(
+            !dbg.contains("SUPER_SECRET_KEY"),
+            "private_rpc_url leaked: {dbg}"
+        );
+        assert!(!dbg.contains("SECRET_TOKEN"), "auth token leaked: {dbg}");
+        assert!(
+            dbg.contains("<redacted>"),
+            "redaction marker missing: {dbg}"
+        );
     }
 
     #[test]
-    fn substitute_env_vars_reports_unset_as_env_var_missing() {
-        let p = Path::new("/tmp/stub.toml");
-        // Unique var so parallel test runs don't collide with a
-        // caller's env by accident.
-        let err = substitute_env_vars(
-            "ws_url = \"${CHARON_ENV_MISSING_FOR_TESTS_9f3a2c}\"\n",
-            p,
-        )
-        .expect_err("unset env var must error");
-        match err {
-            ConfigError::EnvVarMissing { var, .. } => {
-                assert_eq!(var, "CHARON_ENV_MISSING_FOR_TESTS_9f3a2c");
-            }
-            other => panic!("wrong variant: {other:?}"),
-        }
+    fn deser_treats_empty_private_rpc_as_unset() {
+        // Simulates the env-substitution result when
+        // `CHARON_BSC_PRIVATE_RPC_URL=` is blank: the string reaches
+        // serde as `""`, which must collapse to `None` so the
+        // `PrivateRpcRequired` gate fires instead of constructing a
+        // bogus empty-URL submitter.
+        let toml_src = r#"
+            chain_id = 56
+            ws_url = "wss://x/y"
+            http_url = "https://x/y"
+            private_rpc_url = ""
+            private_rpc_auth = ""
+            allow_public_mempool = true
+        "#;
+        let c: ChainConfig = toml::from_str(toml_src).expect("parse");
+        assert!(c.private_rpc_url.is_none());
+        assert!(c.private_rpc_auth.is_none());
     }
 
     #[test]
-    fn substitute_env_vars_reports_unclosed_placeholder() {
-        let p = Path::new("/tmp/stub.toml");
-        let err = substitute_env_vars("ws_url = \"${NEVER_CLOSED\n", p)
-            .expect_err("unterminated placeholder must error");
-        assert!(matches!(err, ConfigError::UnterminatedPlaceholder { .. }));
+    fn deser_keeps_non_empty_private_rpc() {
+        let toml_src = r#"
+            chain_id = 56
+            ws_url = "wss://x/y"
+            http_url = "https://x/y"
+            private_rpc_url = "https://priv.example/rpc"
+        "#;
+        let c: ChainConfig = toml::from_str(toml_src).expect("parse");
+        let url = c.private_rpc_url.expect("url present");
+        assert_eq!(url.expose_secret(), "https://priv.example/rpc");
     }
-
-    #[test]
-    fn load_reports_bad_toml_as_toml_parse() {
-        // Write a tiny malformed file into a scratch path and load it.
-        // Using std::env::temp_dir keeps us off `tempfile` (not a dev
-        // dep on this branch) while remaining unique per-test.
-        let tmp = std::env::temp_dir().join("charon_bad_toml_9f3a2c.toml");
-        std::fs::write(&tmp, b"this is = = not toml").expect("write tmp");
-        let err = Config::load(&tmp).expect_err("bad TOML must error");
-        let _ = std::fs::remove_file(&tmp);
-        assert!(matches!(err, ConfigError::TomlParse { .. }));
-    }
-
-    #[test]
-    fn validate_passes_for_same_chain_under_different_map_keys() {
-        // Guards the review's "no false positive when flashloan and
-        // liquidator share the same chain but via different map keys"
-        // invariant.
-        let mut cfg = base_config();
-        cfg.flashloan.insert("aave_v3_bsc".into(), fl("bnb"));
-        cfg.liquidator.insert("charon_bnb_v1".into(), liq("bnb"));
-        cfg.validate().expect("same chain via different keys is fine");
-    }
-}
-
-/// Replace every `${NAME}` in `input` with the value of environment variable
-/// `NAME`. Returns [`ConfigError::UnterminatedPlaceholder`] if a `${` has no
-/// matching `}` and [`ConfigError::EnvVarMissing`] if the variable is not set.
-fn substitute_env_vars(input: &str, path: &Path) -> Result<String> {
-    let mut output = String::with_capacity(input.len());
-    let mut rest = input;
-    while let Some(start) = rest.find("${") {
-        output.push_str(&rest[..start]);
-        let after = &rest[start + 2..];
-        let end = after
-            .find('}')
-            .ok_or_else(|| ConfigError::UnterminatedPlaceholder {
-                path: path.to_path_buf(),
-            })?;
-        let var_name = &after[..end];
-        let value = std::env::var(var_name).map_err(|_| ConfigError::EnvVarMissing {
-            var: var_name.to_string(),
-            path: path.to_path_buf(),
-        })?;
-        output.push_str(&value);
-        rest = &after[end + 1..];
-    }
-    output.push_str(rest);
-    Ok(output)
 }
