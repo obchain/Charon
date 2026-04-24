@@ -20,6 +20,7 @@ Charon monitors under-collateralized positions across major DeFi lending protoco
 - [Safety model](#safety-model)
 - [Getting started](#getting-started)
 - [Configuration](#configuration)
+- [Metrics](#metrics)
 - [Project structure](#project-structure)
 - [Roadmap](#roadmap)
 - [Contributing](#contributing)
@@ -225,6 +226,41 @@ cargo run -- --config config/fork.toml listen
 The fork profile carries `profile_tag = "fork"`; `Config::validate` rejects it at startup if any chain's `ws_url` / `http_url` resolves to a non-loopback host. This keeps the intentionally lowered profit gate from ever pointing at mainnet by accident.
 
 The fork profile omits `[liquidator.bnb]` by default — after `forge create` against the local anvil, add a `[liquidator.bnb]` section pointing at the deployed address to exercise the full liquidation path. Until then the CLI runs in read-only mode (scanner + metrics only).
+
+---
+
+## Metrics
+
+Every profile ships with a Prometheus exporter enabled. Scrape `http://<host>:9091/metrics`. The exporter binds `:9091` (not `:9090`) so it doesn't collide with a co-located Prometheus server.
+
+Key series (single source of truth in [`crates/charon-metrics/src/lib.rs`](crates/charon-metrics/src/lib.rs) — the `names` module is what dashboards and alert rules must match):
+
+| Metric | Type | Labels |
+| --- | --- | --- |
+| `charon_scanner_blocks_total` | counter | chain |
+| `charon_scanner_positions` | gauge | chain, bucket |
+| `charon_pipeline_block_duration_seconds` | histogram | chain |
+| `charon_executor_simulations_total` | counter | chain, result |
+| `charon_executor_opportunities_queued_total` | counter | chain |
+| `charon_executor_opportunities_dropped_total` | counter | chain, stage |
+| `charon_executor_profit_usd_cents` | histogram | chain |
+| `charon_executor_queue_depth` | gauge | — |
+
+### Grafana dashboard
+
+A ready-to-import dashboard lives at [`deploy/grafana/charon.json`](deploy/grafana/charon.json) and a matching alert-rule bundle at [`deploy/grafana/alerts.yaml`](deploy/grafana/alerts.yaml). The dashboard is built against **Grafana 10.4.x or newer** (panel schema v39 and Grafana Cloud both satisfy this); older 9.x installs will reject the import or silently drop panels.
+
+> **Security — read before exposing `:9091`.** The metrics endpoint ships unauthenticated and binds `0.0.0.0` by default. On a public VPS (Hetzner CX22, the documented target) that exposes profit histograms, build SHA, queue depth, and simulation results to the internet. Before scraping from a remote Prometheus, either bind the exporter to `127.0.0.1` and scrape over a local socket / SSH tunnel / Tailscale, or put a reverse proxy with basic auth (or mTLS) in front of `:9091`. See tracking issues [#213](https://github.com/obchain/Charon/issues/213) and [#214](https://github.com/obchain/Charon/issues/214).
+
+Three steps to load it into Grafana or Grafana Cloud:
+
+1. Add a Prometheus data source that scrapes `http://<charon-host>:9091/metrics` (every ~10 s is fine). Use a loopback address, a VPN endpoint, or an authenticated reverse-proxy URL here — never a raw public-internet address.
+2. In Grafana, **Dashboards → New → Import → Upload JSON file** and pick the file above.
+3. On the import screen, select the Prometheus data source you created and click **Import**.
+
+Dashboard UID is `charon-v0` and tags are `charon`, `liquidation`, `defi` — re-importing over an existing copy replaces it rather than duplicating. Variables (`Chain`, `Instance`) auto-populate from label values once metrics start flowing.
+
+Alert rules in `deploy/grafana/alerts.yaml` can be loaded by Prometheus via `rule_files:` or by Grafana unified alerting (**Alerting → Contact points → Rules → Upload file**). Thresholds are tuned for a single-host BSC deployment on a 3s block cadence — adjust per-environment before wiring a pager.
 
 ---
 
