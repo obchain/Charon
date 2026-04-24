@@ -3,27 +3,47 @@
 //! Aave V3 is the default flash-loan source on BSC for Charon v0.1 —
 //! Balancer is not deployed there, so the router falls straight to Aave
 //! for every liquidation. The adapter reads the current
-//! `FLASHLOAN_PREMIUM_TOTAL` (basis points) at connect time and uses
-//! the Aave `PoolDataProvider` to resolve each asset's aToken, whose
-//! underlying balance is the liquidity ceiling for a flash loan.
+//! `FLASHLOAN_PREMIUM_TOTAL` (Aave encodes it as 4-decimal percent,
+//! e.g. `5` means 0.05%) at connect time and converts it to the
+//! workspace-wide millionths (1e6) convention by multiplying by 100
+//! (Aave `5` -> `500` millionths). It also uses the Aave
+//! `PoolDataProvider` to resolve each asset's aToken (whose underlying
+//! balance is the liquidity ceiling for a flash loan) and to read the
+//! reserve configuration bitmap so paused / frozen reserves are
+//! rejected before the router even tries to build calldata.
 
 use std::sync::Arc;
 
-use alloy::primitives::{Address, U256, address};
+use alloy::primitives::{Address, U256};
 use alloy::providers::{Provider, RootProvider};
 use alloy::pubsub::PubSubFrontend;
 use alloy::sol;
 use alloy::sol_types::SolCall;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
-use charon_core::{FlashLoanProvider, FlashLoanQuote, FlashLoanSource};
+use charon_core::{FlashLoanError, FlashLoanProvider, FlashLoanQuote, FlashLoanSource};
 use tracing::{debug, info};
 
-/// Aave V3 `PoolDataProvider` on BSC mainnet.
-///
-/// Hardcoded because v0.1 targets a single chain; when multi-chain
-/// expansion lands this moves into `FlashLoanConfig`.
-pub const AAVE_V3_BSC_DATA_PROVIDER: Address = address!("23dF2a19384231aFD114b036C14b6b03324D79BC");
+/// BSC mainnet chain id. The adapter refuses to connect to anything
+/// else — Aave V3 is deployed on many chains but the current config
+/// and receiver only target BNB Chain.
+pub const BSC_CHAIN_ID: u64 = 56;
+
+/// Aave encodes the flash-loan premium as 4-decimal percent (e.g. `5`
+/// means 0.05%). We store fee rates in millionths (1e6) workspace-wide,
+/// so multiply Aave's value by this factor at conversion time.
+const AAVE_PREMIUM_TO_MILLIONTHS: u32 = 100;
+
+/// Denominator used by Aave when applying the premium on-chain. Kept
+/// private — external callers should read `fee` out of the quote
+/// rather than recomputing it.
+const AAVE_PREMIUM_DENOMINATOR: u64 = 10_000;
+
+/// Aave V3 reserve configuration bitmap layout. Only the bits the
+/// adapter cares about are extracted; see the Aave V3
+/// `ReserveConfiguration.sol` library for the full layout.
+const RESERVE_FROZEN_BIT: u32 = 57;
+const RESERVE_PAUSED_BIT: u32 = 60;
 
 sol! {
     /// Aave V3 Pool — flash-loan entry point.
@@ -40,11 +60,12 @@ sol! {
             uint16 referralCode
         ) external;
 
-        /// Flash-loan premium in basis points (e.g. `5` = 0.05%).
+        /// Flash-loan premium in 4-decimal percent (e.g. `5` = 0.05%).
         function FLASHLOAN_PREMIUM_TOTAL() external view returns (uint128);
     }
 
-    /// Aave V3 PoolDataProvider — resolves asset → aToken / debt tokens.
+    /// Aave V3 PoolDataProvider — resolves asset → aToken / debt tokens
+    /// and exposes the packed reserve configuration bitmap.
     #[sol(rpc)]
     interface IAaveV3DataProvider {
         function getReserveTokensAddresses(address asset)
@@ -52,6 +73,43 @@ sol! {
                 address aTokenAddress,
                 address stableDebtTokenAddress,
                 address variableDebtTokenAddress
+            );
+
+        function getReserveConfigurationData(address asset)
+            external view returns (
+                uint256 decimals,
+                uint256 ltv,
+                uint256 liquidationThreshold,
+                uint256 liquidationBonus,
+                uint256 reserveFactor,
+                bool usageAsCollateralEnabled,
+                bool borrowingEnabled,
+                bool stableBorrowRateEnabled,
+                bool isActive,
+                bool isFrozen
+            );
+
+        /// Packed configuration bitmap — Aave stores paused (bit 60)
+        /// and frozen (bit 57) flags here. The per-field accessors
+        /// above are convenient but don't currently expose `paused`,
+        /// so we read the bitmap directly.
+        function getReserveData(address asset)
+            external view returns (
+                uint256 configuration,
+                uint128 liquidityIndex,
+                uint128 currentLiquidityRate,
+                uint128 variableBorrowIndex,
+                uint128 currentVariableBorrowRate,
+                uint128 currentStableBorrowRate,
+                uint40  lastUpdateTimestamp,
+                uint16  id,
+                address aTokenAddress,
+                address stableDebtTokenAddress,
+                address variableDebtTokenAddress,
+                address interestRateStrategyAddress,
+                uint128 accruedToTreasury,
+                uint128 unbacked,
+                uint128 isolationModeTotalDebt
             );
     }
 
@@ -78,20 +136,37 @@ pub struct AaveFlashLoan {
     /// callback.
     receiver: Address,
     chain_id: u64,
-    fee_bps: u16,
+    /// Fee rate in millionths (1e6). Aave V3 BSC is typically
+    /// `500` (= 0.05%).
+    fee_rate_millionths: u32,
+    /// Aave's raw premium in 4-decimal percent (needed to recompute
+    /// the absolute fee at quote time without losing precision).
+    aave_premium: u32,
 }
 
 impl AaveFlashLoan {
     /// Connect to the pool, cache its current flash-loan premium, and
-    /// verify the chain id. The data provider address defaults to the
-    /// BSC constant above; other chains will need an explicit override
-    /// once multi-chain support lands.
+    /// verify the chain id.
+    ///
+    /// `data_provider` is the Aave V3 `PoolDataProvider` address for
+    /// the chain — plumbed in from [`charon_core::config::FlashLoanConfig`]
+    /// so multi-chain expansion is a config change, not a code change.
     pub async fn connect(
         provider: Arc<RootProvider<PubSubFrontend>>,
         pool: Address,
+        data_provider: Address,
         receiver: Address,
     ) -> Result<Self> {
-        debug!(%pool, %receiver, "connecting Aave V3 flash-loan adapter");
+        debug!(%pool, %data_provider, %receiver, "connecting Aave V3 flash-loan adapter");
+
+        let chain_id = provider
+            .get_chain_id()
+            .await
+            .context("Aave V3: eth_chainId failed")?;
+        anyhow::ensure!(
+            chain_id == BSC_CHAIN_ID,
+            "Aave V3 adapter is BSC-only for v0.1: expected chain_id {BSC_CHAIN_ID}, got {chain_id}"
+        );
 
         let pool_if = IAaveV3Pool::new(pool, provider.clone());
         let premium = pool_if
@@ -100,36 +175,38 @@ impl AaveFlashLoan {
             .await
             .context("Aave V3: FLASHLOAN_PREMIUM_TOTAL() failed")?
             ._0;
-        let fee_bps = u16::try_from(premium)
-            .context("Aave V3: premium does not fit in u16 bps — unexpected value")?;
-
-        let chain_id = provider
-            .get_chain_id()
-            .await
-            .context("Aave V3: eth_chainId failed")?;
+        let aave_premium = u32::try_from(premium)
+            .context("Aave V3: premium does not fit in u32 — unexpected value")?;
+        // Aave 5 (0.05%) -> 500 millionths.
+        let fee_rate_millionths = aave_premium
+            .checked_mul(AAVE_PREMIUM_TO_MILLIONTHS)
+            .context("Aave V3: premium -> millionths overflow")?;
 
         info!(
             %pool,
+            %data_provider,
             %receiver,
             chain_id,
-            fee_bps,
+            aave_premium,
+            fee_rate_millionths,
             "Aave V3 flash-loan adapter ready"
         );
 
         Ok(Self {
             provider,
             pool,
-            data_provider: AAVE_V3_BSC_DATA_PROVIDER,
+            data_provider,
             receiver,
             chain_id,
-            fee_bps,
+            fee_rate_millionths,
+            aave_premium,
         })
     }
 
     /// Return the aToken address for `asset`. Falls back to `None` when
     /// Aave does not list the asset on this chain (call reverts or
     /// returns the zero address).
-    async fn atoken_for(&self, asset: Address) -> Result<Option<Address>> {
+    async fn atoken_for(&self, asset: Address) -> Result<Option<Address>, FlashLoanError> {
         let dp = IAaveV3DataProvider::new(self.data_provider, self.provider.clone());
         match dp.getReserveTokensAddresses(asset).call().await {
             Ok(r) => {
@@ -143,6 +220,40 @@ impl AaveFlashLoan {
             Err(_) => Ok(None),
         }
     }
+
+    /// Check the reserve's packed configuration for paused / frozen
+    /// flags. Either one makes a flash loan revert on Aave, so the
+    /// adapter rejects the borrow before even asking for liquidity.
+    async fn assert_reserve_open(&self, asset: Address) -> Result<(), FlashLoanError> {
+        let dp = IAaveV3DataProvider::new(self.data_provider, self.provider.clone());
+        let cfg = dp
+            .getReserveConfigurationData(asset)
+            .call()
+            .await
+            .map_err(|e| FlashLoanError::rpc(format!("getReserveConfigurationData: {e}")))?;
+        if !cfg.isActive || cfg.isFrozen {
+            return Err(FlashLoanError::ReservePaused { asset });
+        }
+        // Paused is not exposed via the typed accessor, so read the
+        // packed bitmap and check bit 60 ourselves.
+        let data = dp
+            .getReserveData(asset)
+            .call()
+            .await
+            .map_err(|e| FlashLoanError::rpc(format!("getReserveData: {e}")))?;
+        if bit_is_set(data.configuration, RESERVE_PAUSED_BIT)
+            || bit_is_set(data.configuration, RESERVE_FROZEN_BIT)
+        {
+            return Err(FlashLoanError::ReservePaused { asset });
+        }
+        Ok(())
+    }
+}
+
+/// Return true when bit `index` is set in the Aave packed
+/// configuration `U256`.
+fn bit_is_set(bitmap: U256, index: u32) -> bool {
+    (bitmap >> index) & U256::from(1u8) == U256::from(1u8)
 }
 
 #[async_trait]
@@ -155,11 +266,12 @@ impl FlashLoanProvider for AaveFlashLoan {
         self.chain_id
     }
 
-    fn fee_rate_bps(&self) -> u16 {
-        self.fee_bps
+    fn fee_rate_millionths(&self) -> u32 {
+        self.fee_rate_millionths
     }
 
-    async fn available_liquidity(&self, token: Address) -> Result<U256> {
+    async fn available_liquidity(&self, token: Address) -> Result<U256, FlashLoanError> {
+        self.assert_reserve_open(token).await?;
         let Some(atoken) = self.atoken_for(token).await? else {
             return Ok(U256::ZERO);
         };
@@ -168,28 +280,33 @@ impl FlashLoanProvider for AaveFlashLoan {
             .balanceOf(atoken)
             .call()
             .await
-            .with_context(|| format!("Aave V3: balanceOf({atoken}) failed"))?
+            .map_err(|e| FlashLoanError::rpc(format!("balanceOf({atoken}): {e}")))?
             ._0;
         Ok(bal)
     }
 
-    async fn quote(&self, token: Address, amount: U256) -> Result<Option<FlashLoanQuote>> {
+    async fn quote(
+        &self,
+        token: Address,
+        amount: U256,
+    ) -> Result<Option<FlashLoanQuote>, FlashLoanError> {
         let liquidity = self.available_liquidity(token).await?;
         if liquidity < amount {
             return Ok(None);
         }
-        // fee = amount * fee_bps / 10_000
+        // fee = amount * aave_premium / 10_000 (Aave's canonical math,
+        // preserved exactly — we don't round-trip through millionths).
         let fee = amount
-            .checked_mul(U256::from(self.fee_bps))
-            .context("Aave V3: fee multiplication overflow")?
-            / U256::from(10_000u64);
+            .checked_mul(U256::from(self.aave_premium))
+            .ok_or_else(|| FlashLoanError::other("fee multiplication overflow"))?
+            / U256::from(AAVE_PREMIUM_DENOMINATOR);
         Ok(Some(FlashLoanQuote {
             source: FlashLoanSource::AaveV3,
             chain_id: self.chain_id,
             token,
             amount,
             fee,
-            fee_bps: self.fee_bps,
+            fee_rate_millionths: self.fee_rate_millionths,
             pool_address: self.pool,
         }))
     }
@@ -197,13 +314,19 @@ impl FlashLoanProvider for AaveFlashLoan {
     fn build_flashloan_calldata(
         &self,
         quote: &FlashLoanQuote,
-        inner_calldata: &[u8],
-    ) -> Result<Vec<u8>> {
+        liquidation_params: &[u8],
+    ) -> Result<Vec<u8>, FlashLoanError> {
+        if liquidation_params.is_empty() {
+            return Err(FlashLoanError::other(
+                "build_flashloan_calldata: liquidation_params is empty; \
+                 executeOperation would revert on ABI decode",
+            ));
+        }
         let call = IAaveV3Pool::flashLoanSimpleCall {
             receiverAddress: self.receiver,
             asset: quote.token,
             amount: quote.amount,
-            params: inner_calldata.to_vec().into(),
+            params: liquidation_params.to_vec().into(),
             referralCode: 0,
         };
         Ok(call.abi_encode())
@@ -213,6 +336,7 @@ impl FlashLoanProvider for AaveFlashLoan {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloy::primitives::address;
 
     #[test]
     fn flash_loan_simple_calldata_has_correct_selector() {
@@ -222,7 +346,7 @@ mod tests {
             token: address!("1111111111111111111111111111111111111111"),
             amount: U256::from(1_000u64),
             fee: U256::from(5u64),
-            fee_bps: 5,
+            fee_rate_millionths: 500,
             pool_address: address!("2222222222222222222222222222222222222222"),
         };
         // Standalone encoder mirror of `build_flashloan_calldata` so we
@@ -241,5 +365,17 @@ mod tests {
             &IAaveV3Pool::flashLoanSimpleCall::SELECTOR,
             "selector mismatch — check flashLoanSimple arg order"
         );
+    }
+
+    #[test]
+    fn bit_is_set_reads_paused_and_frozen_bits() {
+        let paused = U256::from(1u64) << RESERVE_PAUSED_BIT;
+        let frozen = U256::from(1u64) << RESERVE_FROZEN_BIT;
+        assert!(bit_is_set(paused, RESERVE_PAUSED_BIT));
+        assert!(!bit_is_set(paused, RESERVE_FROZEN_BIT));
+        assert!(bit_is_set(frozen, RESERVE_FROZEN_BIT));
+        assert!(!bit_is_set(frozen, RESERVE_PAUSED_BIT));
+        assert!(!bit_is_set(U256::ZERO, RESERVE_PAUSED_BIT));
+        assert!(!bit_is_set(U256::ZERO, RESERVE_FROZEN_BIT));
     }
 }
