@@ -1,0 +1,17 @@
+[package]
+name = "charon-metrics"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Prometheus-compatible metrics exporter and metric constants for Charon"
+
+[dependencies]
+anyhow = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+metrics = { workspace = true }
+metrics-exporter-prometheus = { workspace = true }
+thiserror = { workspace = true }
+
+[lints]
+workspace = true

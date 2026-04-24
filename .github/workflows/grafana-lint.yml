@@ -1,0 +1,40 @@
+name: grafana-lint
+
+on:
+  push:
+    paths:
+      - 'deploy/grafana/**'
+      - '.github/workflows/grafana-lint.yml'
+  pull_request:
+    paths:
+      - 'deploy/grafana/**'
+      - '.github/workflows/grafana-lint.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate dashboard JSON syntax
+        run: python3 -m json.tool deploy/grafana/charon.json > /dev/null
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+
+      - name: Install grafana dashboard-linter
+        run: go install github.com/grafana/dashboard-linter@latest
+
+      - name: Lint dashboard schema and PromQL
+        run: dashboard-linter lint --strict deploy/grafana/charon.json
+
+      - name: Validate alert rules with promtool
+        run: |
+          docker run --rm -v "$PWD/deploy/grafana:/rules:ro" \
+            prom/prometheus:v2.55.1 \
+            promtool check rules /rules/alerts.yaml

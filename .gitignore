@@ -2,6 +2,18 @@
 /target/
 **/*.rs.bk
 
+# Foundry build artifacts
+contracts/out/
+contracts/cache/
+contracts/broadcast/
+contracts/foundry.lock
+out/
+cache/
+broadcast/
+
+# JS/TS tooling
+node_modules/
+
 # Environment / secrets
 .env
 .env.local
@@ -16,7 +28,18 @@
 # Logs
 *.log
 
+# Markdown policy: only README.md is ever pushed; everything else is local-only.
+*.md
+!README.md
+
 # Local-only dev notes and editor configs
 .claude/
 docs/context.md
 NOTES.md
+
+# Markdown policy: only README.md is ever pushed; everything else is local-only.
+*.md
+!README.md
+
+# Reference docs copied from backups — local-only, not pushed.
+docs/*.html

@@ -1,38 +1,96 @@
 //! Charon command-line entrypoint.
 //!
 //! ```text
+//! CHARON_CONFIG=/etc/charon/default.toml charon listen
 //! charon --config config/default.toml listen
 //! charon --config config/default.toml listen --borrower 0xABC…
 //! charon --config config/default.toml test-connection --chain bnb
 //! ```
+//!
+//! ## Pipeline overview
+//!
+//! `listen` spawns one [`BlockListener`] per configured chain and drains
+//! the shared `ChainEvent` channel. For every non-backfill `NewBlock` on
+//! the Venus chain the cadence scheduler [`ScanScheduler`] decides which
+//! bucket of borrowers to refresh; the Venus adapter fetches their
+//! positions pinned to the observed block; the [`HealthScanner`]
+//! rebuckets them; each freshly `Liquidatable` position is then walked
+//! through the full off-chain pipeline:
+//!
+//! 1. `get_liquidation_params` — adapter emits vToken + repay.
+//! 2. `FlashLoanRouter::route` — cheapest source for (token, repay).
+//! 3. `calculate_profit` — wei-native [`NetProfit`] breakdown.
+//! 4. Threshold compare — `net_profit_usd_1e6` vs
+//!    `config.bot.min_profit_usd_1e6`.
+//! 5. `TxBuilder::encode_calldata` + `Simulator::simulate` — hard
+//!    safety gate; only opportunities that survive `eth_call` reach
+//!    the queue.
+//! 6. `OpportunityQueue::push` — wei-ordered heap for the future
+//!    broadcast stage.
+//!
+//! ## Security posture
+//!
+//! - Signer is held in a [`SecretString`] on the config, only
+//!   materialised once via [`ExposeSecret::expose_secret`] at the
+//!   single call site that builds the [`PrivateKeySigner`]. The
+//!   exposed bytes are never stored back, never logged, never in any
+//!   `Debug` format.
+//! - No signer → no simulation → no enqueue. The scan-only mode is
+//!   observable but refuses to produce any signed artefact.
+//! - Backfill blocks are skipped — the next real head supersedes them
+//!   and a fresh scan is cheaper than reconciling retroactive bucket
+//!   transitions.
 
+use std::collections::HashSet;
 use std::path::PathBuf;
+use std::str::FromStr;
 use std::sync::Arc;
+use std::time::Duration;
 
+use alloy::eips::BlockNumberOrTag;
 use alloy::network::TransactionBuilder;
-use alloy::primitives::{Address, U256};
-use alloy::providers::{ProviderBuilder, WsConnect};
-use alloy::rpc::types::TransactionRequest;
+use alloy::primitives::{Address, B256, Bytes, U256};
+use alloy::providers::{Provider, ProviderBuilder, RootProvider, WsConnect};
+use alloy::pubsub::PubSubFrontend;
+use alloy::rpc::types::{BlockTransactionsKind, TransactionRequest};
 use alloy::signers::local::PrivateKeySigner;
 use anyhow::{Context, Result, bail};
+use async_trait::async_trait;
 use charon_core::{
-    Config, LendingProtocol, LiquidationOpportunity, LiquidationParams, OpportunityQueue,
-    ProfitInputs, SwapRoute, calculate_profit,
+    Config, FlashLoanQuote, LendingProtocol, LiquidationOpportunity, LiquidationParams,
+    OpportunityQueue, Position, Price, ProfitInputs, calculate_profit,
 };
 use charon_executor::{
-    DEFAULT_SUBMIT_TIMEOUT, GasOracle, GasParams, NonceManager, Simulator, SubmitError, Submitter,
-    TxBuilder, gas_cost_usd_cents,
+    DEFAULT_SUBMIT_TIMEOUT, GasDecision, GasOracle, NonceManager, Simulator, SubmitError,
+    Submitter, TxBuilder,
 };
 use charon_flashloan::{AaveFlashLoan, FlashLoanRouter};
+use charon_metrics::{bucket, drop_stage, sim_result};
 use charon_protocols::VenusAdapter;
 use charon_scanner::{
-    BlockListener, ChainEvent, ChainProvider, DEFAULT_MAX_AGE, HealthScanner, PriceCache,
+    BlockListener, ChainEvent, ChainProvider, DEFAULT_MAX_AGE, HealthScanner, MempoolMonitor,
+    OracleUpdate, PendingCache, PositionBucket, PriceCache, ScanScheduler, SimulationVerdict,
     TokenMetaCache,
 };
 use clap::{Parser, Subcommand};
+use secrecy::ExposeSecret;
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 use tracing_subscriber::EnvFilter;
+
+/// Buffer size for the mempool's `OracleUpdate` channel. Sized so a
+/// short burst of oracle-write txs at block-boundary time doesn't
+/// back-pressure the monitor task.
+const ORACLE_UPDATE_CHANNEL: usize = 256;
+
+/// Env var the operator sets to enable the mempool monitor. Expected
+/// value is the hex-encoded Venus oracle address whose write
+/// selectors the monitor should track. Unset (or empty) skips the
+/// mempool path cleanly so the CLI stays usable on profiles that do
+/// not have a paid MEV stream. A future config-file knob can replace
+/// this env var; for now keeping it env-only avoids a config-schema
+/// change on feat/21.
+const VENUS_ORACLE_ENV: &str = "CHARON_VENUS_ORACLE";
 
 /// Size of the fan-in channel from listeners to the scanner pipeline.
 /// One slot per ~5 blocks across all chains covers short stalls without
@@ -41,37 +99,83 @@ const CHAIN_EVENT_CHANNEL: usize = 1024;
 
 /// Slippage budget applied to every profit estimate (basis points).
 /// 0.5% — conservative default for PancakeSwap V3 hot-pair swaps.
+/// Tracked alongside the future gas oracle (#148); promoted to
+/// per-route config once the router produces live quotes.
 const DEFAULT_SLIPPAGE_BPS: u16 = 50;
 
 /// Pre-broadcast gas-units estimate used by the profit gate. Venus
-/// liquidation path through the Aave flashloan callback empirically
+/// liquidation path through the Aave flash-loan callback empirically
 /// lands in ~1.1-1.6M gas; we use 1.5M to avoid gating out profitable
 /// txs that would comfortably fit under the real `eth_estimateGas`
-/// result fetched inside [`broadcast`]. The actual gas limit sent on
+/// result fetched at broadcast time. The actual gas limit sent on
 /// the wire is still `estimate_gas × 1.3` at broadcast time.
 const PROFIT_GATE_ROUGH_GAS_UNITS: u64 = 1_500_000;
 
 /// Native-asset Chainlink feed symbol on BSC. Used to price the gas
-/// cost estimate in USD cents. If this feed is missing from the
-/// config's `[chainlink.bnb]` table the bot refuses to start — a
-/// missing BNB feed means we cannot compute gas cost at all.
+/// cost estimate (gas_units × max_fee_per_gas in native wei) into
+/// debt-token wei via the ratio `native_price / debt_price`. If this
+/// feed is missing from the `PriceCache` the bot refuses to start —
+/// a missing BNB feed means the profit gate cannot be trusted.
 const NATIVE_FEED_SYMBOL: &str = "BNB";
 
-/// Multiplier applied to `eth_estimateGas` before broadcast. 30 %
-/// headroom covers state drift between estimate and inclusion (vToken
-/// index update, oracle writes, swap-pool reserve change, Venus
-/// reentrancy into the callback) without overpaying on a happy-path
-/// liquidation. BSC gas is cheap enough that the extra buffer is worth
-/// the reduction in out-of-gas reverts.
-const GAS_LIMIT_BUFFER_NUM: u64 = 13;
-const GAS_LIMIT_BUFFER_DEN: u64 = 10;
+/// Gas limit supplied to `Simulator::simulate` until a real gas
+/// estimate is wired up. Sized to comfortably cover a Venus
+/// `liquidateBorrow` + PancakeSwap V3 swap round-trip.
+const SIMULATION_GAS_LIMIT: u64 = 2_000_000;
+
+/// Conservative debt-token-wei floor baked into
+/// `SwapRoute.min_amount_out` on top of the flash-loan repayment.
+/// Combined with the gas floor below it gives the on-chain
+/// `CharonLiquidator.executeLiquidation` revert-guard a lower bound
+/// independent of the off-chain profit math. Placeholder until the
+/// per-token USD → wei conversion (#148) lands.
+const STATIC_GAS_FLOOR_DEBT_WEI: u128 = 3_000_000_000_000_000_000;
+
+/// Minimum-profit floor in debt-token smallest units, also baked into
+/// `SwapRoute.min_amount_out`. Forces the DEX leg to return strictly
+/// more than repay + fee + gas floor so a zero-net liquidation cannot
+/// slip past the on-chain backstop. Replaced by a configured value
+/// once USD → token pricing lands (#148).
+const MIN_PROFIT_FLOOR_DEBT_WEI: u128 = 1_000_000_000_000_000_000;
+
+/// Wall-clock deadline for one per-block pipeline pass. If the
+/// adapter, router, or simulator stalls beyond this we abandon the
+/// tick so the event drain can pick up on the next block instead of
+/// blocking across multiple heads.
+const PER_BLOCK_TIMEOUT: Duration = Duration::from_millis(2_500);
+
+/// Env var the operator must set (to `1`) before `--execute` is
+/// honoured. A purely belt-and-braces second confirmation beyond the
+/// CLI flag so a stale shell-history invocation cannot broadcast
+/// signed liquidations by accident. Unset or any value other than
+/// `1` refuses to build the execution harness, regardless of other
+/// safety gates. Checked at startup; the listener then falls back to
+/// scan+simulate and logs a loud warning so the operator notices.
+const EXECUTE_CONFIRMATION_ENV: &str = "CHARON_EXECUTE_CONFIRMED";
+
+/// Multiplicative broadcast-gas buffer on top of `eth_estimateGas`:
+/// 130% (= 13/10). 30% headroom covers state drift between estimate
+/// time and inclusion time — vToken index ticks, Chainlink oracle
+/// writes landing in the same block, PancakeSwap reserve updates.
+/// BSC gas is cheap enough that the extra buffer is worth the
+/// reduction in out-of-gas reverts. Tuned alongside the simulation
+/// gate's own 2 M hard ceiling so both agree on "tx will fit on
+/// chain".
+const BROADCAST_GAS_BUFFER_NUM: u64 = 13;
+const BROADCAST_GAS_BUFFER_DEN: u64 = 10;
 
 /// Charon — multi-chain flash-loan liquidation bot.
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
 struct Cli {
     /// Path to the TOML config file.
-    #[arg(long, short = 'c', default_value = "config/default.toml")]
+    ///
+    /// No default — the operator must supply the path explicitly via
+    /// `--config` or the `CHARON_CONFIG` environment variable. Avoids
+    /// the silent cwd-relative `config/default.toml` fallback which
+    /// breaks inside the Docker deploy image where WORKDIR may differ
+    /// from the repo root.
+    #[arg(long, short = 'c', env = "CHARON_CONFIG")]
     config: PathBuf,
 
     #[command(subcommand)]
@@ -80,22 +184,33 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Command {
-    /// Spawn block listeners + run the full Venus pipeline every new block.
+    /// Spawn one block listener per configured chain and run the full
+    /// Venus → router → profit → builder → simulator pipeline every
+    /// real (non-backfill) block.
     ///
     /// Borrower discovery from indexed events is a follow-up; pass
-    /// `--borrower 0x…` one or more times to seed a test list.
+    /// `--borrower 0x…` one or more times to seed a test list. An
+    /// empty list is allowed — the adapter still connects so the
+    /// operator can confirm the WS pipeline.
     Listen {
         /// Addresses to scan on every new block. Repeat the flag for
-        /// multiple borrowers. Empty list is allowed (the rest of the
-        /// pipeline still spins up so the operator can confirm wiring).
+        /// multiple borrowers.
         #[arg(long = "borrower")]
         borrowers: Vec<Address>,
 
-        /// Broadcast signed liquidation txs when the simulator passes.
-        /// Off by default — the pipeline runs scan + simulate only.
-        /// Requires: `BOT_SIGNER_KEY` set, a non-zero
-        /// `liquidator.contract_address`, and a `private_rpc_url` (or
-        /// `allow_public_mempool = true`, dev-only).
+        /// Sign and broadcast the liquidation tx for every
+        /// opportunity that clears the simulation gate. Off by
+        /// default — the pipeline runs scan + simulate only. Requires
+        /// all of:
+        ///   * `bot.signer_key` populated (via `BOT_SIGNER_KEY` env),
+        ///   * every chain with a `[liquidator.<chain>]` section has
+        ///     a non-zero `contract_address`,
+        ///   * every chain has either `private_rpc_url` configured or
+        ///     `allow_public_mempool = true` (dev only), and
+        ///   * `CHARON_EXECUTE_CONFIRMED=1` in the environment.
+        /// Any gate failing aborts startup — `--execute` is an
+        /// explicit operator intent and must not silently degrade to
+        /// scan-only.
         #[arg(long = "execute", default_value_t = false)]
         execute: bool,
     },
@@ -108,14 +223,103 @@ enum Command {
     },
 }
 
-#[tokio::main]
+/// Shared Venus-side pipeline state assembled once at startup. Wrapped
+/// in `Option` so the listener still drains events when
+/// `[protocol.venus]` is absent (useful for operators running the
+/// block pipeline against a chain before its adapter is wired).
+struct VenusPipeline {
+    chain_name: String,
+    adapter: Arc<VenusAdapter>,
+    scanner: Arc<HealthScanner>,
+    scheduler: ScanScheduler,
+    prices: Arc<PriceCache>,
+    /// `(symbol, decimals)` for every Venus underlying the adapter
+    /// discovered at startup. Used by the profit gate to convert a
+    /// raw `repay_amount` into USD cents via `PriceCache` by symbol.
+    /// Missing metadata (RPC failure on `symbol()` or `decimals()`)
+    /// is treated the same as a missing price — the opportunity is
+    /// dropped, never priced with a guess.
+    token_meta: Arc<TokenMetaCache>,
+    /// Per-chain EIP-1559 fee source used by the profit gate. Separate
+    /// from `ExecHarness::gas_oracle` (which serves broadcast under
+    /// `--execute`) so the profit path is always able to price gas,
+    /// even in scan-only mode. Honours `bot.max_gas_wei` as the
+    /// ceiling and the chain's `priority_fee_gwei` as the tip; has its
+    /// own per-block cache so a tick with N liquidatable positions
+    /// still issues a single `get_block` call.
+    gas_oracle: Arc<GasOracle>,
+    router: Arc<FlashLoanRouter>,
+    liquidator: Address,
+    provider: Arc<RootProvider<PubSubFrontend>>,
+    /// Queue for opportunities that pass the simulation gate. The
+    /// broadcast stage reads from this when the `--execute` harness
+    /// is populated; entries are pushed *before* the broadcast call
+    /// so a later submit failure still leaves a record of the ranked
+    /// candidate.
+    queue: Arc<OpportunityQueue>,
+    /// Built lazily on first actionable opportunity so scan-only
+    /// runs (no signer configured) never touch the secret.
+    tx_builder: tokio::sync::OnceCell<Option<Arc<TxBuilder>>>,
+    simulator: tokio::sync::OnceCell<Option<Simulator>>,
+    min_profit_usd_1e6: u64,
+    chain_id: u64,
+    /// Present only when the operator ran `listen --execute` and
+    /// every safety gate passed. `None` means scan-only or
+    /// scan+simulate mode — `process_opportunity` observes the
+    /// simulation gate and queues candidates, but never signs or
+    /// broadcasts. Eagerly assembled at startup rather than
+    /// lazy-initialised so a mis-configured private RPC or bad
+    /// signer key is caught on boot, not on the first liquidatable
+    /// position to land.
+    exec_harness: Option<Arc<ExecHarness>>,
+}
+
+/// Bundle of executor components needed to broadcast a simulated
+/// opportunity. Present only when the operator ran `listen --execute`
+/// and every safety gate passed; `None` means the pipeline is in
+/// scan-only or scan+simulate mode.
+///
+/// Single-chain scope (BNB) for v0.1, matching the rest of the
+/// `VenusPipeline` — a multi-chain harness is a follow-up when a
+/// second adapter lands.
+struct ExecHarness {
+    /// Per-chain EIP-1559 fee source. Honours `bot.max_gas_wei` as
+    /// the ceiling and the chain's `priority_fee_gwei` as the tip.
+    /// Cached per block so a single tick doesn't spam the RPC with
+    /// repeated `eth_feeHistory` reads.
+    gas_oracle: GasOracle,
+    /// Local atomic nonce counter. Initialised against the pending
+    /// block on startup, incremented per `next()`, and resynced to
+    /// the chain on any rejection that leaves the counter ahead of
+    /// confirmed state.
+    nonce_manager: Arc<NonceManager>,
+    /// Private-RPC submitter. HTTPS / WSS only. Single-shot per
+    /// submit — the caller owns retry + staleness decisions via the
+    /// opportunity queue TTL.
+    submitter: Arc<Submitter>,
+    /// Hot-wallet signer address. Pre-materialised here so the
+    /// broadcast path never re-derives it from the `TxBuilder` on
+    /// the hot path.
+    signer_address: Address,
+    /// Host-only label for logs (scheme + host, no api-key in query
+    /// string). Logged on every submit so operators can pivot on
+    /// submit latency per endpoint.
+    submitter_label: String,
+}
+
+// Explicit multi-thread flavor so the concurrency contract survives any
+// future trimming of tokio's `full` feature set.
+#[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<()> {
     // Load `.env` if present. Silent no-op if the file isn't there.
     let _ = dotenvy::dotenv();
 
-    // Structured logging. Override verbosity with RUST_LOG=debug etc.
+    // Structured logs go to stderr so `listen` can eventually emit a
+    // JSON data stream on stdout without interleaving. Verbosity via
+    // RUST_LOG.
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
+        .with_writer(std::io::stderr)
         .init();
 
     let cli = Cli::parse();
@@ -129,17 +333,23 @@ async fn main() -> Result<()> {
         .validate()
         .context("config validation failed — refusing to start")?;
 
+    // SECURITY: only counts and non-secret scalars here. Never log
+    // ws_url, http_url, signer_key, or the full Debug of Config —
+    // RPC URLs embed API keys, and the signer key is a SecretString.
     info!(
         chains = config.chain.len(),
         protocols = config.protocol.len(),
         flashloan_sources = config.flashloan.len(),
         liquidators = config.liquidator.len(),
-        min_profit_usd = config.bot.min_profit_usd,
+        min_profit_usd_1e6 = config.bot.min_profit_usd_1e6,
+        signer_configured = config.bot.signer_key.is_some(),
         "config loaded"
     );
 
     match cli.command {
-        Command::Listen { borrowers, execute } => run_listen(config, borrowers, execute).await?,
+        Command::Listen { borrowers, execute } => {
+            run_listen(&config, borrowers, execute).await?;
+        }
         Command::TestConnection { chain } => {
             let chain_cfg = config
                 .chain
@@ -154,694 +364,1657 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-/// Bundle of executor components needed to broadcast a simulated
-/// opportunity. Present only when the operator ran `listen --execute`
-/// and every safety gate passed; `None` means the pipeline is in
-/// scan-only or scan-plus-simulate mode. Holds its own `GasOracle`
-/// clone — the oracle is also used by the profit gate outside
-/// `--execute` mode, so it lives at run-listen scope and the clone
-/// here is just convenience.
-struct ExecHarness {
-    gas_oracle: GasOracle,
-    nonce_manager: Arc<NonceManager>,
-    submitter: Arc<Submitter>,
-    signer_address: Address,
-}
-
-/// Wire the full Venus → scanner → profit → router → builder → sim
-/// pipeline into the block-event drain loop.
+/// Long-running listener entry point. Spawns one `BlockListener` per
+/// configured chain, drains the shared `ChainEvent` channel, and exits
+/// cleanly on SIGINT or SIGTERM so the Docker `stop` → SIGTERM →
+/// SIGKILL sequence never tears mid-operation.
 ///
-/// With `--execute` the pipeline also signs and broadcasts any
-/// opportunity whose simulator gate passes. Without it the pipeline is
-/// read-only: simulation results are logged but nothing is signed or
-/// sent.
-async fn run_listen(config: Config, borrowers: Vec<Address>, execute: bool) -> Result<()> {
-    // ── Adapters + scanner + price cache (existing #8/#9/#10 wiring) ──
-    let bnb = config
-        .chain
-        .get("bnb")
-        .context("chain 'bnb' not configured — required for v0.1")?;
-    let venus_cfg = config
-        .protocol
-        .get("venus")
-        .context("protocol 'venus' not configured — required for v0.1")?;
-    let aave_cfg = config
-        .flashloan
-        .get("aave_v3_bsc")
-        .context("flashloan 'aave_v3_bsc' not configured — required for v0.1")?;
-    let liquidator_cfg = config
-        .liquidator
-        .get("bnb")
-        .context("liquidator 'bnb' not configured — required for v0.1")?;
+/// For every `NewBlock` event on a chain with a `[protocol.venus]`
+/// entry the Venus adapter fetches positions anchored at the observed
+/// block, pushes them through the bucketed [`HealthScanner`], and
+/// limits fetches to buckets whose cadence fires this block via
+/// [`ScanScheduler`]. A per-chain [`PriceCache`] is refreshed on each
+/// scan tick so profit-ranking reads sub-heartbeat Chainlink feeds.
+///
+/// Liquidatable positions flow into the full off-chain pipeline:
+/// router-picked flash loan → wei-native profit calc → tx encode →
+/// `eth_call` simulation gate → profit-ordered queue.
+///
+/// Chains without a Venus protocol config still flow through the drain
+/// loop but trigger no protocol scans (v0.1 scope).
+///
+/// Backfill blocks (synthesised during WebSocket reconnect) are logged
+/// but not scanned — the state they would produce is superseded by
+/// the next real head and a fresh scan is cheaper than retroactive
+/// bucket transitions.
+async fn run_listen(config: &Config, borrowers: Vec<Address>, execute: bool) -> Result<()> {
+    if config.chain.is_empty() {
+        anyhow::bail!("no chains configured — nothing to listen to");
+    }
 
-    // Single shared pub-sub provider — adapter, price cache, flash-loan
-    // adapter, and tx builder all hang off it. Cuts WS connection
-    // count from 4 to 1.
-    let provider = Arc::new(
-        ProviderBuilder::new()
-            .on_ws(WsConnect::new(&bnb.ws_url))
-            .await
-            .context("listen: failed to open shared ws provider")?,
-    );
-
-    let adapter = Arc::new(VenusAdapter::connect(provider.clone(), venus_cfg.comptroller).await?);
-
-    let scanner = Arc::new(HealthScanner::new(
-        config.bot.liquidatable_threshold,
-        config.bot.near_liq_threshold,
-    )?);
-
-    let price_feeds = config.chainlink.get("bnb").cloned().unwrap_or_default();
-    let prices = Arc::new(PriceCache::new(
-        provider.clone(),
-        price_feeds,
-        DEFAULT_MAX_AGE,
-    ));
-    prices.refresh_all().await;
-    for sym in prices.symbols() {
-        if let Some(p) = prices.get(sym) {
-            info!(symbol = %sym, price = %p.price, decimals = p.decimals, "chainlink feed");
+    // ── Execute-gate safety checks (#305) ─────────────────────────────
+    //
+    // `--execute` is an explicit operator intent to sign and broadcast
+    // liquidations — it must never silently degrade to scan-only. If
+    // any gate below fails we abort startup with a descriptive error
+    // rather than spinning up a half-wired pipeline.
+    //
+    // Four gates, all mandatory when `--execute` is set:
+    //
+    //   1. `bot.signer_key` is populated (empty strings are already
+    //      collapsed to `None` by `normalize_empty_secrets` — this
+    //      only checks presence, never inspects the value).
+    //   2. Every chain that has a `[liquidator.<chain>]` entry
+    //      references a non-zero `contract_address`. A zero address
+    //      here would route `executeOperation` into the zero address
+    //      on broadcast.
+    //   3. Every chain has either `private_rpc_url` configured or
+    //      has `allow_public_mempool = true` (dev-only). Enforced
+    //      centrally in `Config::validate()` — re-checked here with
+    //      a precise error message.
+    //   4. `CHARON_EXECUTE_CONFIRMED=1` is set in the environment.
+    //      Belt-and-braces second confirmation so stale shell
+    //      history cannot broadcast by accident.
+    //
+    // These gates run *before* any WS connection or RPC call so a
+    // misconfigured profile fails fast.
+    if execute {
+        if config.bot.signer_key.is_none() {
+            bail!(
+                "--execute refuses to start: bot.signer_key is not set (expected via \
+                 BOT_SIGNER_KEY env in the signer_key = \"${{BOT_SIGNER_KEY}}\" substitution)"
+            );
         }
-    }
-    if prices.get(NATIVE_FEED_SYMBOL).is_none() {
-        bail!(
-            "chainlink feed for '{NATIVE_FEED_SYMBOL}' missing or stale — gas cost cannot be priced"
-        );
-    }
-
-    // Token metadata (symbol + decimals) for every Venus underlying.
-    // Queried once at startup; the profit gate needs both fields to
-    // convert a raw repay amount into USD cents via the price cache.
-    let token_meta = Arc::new(
-        TokenMetaCache::build(
-            provider.as_ref(),
-            adapter.underlying_to_vtoken.keys().copied(),
-        )
-        .await,
-    );
-    info!(
-        tokens_cached = token_meta.len(),
-        "token metadata cache built"
-    );
-    if token_meta.is_empty() {
-        bail!(
-            "token metadata cache is empty — no Venus underlying resolved its symbol/decimals; \
-             profit gate would drop every opportunity. Check RPC and adapter wiring."
-        );
-    }
-
-    // Gas oracle is needed by both the profit gate (every block) and
-    // the broadcast path (under --execute). Build once, share by
-    // value — `GasOracle` is `Copy`.
-    let gas_oracle = GasOracle::new(config.bot.max_gas_gwei, bnb.priority_fee_gwei);
-
-    // ── Flash-loan router (#13) ──
-    // Liquidator address may be the placeholder zero — adapter still
-    // builds, but `executeOperation` on a zero-address receiver would
-    // never be reached because no broadcast happens here.
-    let aave = Arc::new(
-        AaveFlashLoan::connect(
-            provider.clone(),
-            aave_cfg.pool,
-            liquidator_cfg.contract_address,
-        )
-        .await?,
-    );
-    let router = Arc::new(FlashLoanRouter::new(vec![aave.clone()]));
-
-    // ── Tx builder + simulator (#14) ──
-    // Both gracefully degrade if `BOT_SIGNER_KEY` is unset — encoding
-    // and simulation can still run, but signing is skipped.
-    let tx_builder: Option<Arc<TxBuilder>> = match std::env::var("BOT_SIGNER_KEY") {
-        Ok(key) => match key.parse::<PrivateKeySigner>() {
-            Ok(signer) => {
-                let chain_id = adapter.chain_id;
-                info!(
-                    signer = %signer.address(),
-                    liquidator = %liquidator_cfg.contract_address,
-                    chain_id,
-                    "tx builder ready"
+        for (chain_name, liq_cfg) in &config.liquidator {
+            if liq_cfg.contract_address == Address::ZERO {
+                bail!(
+                    "--execute refuses to start: [liquidator.{chain_name}] has zero-address \
+                     contract_address — deploy the liquidator and set the address before \
+                     broadcasting"
                 );
-                Some(Arc::new(TxBuilder::new(
-                    signer,
-                    chain_id,
-                    liquidator_cfg.contract_address,
-                )))
             }
-            Err(err) => {
-                warn!(error = ?err, "BOT_SIGNER_KEY set but unparseable — tx builder disabled");
-                None
+        }
+        for (chain_name, chain_cfg) in &config.chain {
+            if chain_cfg.private_rpc_url.is_none() && !chain_cfg.allow_public_mempool {
+                bail!(
+                    "--execute refuses to start: chain '{chain_name}' has no private_rpc_url \
+                     and allow_public_mempool is false — liquidation txs must not leak to the \
+                     public mempool"
+                );
             }
-        },
-        Err(_) => {
-            info!("BOT_SIGNER_KEY not set — pipeline runs read-only (no tx signing/sim)");
+        }
+        let confirmed = std::env::var(EXECUTE_CONFIRMATION_ENV)
+            .ok()
+            .map(|v| v.trim().to_string())
+            .unwrap_or_default();
+        if confirmed != "1" {
+            bail!(
+                "--execute refuses to start: set {EXECUTE_CONFIRMATION_ENV}=1 in the environment \
+                 to confirm you intend to sign and broadcast liquidations"
+            );
+        }
+        warn!(
+            "execute mode confirmed — bot will sign and broadcast liquidations on every \
+             simulation-passing opportunity"
+        );
+    }
+
+    // Venus pipeline state is currently single-chain (BNB) per config
+    // scope. Build it only if `[protocol.venus]` exists and its target
+    // chain plus flashloan+liquidator entries are all configured;
+    // otherwise run the listener pipeline without a scanner.
+    let venus: Option<Arc<VenusPipeline>> = match config.protocol.get("venus") {
+        Some(venus_cfg) => {
+            let chain_name = &venus_cfg.chain;
+            let chain_cfg = config.chain.get(chain_name).with_context(|| {
+                format!(
+                    "protocol 'venus' references chain '{chain_name}' which is not in [chain.*]"
+                )
+            })?;
+
+            // Single shared pub-sub provider for the Venus adapter,
+            // price cache, flash-loan adapter, and simulator. Cuts
+            // WebSocket count from 4 to 1.
+            let provider = Arc::new(
+                ProviderBuilder::new()
+                    .on_ws(WsConnect::new(&chain_cfg.ws_url))
+                    .await
+                    .context("venus adapter: failed to open shared ws provider")?,
+            );
+
+            let adapter =
+                Arc::new(VenusAdapter::connect(provider.clone(), venus_cfg.comptroller).await?);
+
+            let scanner = Arc::new(HealthScanner::new(
+                config.bot.liquidatable_threshold_bps,
+                config.bot.near_liq_threshold_bps,
+            )?);
+            let scheduler = ScanScheduler::new(
+                config.bot.hot_scan_blocks,
+                config.bot.warm_scan_blocks,
+                config.bot.cold_scan_blocks,
+            );
+
+            // Chainlink price cache. Empty map = no feeds configured,
+            // cache stays idle and downstream stages fall back to the
+            // protocol oracle. Reuses the Venus adapter's WS provider.
+            let price_feeds = config.chainlink.get(chain_name).cloned().unwrap_or_default();
+            let prices = Arc::new(PriceCache::new(
+                provider.clone(),
+                price_feeds,
+                DEFAULT_MAX_AGE,
+            ));
+            prices.refresh_all().await;
+            let fresh_feeds: Vec<String> = prices.symbols().map(str::to_string).collect();
+            for sym in &fresh_feeds {
+                if let Some(p) = prices.get(sym) {
+                    info!(
+                        symbol = %sym,
+                        price = %p.price,
+                        decimals = p.decimals,
+                        "chainlink feed"
+                    );
+                }
+            }
+
+            // Native-feed preflight. The profit gate converts gas
+            // cost (priced in native wei) into debt-token wei via the
+            // ratio `native_price / debt_price`. Without the native
+            // feed we would be guessing. Refuse to start rather than
+            // silently drop every opportunity.
+            if prices.get(NATIVE_FEED_SYMBOL).is_none() {
+                bail!(
+                    "chainlink feed for '{NATIVE_FEED_SYMBOL}' missing or stale on chain \
+                     '{chain_name}' — gas cost cannot be priced"
+                );
+            }
+
+            // Token metadata (symbol + decimals) for every Venus
+            // underlying. Queried once at startup; the profit gate
+            // needs both fields to convert a raw repay amount into
+            // USD cents via the price cache. A token whose meta
+            // calls fail is silently skipped by `TokenMetaCache` and
+            // will be seen as "unknown meta" by the profit gate (→
+            // opportunity dropped, not mispriced).
+            let underlyings = adapter.underlying_tokens().await;
+            let token_meta = Arc::new(
+                TokenMetaCache::build(provider.as_ref(), underlyings.iter().copied()).await,
+            );
+            info!(
+                chain = %chain_name,
+                tokens_cached = token_meta.len(),
+                "token metadata cache built"
+            );
+            if token_meta.is_empty() {
+                bail!(
+                    "token metadata cache is empty on chain '{chain_name}' — no Venus \
+                     underlying resolved its symbol/decimals; profit gate would drop every \
+                     opportunity. Check RPC and adapter wiring."
+                );
+            }
+
+            // Gas oracle wired into the profit gate so every
+            // opportunity is priced against the live base-fee
+            // observed on-chain, not a static debt-wei constant.
+            // ExecHarness builds its own oracle for broadcast; the
+            // per-block cache on each instance means both paths
+            // converge on one RPC call per tick even without
+            // sharing state.
+            let profit_gas_oracle = Arc::new(GasOracle::new_for_chain(
+                chain_name.clone(),
+                config.bot.max_gas_wei,
+                chain_cfg.priority_fee_gwei,
+            ));
+
+            // Flash-loan router — Aave V3 on BSC for v0.1. Requires a
+            // liquidator address (receiver) from [liquidator.<chain>]
+            // so `executeOperation` can be dispatched back to our
+            // deployed contract. Absence of either stops pipeline
+            // construction — the listener still runs event-drain-only.
+            let router = match (
+                config.flashloan.get("aave_v3_bsc"),
+                config.liquidator.get(chain_name.as_str()),
+            ) {
+                (Some(fl_cfg), Some(liq_cfg)) => {
+                    let data_provider = fl_cfg.data_provider.with_context(|| {
+                        format!(
+                            "flashloan 'aave_v3_bsc': missing data_provider for chain '{chain_name}'"
+                        )
+                    })?;
+                    let aave = Arc::new(
+                        AaveFlashLoan::connect(
+                            provider.clone(),
+                            fl_cfg.pool,
+                            data_provider,
+                            liq_cfg.contract_address,
+                        )
+                        .await
+                        .context("aave v3: failed to connect flash-loan adapter")?,
+                    );
+                    Some((Arc::new(FlashLoanRouter::new(vec![aave])), liq_cfg.contract_address))
+                }
+                _ => {
+                    info!(
+                        "no [flashloan.aave_v3_bsc] + [liquidator.<chain>] — pipeline will scan \
+                         but not build / simulate / enqueue"
+                    );
+                    None
+                }
+            };
+
+            let chain_id = chain_cfg.chain_id;
+
+            info!(
+                chain = %chain_name,
+                borrower_count = borrowers.len(),
+                market_count = adapter.markets().await.len(),
+                feed_count = fresh_feeds.len(),
+                liquidatable_bps = config.bot.liquidatable_threshold_bps,
+                near_liq_bps = config.bot.near_liq_threshold_bps,
+                hot_blocks = scheduler.hot,
+                warm_blocks = scheduler.warm,
+                cold_blocks = scheduler.cold,
+                flash_sources = router.as_ref().map(|(r, _)| r.providers().len()).unwrap_or(0),
+                min_profit_usd_1e6 = config.bot.min_profit_usd_1e6,
+                signer_configured = config.bot.signer_key.is_some(),
+                "venus pipeline ready"
+            );
+
+            match router {
+                Some((router, liquidator)) => {
+                    // ── Execution harness (--execute only) ────────────
+                    //
+                    // Eagerly assemble gas oracle + nonce manager +
+                    // submitter when the operator opted in. Any
+                    // failure here aborts startup: by this point
+                    // `--execute` has already cleared the four safety
+                    // gates above, so a missing private RPC here would
+                    // be a config bug we refuse to paper over. The
+                    // signer is materialised once, used only to derive
+                    // the address for the nonce manager, and dropped
+                    // — the builder+simulator path in
+                    // `ensure_executor` re-parses the key from
+                    // `SecretString` for its own use so the raw bytes
+                    // never outlive either call site.
+                    let exec_harness: Option<Arc<ExecHarness>> = if execute {
+                        let signer_key = config
+                            .bot
+                            .signer_key
+                            .as_ref()
+                            .expect("--execute safety gate guarantees signer_key is Some");
+                        let raw = signer_key.expose_secret();
+                        let signer: PrivateKeySigner = raw.parse().context(
+                            "--execute: bot.signer_key failed to parse as a PrivateKeySigner",
+                        )?;
+                        let signer_address = signer.address();
+                        drop(signer);
+
+                        let private_url = chain_cfg.private_rpc_url.as_ref().context(
+                            "--execute: chain has no private_rpc_url (allow_public_mempool \
+                             is dev-only and is not supported by the Submitter)",
+                        )?;
+                        let submitter = Submitter::connect(
+                            private_url,
+                            chain_cfg.private_rpc_auth.as_ref(),
+                            DEFAULT_SUBMIT_TIMEOUT,
+                        )
+                        .await
+                        .context("--execute: failed to connect private-RPC submitter")?;
+                        let submitter_label = submitter.endpoint().to_string();
+
+                        let nonce_manager =
+                            NonceManager::init(provider.as_ref(), signer_address)
+                                .await
+                                .context("--execute: failed to initialise nonce manager")?;
+
+                        let gas_oracle = GasOracle::new_for_chain(
+                            chain_name.clone(),
+                            config.bot.max_gas_wei,
+                            chain_cfg.priority_fee_gwei,
+                        );
+
+                        warn!(
+                            chain = %chain_name,
+                            signer = %signer_address,
+                            liquidator = %liquidator,
+                            submitter = %submitter_label,
+                            max_gas_wei = %config.bot.max_gas_wei,
+                            priority_fee_gwei = chain_cfg.priority_fee_gwei,
+                            "execute harness ready — liquidations will be signed and broadcast"
+                        );
+
+                        Some(Arc::new(ExecHarness {
+                            gas_oracle,
+                            nonce_manager: Arc::new(nonce_manager),
+                            submitter: Arc::new(submitter),
+                            signer_address,
+                            submitter_label,
+                        }))
+                    } else {
+                        None
+                    };
+
+                    Some(Arc::new(VenusPipeline {
+                        chain_name: chain_name.clone(),
+                        adapter,
+                        scanner,
+                        scheduler,
+                        prices,
+                        token_meta,
+                        gas_oracle: profit_gas_oracle,
+                        router,
+                        liquidator,
+                        provider,
+                        queue: Arc::new(OpportunityQueue::with_default_ttl()),
+                        tx_builder: tokio::sync::OnceCell::new(),
+                        simulator: tokio::sync::OnceCell::new(),
+                        min_profit_usd_1e6: config.bot.min_profit_usd_1e6,
+                        chain_id,
+                        exec_harness,
+                    }))
+                }
+                None => {
+                    if execute {
+                        bail!(
+                            "--execute requires a [flashloan.aave_v3_bsc] and \
+                             [liquidator.<chain>] pair — configure both before enabling \
+                             broadcast"
+                        );
+                    }
+                    None
+                }
+            }
+        }
+        None => {
+            if execute {
+                bail!(
+                    "--execute requires [protocol.venus] to be configured — refusing to \
+                     start an execute-mode listener without a protocol pipeline"
+                );
+            }
+            info!(
+                "no [protocol.venus] configured — listener will drain events without scanning"
+            );
             None
         }
     };
 
-    let simulator = tx_builder.as_ref().map(|b| {
-        Arc::new(Simulator::new(
-            b.signer_address(),
-            liquidator_cfg.contract_address,
-        ))
-    });
-
-    // ── Execution harness (gated on --execute) ──
-    // Built only when every safety gate passes: signer present,
-    // non-zero liquidator, private-RPC URL present on the chain. Any
-    // failure here aborts startup rather than silently degrading to
-    // scan-only — `--execute` is an explicit operator intent.
-    let exec_harness: Option<Arc<ExecHarness>> = if execute {
-        let builder = tx_builder
-            .as_ref()
-            .context("--execute requires BOT_SIGNER_KEY to be set and parseable")?;
-        if liquidator_cfg.contract_address == Address::ZERO {
-            bail!("--execute refuses to run with zero-address liquidator");
-        }
-        let url = bnb
-            .private_rpc_url
-            .as_ref()
-            .context("--execute requires a private_rpc_url on chain 'bnb' (https:// or wss://)")?;
-        let submitter = Submitter::connect(url, bnb.private_rpc_auth.as_ref(), DEFAULT_SUBMIT_TIMEOUT)
-            .await
-            .context("--execute: failed to connect private-RPC submitter")?;
-        let signer_address = builder.signer_address();
-        let nonce_manager = NonceManager::init(provider.as_ref(), signer_address)
-            .await
-            .context("--execute: failed to initialise nonce manager")?;
-        warn!(
-            signer = %signer_address,
-            liquidator = %liquidator_cfg.contract_address,
-            max_gas_gwei = config.bot.max_gas_gwei,
-            "execute mode ON — bot will sign and broadcast liquidations"
-        );
-        Some(Arc::new(ExecHarness {
-            gas_oracle,
-            nonce_manager: Arc::new(nonce_manager),
-            submitter: Arc::new(submitter),
-            signer_address,
-        }))
-    } else {
-        None
-    };
-
-    // ── Profit-ordered queue ──
-    let queue = Arc::new(tokio::sync::Mutex::new(OpportunityQueue::with_default_ttl()));
-
-    info!(
-        borrower_count = borrowers.len(),
-        market_count = adapter.markets.len(),
-        liquidatable_threshold = config.bot.liquidatable_threshold,
-        near_liq_threshold = config.bot.near_liq_threshold,
-        flash_sources = router.providers().len(),
-        signer_present = tx_builder.is_some(),
-        execute = exec_harness.is_some(),
-        "pipeline ready"
-    );
-
-    // ── Block-event drain ──
     let (tx, mut rx) = mpsc::channel::<ChainEvent>(CHAIN_EVENT_CHANNEL);
-    for (name, chain_cfg) in config.chain {
-        let listener = BlockListener::new(name.clone(), chain_cfg, tx.clone());
-        tokio::spawn(async move {
-            if let Err(err) = listener.run().await {
-                warn!(chain = %name, error = ?err, "listener terminated");
+    let mut listeners: tokio::task::JoinSet<(String, Result<()>)> = tokio::task::JoinSet::new();
+
+    // ── Prometheus exporter (#222) ────────────────────────────────────
+    // Install the global metrics recorder and push the HTTP-listener
+    // future onto the same JoinSet that supervises block/mempool tasks
+    // so a panic in `hyper`/`tokio` inside the exporter triggers the
+    // same controlled-shutdown path (SIGINT / SIGTERM / supervise).
+    // `install` returns `Ok(None)` on a repeat call in the same
+    // process (#223) — nothing to supervise on re-invocation.
+    if config.metrics.enabled {
+        match charon_metrics::install(config.metrics.bind) {
+            Ok(Some(exporter)) => {
+                charon_metrics::set_build_info(
+                    env!("CARGO_PKG_VERSION"),
+                    option_env!("CHARON_GIT_SHA").unwrap_or("unknown"),
+                );
+                listeners.spawn(async move {
+                    let res: Result<()> = exporter
+                        .await
+                        .map_err(|err| anyhow::anyhow!("metrics exporter: {err:?}"));
+                    ("metrics".to_string(), res)
+                });
+                info!(bind = %config.metrics.bind, "metrics exporter listening on /metrics");
             }
-        });
+            Ok(None) => {
+                info!(
+                    bind = %config.metrics.bind,
+                    "metrics exporter already installed — skipping duplicate install"
+                );
+            }
+            Err(err) => {
+                // Refuse to start with a broken exporter: dashboards
+                // would silently go dark and an operator would not
+                // catch it until the next alert fire.
+                return Err(anyhow::anyhow!(
+                    "failed to install metrics exporter on {}: {err}",
+                    config.metrics.bind
+                ));
+            }
+        }
+    } else {
+        info!("metrics exporter disabled via [metrics].enabled = false");
     }
+
+    // ── Mempool monitor (#46 / #299) ──────────────────────────────────
+    // Spawn the pending-tx monitor alongside `BlockListener` on the
+    // Venus pipeline's shared provider. Enabled only when the operator
+    // sets `CHARON_VENUS_ORACLE` to a hex-encoded oracle address — most
+    // public BSC RPCs do not expose `newPendingTransactions` (see the
+    // mempool module's RPC-requirements docs). The returned
+    // [`PendingCache`] is retained so the block-event drain can call
+    // `drain_for_block` with the real confirmed-tx set each tick; the
+    // [`OracleUpdate`] channel is currently logged only (pre-sign
+    // builder wiring is explicitly non-goal for #299, so updates are
+    // observed and dropped until the signer + deployed liquidator
+    // bridge lands in a follow-up).
+    //
+    // The monitor is only wired when a Venus pipeline exists; without
+    // one there is no consumer for either the cache drain or the
+    // oracle-update channel.
+    let mempool_cache: Option<Arc<PendingCache>> =
+        match (venus.as_ref(), std::env::var(VENUS_ORACLE_ENV)) {
+            (Some(pipeline), Ok(hex)) if !hex.is_empty() => {
+                match Address::from_str(hex.trim()) {
+                    Ok(oracle) => {
+                        let monitor = Arc::new(MempoolMonitor::with_defaults_for_chain(
+                            pipeline.chain_name.clone(),
+                            pipeline.provider.clone(),
+                            oracle,
+                        ));
+                        let cache = monitor.cache();
+                        let (oracle_tx, mut oracle_rx) =
+                            mpsc::channel::<OracleUpdate>(ORACLE_UPDATE_CHANNEL);
+                        let monitor_for_task = monitor.clone();
+                        let mempool_task_name = format!("mempool/{}", pipeline.chain_name);
+                        listeners.spawn(async move {
+                            let name = mempool_task_name;
+                            let res: Result<()> = monitor_for_task
+                                .run(oracle_tx)
+                                .await
+                                .map_err(|err| anyhow::anyhow!("mempool monitor: {err}"));
+                            (name, res)
+                        });
+                        let watch_task_name = format!("oracle-watch/{}", pipeline.chain_name);
+                        listeners.spawn(async move {
+                            let name = watch_task_name;
+                            // Non-goal: forwarding OracleUpdate into a
+                            // pre-sign builder or into PriceCache
+                            // refresh (signer + liquidator bridge and
+                            // price-cache push-update API tracked
+                            // separately). Log at debug so operators
+                            // can verify the monitor is actually
+                            // decoding oracle writes on their upstream
+                            // without the flood reaching info.
+                            while let Some(update) = oracle_rx.recv().await {
+                                debug!(
+                                    tx = %update.tx_hash(),
+                                    asset = %update.asset(),
+                                    kind = update.kind(),
+                                    "oracle update observed (pre-sign builder not yet wired)"
+                                );
+                            }
+                            (name, Ok::<(), anyhow::Error>(()))
+                        });
+                        info!(
+                            oracle = %oracle,
+                            chain = %pipeline.chain_name,
+                            "mempool monitor spawned"
+                        );
+                        Some(cache)
+                    }
+                    Err(err) => {
+                        warn!(
+                            env = VENUS_ORACLE_ENV,
+                            error = ?err,
+                            "mempool oracle env var set but unparseable; mempool monitor disabled"
+                        );
+                        None
+                    }
+                }
+            }
+            (None, _) => {
+                info!(
+                    env = VENUS_ORACLE_ENV,
+                    "mempool monitor disabled (no venus pipeline configured)"
+                );
+                None
+            }
+            _ => {
+                info!(
+                    env = VENUS_ORACLE_ENV,
+                    "mempool monitor disabled (no oracle address configured)"
+                );
+                None
+            }
+        };
+
+    // `ChainConfig: Clone` — we only borrow `config`, so each listener
+    // task gets its own owned copy.
+    for (name, chain_cfg) in &config.chain {
+        let name = name.clone();
+        let chain_cfg = chain_cfg.clone();
+        let listener = BlockListener::new(name.clone(), chain_cfg, tx.clone());
+        listeners.spawn(async move { (name, listener.run().await) });
+    }
+    // Drop our sender so the channel closes when every listener exits.
     drop(tx);
 
-    info!("listen: draining chain events (Ctrl-C to stop)");
+    info!("listen: draining chain events (Ctrl-C or SIGTERM to stop)");
 
+    // The signer is loaded lazily on first actionable opportunity so
+    // pure scanning works without a signer configured. The
+    // `signer_key` field is `Option<SecretString>` — we
+    // `expose_secret()` at exactly one call site, pass it straight to
+    // `PrivateKeySigner::from_str`, and never retain the exposed
+    // bytes.
+    let signer_key = config.bot.signer_key.clone();
+
+    // The first real (non-backfill) block on the Venus chain seeds
+    // the scanner with the operator-supplied borrower list.
+    // Subsequent scans pull from the scheduler-selected bucket
+    // membership so we don't burn RPC re-fetching COLD positions
+    // every block.
+    let mut seeded = false;
     tokio::select! {
         _ = async {
             while let Some(event) = rx.recv().await {
                 match event {
-                    ChainEvent::NewBlock { chain, number, timestamp } => {
-                        process_block(
-                            chain,
+                    ChainEvent::NewBlock {
+                        chain,
+                        number,
+                        timestamp,
+                        block_hash,
+                        backfill,
+                    } => {
+                        tracing::debug!(
+                            chain = %chain,
+                            block = number,
+                            timestamp = timestamp,
+                            %block_hash,
+                            backfill,
+                            "cli drained event"
+                        );
+                        if backfill {
+                            // Skip backfill — the next real head will
+                            // snapshot the final state of the missed
+                            // range. The mempool drain is intentionally
+                            // skipped here too: backfilled blocks are
+                            // already several heads behind, so any
+                            // pre-signed tx tied to them would have
+                            // long since expired via cache TTL.
+                            continue;
+                        }
+                        let Some(pipeline) = venus.as_ref() else {
+                            continue;
+                        };
+                        if pipeline.chain_name != chain {
+                            continue;
+                        }
+
+                        // Drain any pre-signed liquidations whose
+                        // oracle trigger landed in this block before
+                        // running the main scan pass. Independent of
+                        // the scan — a mempool hiccup must not block
+                        // the block pipeline.
+                        drain_mempool_for_block(
+                            pipeline.as_ref(),
+                            block_hash,
+                            mempool_cache.as_deref(),
+                            signer_key.as_ref(),
+                        )
+                        .await;
+
+                        // Per-block deadline: a stalled adapter /
+                        // router / simulator must not block the event
+                        // drain across multiple heads.
+                        let pass = run_block_pipeline(
+                            pipeline.clone(),
                             number,
                             timestamp,
                             &borrowers,
-                            adapter.clone(),
-                            scanner.clone(),
-                            router.clone(),
-                            tx_builder.clone(),
-                            simulator.clone(),
-                            exec_harness.clone(),
-                            prices.clone(),
-                            token_meta.clone(),
-                            gas_oracle,
-                            queue.clone(),
-                            provider.clone(),
-                            config.bot.min_profit_usd,
-                        )
-                        .await;
+                            &mut seeded,
+                            signer_key.as_ref(),
+                        );
+                        if let Err(_elapsed) =
+                            tokio::time::timeout(PER_BLOCK_TIMEOUT, pass).await
+                        {
+                            warn!(
+                                chain = %chain,
+                                block = number,
+                                timeout_ms = PER_BLOCK_TIMEOUT.as_millis() as u64,
+                                "per-block pipeline pass timed out; moving on"
+                            );
+                        }
                     }
+                    _ => {}
                 }
             }
-        } => info!("all listeners exited"),
-        _ = tokio::signal::ctrl_c() => info!("ctrl-c received, shutting down"),
+        } => {
+            info!("all listeners exited");
+        }
+        _ = supervise(&mut listeners) => {
+            info!("all listener tasks terminated");
+        }
+        _ = tokio::signal::ctrl_c() => {
+            info!("received SIGINT, shutting down");
+            listeners.shutdown().await;
+        }
+        _ = wait_sigterm() => {
+            info!("received SIGTERM, shutting down");
+            listeners.shutdown().await;
+        }
     }
 
     Ok(())
 }
 
-/// One full pipeline pass for one block. Errors are logged, never
-/// propagated — the bot keeps draining events even if a single block's
-/// scan has issues.
-#[allow(clippy::too_many_arguments)]
-async fn process_block(
-    chain: String,
+/// One full pipeline pass for one non-backfill block on the Venus
+/// chain. Errors are logged, never propagated — the bot keeps draining
+/// events even if a single block's scan has issues.
+async fn run_block_pipeline(
+    pipeline: Arc<VenusPipeline>,
     block: u64,
     timestamp: u64,
     borrowers: &[Address],
-    adapter: Arc<VenusAdapter>,
-    scanner: Arc<HealthScanner>,
-    router: Arc<FlashLoanRouter>,
-    tx_builder: Option<Arc<TxBuilder>>,
-    simulator: Option<Arc<Simulator>>,
-    exec_harness: Option<Arc<ExecHarness>>,
-    prices: Arc<PriceCache>,
-    token_meta: Arc<TokenMetaCache>,
-    gas_oracle: GasOracle,
-    queue: Arc<tokio::sync::Mutex<OpportunityQueue>>,
-    provider: Arc<alloy::providers::RootProvider<alloy::pubsub::PubSubFrontend>>,
-    min_profit_usd: f64,
+    seeded: &mut bool,
+    signer_key: Option<&secrecy::SecretString>,
 ) {
     let start = std::time::Instant::now();
 
-    // 1. Adapter — fetch raw positions for the tracked borrower list.
-    let positions = match adapter.fetch_positions(borrowers).await {
+    // One-shot block counter per pipeline pass (#222). Counted even
+    // when `scan_set` is empty — the block still ticked through the
+    // drain loop and dashboards otherwise silently lose visibility on
+    // "bot is alive, nothing to scan" intervals.
+    charon_metrics::record_block_scanned(pipeline.chain_name.as_str());
+
+    // Which borrowers to scan this tick. First real block uses the
+    // operator's seed list; thereafter the scheduler picks buckets
+    // whose cadence fires.
+    let scan_set: Vec<Address> = if !*seeded {
+        *seeded = true;
+        borrowers.to_vec()
+    } else {
+        let mut v = Vec::new();
+        for b in [
+            PositionBucket::Liquidatable,
+            PositionBucket::NearLiquidation,
+            PositionBucket::Healthy,
+        ] {
+            if pipeline.scheduler.should_scan(b, block) {
+                v.extend(pipeline.scanner.borrowers_in_bucket(b));
+            }
+        }
+        v
+    };
+    if scan_set.is_empty() {
+        return;
+    }
+
+    // Refresh Chainlink prices so downstream profit-ranking reads
+    // sub-heartbeat feeds. Individual feed failures are logged inside
+    // `refresh_all` and do not abort the scan.
+    pipeline.prices.refresh_all().await;
+
+    let block_tag = BlockNumberOrTag::Number(block);
+    let positions = match pipeline.adapter.fetch_positions(&scan_set, block_tag).await {
         Ok(p) => p,
         Err(err) => {
-            warn!(chain = %chain, block, error = ?err, "venus fetch_positions failed");
+            warn!(
+                chain = %pipeline.chain_name,
+                block,
+                error = ?err,
+                "venus fetch_positions failed"
+            );
             return;
         }
     };
 
-    // 2. Scanner — classify into healthy / near-liq / liquidatable buckets.
-    scanner.upsert(positions);
-    let counts = scanner.bucket_counts();
+    let returned = positions.len();
+    pipeline.scanner.upsert(positions.clone());
+    pipeline.scanner.prune(&positions);
+    let counts = pipeline.scanner.bucket_counts();
+    metrics::histogram!("charon_scanner_scan_duration_seconds")
+        .record(start.elapsed().as_secs_f64());
 
-    // 3a. One-shot gas snapshot for this block. Shared across every
-    //    opportunity in this tick so we make a single `get_block`
-    //    call no matter how many liquidatable positions fan out.
-    //    `None` means the gas oracle refused to emit (ceiling tripped
-    //    or RPC error); the profit gate treats that as "too expensive
-    //    this block" and drops every candidate.
-    let gas_snapshot = match gas_oracle.fetch_params(provider.as_ref()).await {
-        Ok(params) => params,
-        Err(err) => {
-            warn!(chain = %chain, block, error = ?err, "gas oracle tick failed");
-            None
-        }
-    };
+    // Per-bucket position gauges — feat/22 `set_position_bucket`.
+    // Emitted every tick so dashboards track live bucket sizes
+    // rather than a stale counter that decays with TTL.
+    let chain = pipeline.chain_name.as_str();
+    charon_metrics::set_position_bucket(chain, bucket::HEALTHY, counts.healthy as u64);
+    charon_metrics::set_position_bucket(
+        chain,
+        bucket::NEAR_LIQ,
+        counts.near_liquidation as u64,
+    );
+    charon_metrics::set_position_bucket(
+        chain,
+        bucket::LIQUIDATABLE,
+        counts.liquidatable as u64,
+    );
 
-    // 3b. Per-liquidatable: route flash loan, calc profit, build, simulate, queue.
-    let liquidatable = scanner.liquidatable();
+    // Walk each liquidatable position through the e2e pipeline. Only
+    // opportunities that pass the simulation gate reach the queue.
+    let liquidatable = pipeline.scanner.liquidatable();
     let mut queued = 0usize;
-    let mut broadcast = 0usize;
     for pos in liquidatable {
-        match process_opportunity(
-            &pos,
-            adapter.as_ref(),
-            router.as_ref(),
-            tx_builder.as_deref(),
-            simulator.as_deref(),
-            exec_harness.as_deref(),
-            prices.as_ref(),
-            token_meta.as_ref(),
-            gas_snapshot,
-            provider.as_ref(),
-            min_profit_usd,
-            block,
-            queue.clone(),
-        )
-        .await
-        {
-            Ok(ProcessOutcome::Queued) => queued += 1,
-            Ok(ProcessOutcome::Broadcast) => {
-                queued += 1;
-                broadcast += 1;
-            }
-            Ok(ProcessOutcome::Dropped) => {}
-            Err(err) => debug!(borrower = %pos.borrower, error = ?err, "opportunity dropped"),
+        match process_opportunity(pipeline.clone(), &pos, block, signer_key).await {
+            Ok(true) => queued += 1,
+            Ok(false) => {}
+            Err(err) => debug!(
+                borrower = %pos.borrower,
+                error = ?err,
+                "opportunity dropped"
+            ),
         }
     }
 
-    // 4. Drain queue stats.
-    let q = queue.lock().await;
-    let queue_len = q.len();
-    drop(q);
-
+    let queue_len = pipeline.queue.len().await;
+    // Queue depth + full per-block pipeline duration. The histogram
+    // uses the domain-scaled buckets registered in
+    // `charon_metrics::install` so BSC's ~3s heartbeat lands inside
+    // meaningful quantiles rather than collapsing into `+Inf`.
+    charon_metrics::set_queue_depth(queue_len as u64);
+    charon_metrics::observe_block_duration(chain, start.elapsed().as_secs_f64());
     info!(
-        chain = %chain,
+        chain = %pipeline.chain_name,
         block,
         timestamp,
-        tracked = borrowers.len(),
+        tracked = scan_set.len(),
+        returned,
         healthy = counts.healthy,
         near_liq = counts.near_liquidation,
         liquidatable = counts.liquidatable,
         queued,
-        broadcast,
         queue_len,
-        block_ms = start.elapsed().as_millis() as u64,
-        "pipeline tick"
+        scan_ms = start.elapsed().as_millis() as u64,
+        "venus scan"
     );
 }
 
-/// Outcome of a single `process_opportunity` invocation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ProcessOutcome {
-    /// Dropped at a profit / simulation / gas gate. Not in the queue.
-    Dropped,
-    /// Accepted and pushed to the profit-ordered queue. No broadcast.
-    Queued,
-    /// Accepted, queued, and broadcast to the private RPC.
-    Broadcast,
+/// Narrow trait objects let `process_opportunity` run against either
+/// the production Simulator-over-provider path or a hand-rolled mock
+/// in tests. Keeps the surface tiny — no simulation framework needed.
+#[async_trait]
+trait SimGate: Send + Sync {
+    async fn encode_and_simulate(
+        &self,
+        opp: &LiquidationOpportunity,
+        params: &LiquidationParams,
+    ) -> Result<()>;
+}
+
+/// Production simulation gate: encode via `TxBuilder`, run `eth_call`
+/// via `Simulator`.
+struct ProductionSimGate<'a> {
+    builder: &'a TxBuilder,
+    sim: &'a Simulator,
+    provider: &'a RootProvider<PubSubFrontend>,
+}
+
+#[async_trait]
+impl<'a> SimGate for ProductionSimGate<'a> {
+    async fn encode_and_simulate(
+        &self,
+        opp: &LiquidationOpportunity,
+        params: &LiquidationParams,
+    ) -> Result<()> {
+        let calldata: Bytes = self.builder.encode_calldata(opp, params)?;
+        self.sim
+            .simulate(self.provider, calldata, SIMULATION_GAS_LIMIT)
+            .await?;
+        Ok(())
+    }
+}
+
+/// Lazy-materialise the `(TxBuilder, Simulator)` pair the first time
+/// an actionable opportunity reaches this pipeline. Scan-only runs
+/// (no signer configured) never touch `signer_key` at all.
+///
+/// The signer bytes are exposed for a single synchronous call to
+/// `PrivateKeySigner::from_str` and then dropped — `TxBuilder` owns
+/// the signer handle, never the raw hex.
+async fn ensure_executor<'a>(
+    pipeline: &'a VenusPipeline,
+    signer_key: Option<&secrecy::SecretString>,
+) -> Option<(&'a TxBuilder, &'a Simulator)> {
+    let builder_slot = pipeline
+        .tx_builder
+        .get_or_init(|| async {
+            let key = signer_key?;
+            // `expose_secret()` is the only place the raw hex is
+            // materialised. `PrivateKeySigner::from_str` parses it
+            // into an internal `k256::SecretKey`; the returned
+            // `String` reference is dropped at end of this block.
+            let raw = key.expose_secret();
+            match raw.parse::<PrivateKeySigner>() {
+                Ok(signer) => {
+                    info!(
+                        signer = %signer.address(),
+                        liquidator = %pipeline.liquidator,
+                        chain_id = pipeline.chain_id,
+                        "tx builder ready"
+                    );
+                    Some(Arc::new(TxBuilder::new(
+                        signer,
+                        pipeline.chain_id,
+                        pipeline.liquidator,
+                    )))
+                }
+                Err(err) => {
+                    // Log the error display *only* — alloy's
+                    // PrivateKeySigner parse error does not echo the
+                    // input hex, but we still stick to `{err}` (not
+                    // `{err:?}`) to avoid any accidental leak.
+                    warn!(
+                        error = %err,
+                        "CHARON_SIGNER_KEY unparseable — tx builder disabled, scan-only mode"
+                    );
+                    None
+                }
+            }
+        })
+        .await;
+    let builder = builder_slot.as_ref()?;
+
+    let sim_slot = pipeline
+        .simulator
+        .get_or_init(|| async { Some(Simulator::from_builder(builder, pipeline.liquidator)) })
+        .await;
+    let sim = sim_slot.as_ref()?;
+
+    Some((builder.as_ref(), sim))
 }
 
 /// Run one liquidatable position through the rest of the pipeline.
-/// Returns a [`ProcessOutcome`] describing how far it made it, or
-/// `Err` for unexpected failures the caller should log at `debug`.
-#[allow(clippy::too_many_arguments)]
+///
+/// Return value semantics:
+/// * `Ok(true)`  — opportunity cleared every gate and landed in the queue.
+/// * `Ok(false)` — dropped at a configured gate (no signer, no route,
+///   below profit threshold, or simulation reverted). Not an error.
+/// * `Err(..)`   — unexpected failure (profit-calc error, encoder
+///   error, RPC error); caller logs.
+///
+/// Hard invariant (CLAUDE.md, #170): **an opportunity is never
+/// enqueued unless it passed the simulation gate**. If no signer is
+/// configured, this function returns `Ok(false)` before touching the
+/// queue — scan-only mode observes, it never queues.
 async fn process_opportunity(
-    pos: &charon_core::Position,
-    adapter: &VenusAdapter,
-    router: &FlashLoanRouter,
-    tx_builder: Option<&TxBuilder>,
-    simulator: Option<&Simulator>,
-    exec_harness: Option<&ExecHarness>,
-    prices: &PriceCache,
-    token_meta: &TokenMetaCache,
-    gas_snapshot: Option<GasParams>,
-    provider: &alloy::providers::RootProvider<alloy::pubsub::PubSubFrontend>,
-    min_profit_usd: f64,
-    queued_at_block: u64,
-    queue: Arc<tokio::sync::Mutex<OpportunityQueue>>,
-) -> Result<ProcessOutcome> {
-    // a. Adapter: build protocol-specific liquidation params (vTokens + repay).
-    let params = adapter.get_liquidation_params(pos)?;
-    let LiquidationParams::Venus { repay_amount, .. } = &params;
-    let repay = *repay_amount;
+    pipeline: Arc<VenusPipeline>,
+    pos: &Position,
+    block: u64,
+    signer_key: Option<&secrecy::SecretString>,
+) -> Result<bool> {
+    // a. Adapter: build protocol-specific liquidation params (vTokens
+    //    + repay).
+    let params = pipeline
+        .adapter
+        .get_liquidation_params(pos)
+        .context("venus: get_liquidation_params failed")?;
 
-    // b. Router: pick cheapest flash-loan source.
-    let Some(quote) = router.route(pos.debt_token, repay).await else {
-        return Ok(ProcessOutcome::Dropped);
+    // Exhaustive match so a new `LiquidationParams` variant forces
+    // this call site to be audited. `LiquidationParams` is
+    // `#[non_exhaustive]`, hence the trailing wildcard.
+    let repay = match &params {
+        LiquidationParams::Venus { repay_amount, .. } => *repay_amount,
+        other => {
+            debug!(
+                borrower = %pos.borrower,
+                variant = ?other,
+                "unsupported liquidation protocol — skipping"
+            );
+            return Ok(false);
+        }
     };
 
-    // c. Real profit calc. Any missing piece of price/meta/gas data
-    //    deliberately drops the opportunity rather than falling back
-    //    to an optimistic default — the profit gate is the last line
-    //    of defence against broadcasting an unprofitable tx.
-    let Some(debt_meta) = token_meta.get(&pos.debt_token) else {
+    let chain = pipeline.chain_name.as_str();
+
+    // b. Router: pick cheapest flash-loan source for (debt token,
+    //    repay amount).
+    let Some(quote) = pipeline.router.route(pos.debt_token, repay).await else {
+        charon_metrics::record_opportunity_dropped(chain, drop_stage::ROUTER);
+        return Ok(false);
+    };
+
+    // c. Profit calc — wei-native NetProfit breakdown with real
+    //    per-token pricing (#148 follow-up / #306). Every missing
+    //    piece of price/meta/gas data is a hard drop: the profit
+    //    gate is the last line of defence against broadcasting an
+    //    unprofitable tx, so a "maybe profitable" signal is never
+    //    produced against fallback values.
+    let Some(debt_meta) = pipeline.token_meta.get(&pos.debt_token) else {
+        charon_metrics::record_opportunity_dropped(chain, drop_stage::PROFIT);
         debug!(
             borrower = %pos.borrower,
             debt_token = %pos.debt_token,
             "no token metadata — dropped"
         );
-        return Ok(ProcessOutcome::Dropped);
+        return Ok(false);
     };
-    let Some(debt_price) = prices.get(&debt_meta.symbol) else {
+    let Some(debt_cached) = pipeline.prices.get(&debt_meta.symbol) else {
+        charon_metrics::record_opportunity_dropped(chain, drop_stage::PROFIT);
         debug!(
             borrower = %pos.borrower,
             symbol = %debt_meta.symbol,
             "no chainlink price (or stale) — dropped"
         );
-        return Ok(ProcessOutcome::Dropped);
+        return Ok(false);
     };
-    let Some(native_price) = prices.get(NATIVE_FEED_SYMBOL) else {
+    let Some(native_cached) = pipeline.prices.get(NATIVE_FEED_SYMBOL) else {
+        charon_metrics::record_opportunity_dropped(chain, drop_stage::PROFIT);
         debug!(
             borrower = %pos.borrower,
-            "no BNB/USD price (or stale) — dropped"
+            "no native/USD price (or stale) — dropped"
         );
-        return Ok(ProcessOutcome::Dropped);
-    };
-    let Some(gas_params) = gas_snapshot else {
-        debug!(
-            borrower = %pos.borrower,
-            "gas snapshot unavailable this block — dropped"
-        );
-        return Ok(ProcessOutcome::Dropped);
+        return Ok(false);
     };
 
-    let repay_usd_cents = amount_to_usd_cents(
-        repay,
-        debt_meta.decimals,
-        debt_price.price,
-        debt_price.decimals,
-    );
-    let flash_fee_usd_cents = amount_to_usd_cents(
-        quote.fee,
-        debt_meta.decimals,
-        debt_price.price,
-        debt_price.decimals,
-    );
-    let gas_cost_usd = gas_cost_usd_cents(
-        PROFIT_GATE_ROUGH_GAS_UNITS,
-        gas_params.max_fee_per_gas,
-        native_price.price,
-        native_price.decimals,
-    );
-
-    let profit_inputs = ProfitInputs {
-        repay_amount_usd_cents: repay_usd_cents,
-        liquidation_bonus_bps: pos.liquidation_bonus_bps,
-        flash_fee_usd_cents,
-        gas_cost_usd_cents: gas_cost_usd,
-        slippage_bps: DEFAULT_SLIPPAGE_BPS,
+    // Chainlink answers arrive with the feed's native decimals
+    // (`decimals` is typically 8 on BSC but is read per-feed); the
+    // `Price` wire-format used by `ProfitInputs` is strictly 1e8.
+    // `scaled_to(8)` normalises both without relying on a constant.
+    let debt_price_1e8 = match u64::try_from(debt_cached.scaled_to(8)) {
+        Ok(v) if v > 0 => v,
+        _ => {
+            charon_metrics::record_opportunity_dropped(chain, drop_stage::PROFIT);
+            debug!(
+                borrower = %pos.borrower,
+                symbol = %debt_meta.symbol,
+                "debt price out of u64 range or zero — dropped"
+            );
+            return Ok(false);
+        }
     };
-    let net = match calculate_profit(&profit_inputs, min_profit_usd) {
-        Ok(n) => n,
+    let native_price_1e8 = match u64::try_from(native_cached.scaled_to(8)) {
+        Ok(v) if v > 0 => v,
+        _ => {
+            charon_metrics::record_opportunity_dropped(chain, drop_stage::PROFIT);
+            debug!(
+                borrower = %pos.borrower,
+                "native price out of u64 range or zero — dropped"
+            );
+            return Ok(false);
+        }
+    };
+    let debt_price = match Price::new(debt_price_1e8) {
+        Ok(p) => p,
         Err(err) => {
-            debug!(borrower = %pos.borrower, error = ?err, "profit gate dropped");
-            return Ok(ProcessOutcome::Dropped);
+            charon_metrics::record_opportunity_dropped(chain, drop_stage::PROFIT);
+            debug!(borrower = %pos.borrower, error = ?err, "debt Price rejected");
+            return Ok(false);
         }
     };
 
-    // d. Build the executor's view of the opportunity. swap_route is
-    //    a placeholder until the DEX optimizer lands; min_amount_out
-    //    is set to `quote.amount + quote.fee` so the on-chain backstop
-    //    catches an under-fill.
-    let opp = LiquidationOpportunity {
-        position: pos.clone(),
-        debt_to_repay: repay,
-        expected_collateral_out: pos.collateral_amount,
-        flash_source: quote.source,
-        swap_route: SwapRoute {
+    // Gas cost in debt-token wei:
+    //
+    //   native_wei  = gas_units * max_fee_per_gas
+    //   debt_wei    = native_wei * native_price_1e8 / debt_price_1e8
+    //               * 10^debt_decimals / 10^native_decimals
+    //
+    // BSC native (BNB) is 18 decimals. We assume 18 here — the same
+    // assumption baked into `STATIC_GAS_FLOOR_DEBT_WEI` / previous
+    // placeholder pricing. A per-chain native-decimals lookup is a
+    // follow-up if non-EVM or non-18-dec native chains enter scope.
+    const NATIVE_DECIMALS: u8 = 18;
+    let gas_decision = match pipeline
+        .gas_oracle
+        .fetch_params(pipeline.provider.as_ref(), Some(block))
+        .await
+    {
+        Ok(d) => d,
+        Err(err) => {
+            charon_metrics::record_opportunity_dropped(chain, drop_stage::PROFIT);
+            debug!(
+                borrower = %pos.borrower,
+                error = ?err,
+                "gas oracle fetch failed — dropped"
+            );
+            return Ok(false);
+        }
+    };
+    let gas_params = match gas_decision {
+        GasDecision::Proceed(p) => p,
+        GasDecision::SkipCeilingExceeded {
+            max_fee_wei,
+            ceiling_wei,
+        } => {
+            charon_metrics::record_opportunity_dropped(chain, drop_stage::PROFIT);
+            debug!(
+                borrower = %pos.borrower,
+                %max_fee_wei,
+                %ceiling_wei,
+                "gas ceiling exceeded — dropped"
+            );
+            return Ok(false);
+        }
+        // `GasDecision` is `#[non_exhaustive]` — any future skip
+        // variant must fail closed rather than silently proceed.
+        _ => {
+            charon_metrics::record_opportunity_dropped(chain, drop_stage::PROFIT);
+            debug!(
+                borrower = %pos.borrower,
+                "unrecognised GasDecision variant — dropped"
+            );
+            return Ok(false);
+        }
+    };
+    let gas_cost_debt_wei = gas_cost_in_debt_wei(
+        PROFIT_GATE_ROUGH_GAS_UNITS,
+        gas_params.max_fee_per_gas,
+        native_price_1e8,
+        debt_price_1e8,
+        NATIVE_DECIMALS,
+        debt_meta.decimals,
+    );
+
+    let opp_preview = preview_opportunity(pos, &quote, repay);
+    let inputs = match ProfitInputs::from_opportunity(
+        &opp_preview,
+        opp_preview.expected_collateral_out,
+        quote.fee,
+        gas_cost_debt_wei,
+        DEFAULT_SLIPPAGE_BPS,
+        debt_price,
+        debt_meta.decimals,
+    ) {
+        Ok(i) => i,
+        Err(err) => {
+            charon_metrics::record_opportunity_dropped(chain, drop_stage::PROFIT);
+            debug!(borrower = %pos.borrower, error = ?err, "profit inputs rejected");
+            return Ok(false);
+        }
+    };
+    let net = match calculate_profit(&inputs, pipeline.min_profit_usd_1e6) {
+        Ok(n) => n,
+        Err(err) => {
+            charon_metrics::record_opportunity_dropped(chain, drop_stage::PROFIT);
+            debug!(borrower = %pos.borrower, error = ?err, "profit gate dropped");
+            return Ok(false);
+        }
+    };
+
+    // d. Build the executor's view of the opportunity.
+    //
+    //    `swap_route.min_amount_out` is the on-chain backstop. It
+    //    must strictly exceed what we owe (quote.amount + quote.fee)
+    //    by at least gas floor + profit floor — otherwise the flash
+    //    loan could close successfully while the bot posts a zero-
+    //    or negative-net result on-chain. Today both floors are
+    //    constants in debt-token smallest units; live gas-oracle +
+    //    USD → token conversion (#148) replaces them.
+    let gas_floor = U256::from(STATIC_GAS_FLOOR_DEBT_WEI);
+    let profit_floor = U256::from(MIN_PROFIT_FLOOR_DEBT_WEI);
+    let min_amount_out = quote
+        .amount
+        .saturating_add(quote.fee)
+        .saturating_add(gas_floor)
+        .saturating_add(profit_floor);
+
+    let opp = LiquidationOpportunity::with_profit(
+        opp_preview.position.clone(),
+        repay,
+        opp_preview.expected_collateral_out,
+        quote.source,
+        charon_core::SwapRoute {
             token_in: pos.collateral_token,
             token_out: pos.debt_token,
             amount_in: pos.collateral_amount,
-            min_amount_out: quote.amount + quote.fee,
-            pool_fee: 3_000,
+            min_amount_out,
+            // PancakeSwap V3 hot-pair default. `None` is for
+            // fee-less routes (Balancer V2, Curve stable pool);
+            // PancakeSwap V3 uses 0.3% for BSC stablecoin pairs.
+            pool_fee: Some(3_000),
         },
-        net_profit_usd_cents: net.net_usd_cents,
+        net,
+    );
+
+    // e. Simulation gate — the hard safety invariant: no signer → no
+    //    simulation → no enqueue. We refuse to push opportunities
+    //    that have not passed `eth_call`, because the downstream
+    //    broadcast stage assumes every queued entry is known-good
+    //    against the latest state.
+    let Some((builder, sim)) = ensure_executor(pipeline.as_ref(), signer_key).await else {
+        // Scan-only mode: no signer, no simulation, no enqueue. Count
+        // as a simulation-stage drop so dashboards surface scan-only
+        // runs without hiding them under router/profit gates.
+        charon_metrics::record_opportunity_dropped(chain, drop_stage::SIMULATION);
+        debug!(
+            borrower = %pos.borrower,
+            "simulation skipped — no signer configured; opportunity not enqueued"
+        );
+        return Ok(false);
     };
 
-    // e. Tx builder + simulator — only if the operator supplied
-    //    BOT_SIGNER_KEY. Without it, push to the queue based on profit
-    //    alone so dry-runs still surface ranked candidates.
-    let calldata = match (tx_builder, simulator) {
-        (Some(builder), Some(sim)) => {
-            let bytes = builder.encode_calldata(&opp, &params)?;
-            if let Err(err) = sim.simulate(provider, bytes.clone()).await {
-                debug!(borrower = %pos.borrower, error = ?err, "simulation gate dropped");
-                return Ok(ProcessOutcome::Dropped);
-            }
-            Some(bytes)
-        }
-        _ => None,
+    let gate = ProductionSimGate {
+        builder,
+        sim,
+        provider: pipeline.provider.as_ref(),
     };
-
-    // f. Push to the profit-ordered queue before broadcast so a later
-    //    submit failure still leaves a record of the ranked candidate.
-    let mut outcome = ProcessOutcome::Queued;
-    {
-        let mut q = queue.lock().await;
-        q.push(opp.clone(), queued_at_block);
+    if let Err(err) = gate.encode_and_simulate(&opp, &params).await {
+        charon_metrics::record_simulation(chain, sim_result::REVERT);
+        charon_metrics::record_opportunity_dropped(chain, drop_stage::SIMULATION);
+        debug!(borrower = %pos.borrower, error = ?err, "simulation gate dropped");
+        return Ok(false);
     }
+    charon_metrics::record_simulation(chain, sim_result::OK);
 
-    // g. Broadcast (only when --execute set every gate, and we have
-    //    calldata from the sim step — `exec_harness.is_some()` implies
-    //    `tx_builder.is_some()` and `simulator.is_some()`).
-    if let (Some(harness), Some(builder), Some(bytes)) = (exec_harness, tx_builder, calldata) {
-        match broadcast(harness, builder, provider, bytes).await {
-            Ok(hash) => {
+    // f. Push to the profit-ordered queue. `simulated = true` because
+    //    the production path only reaches here after a successful
+    //    `eth_call` gate — dry-run entries never get here.
+    //    **Queue-before-broadcast**: insert into the queue first so a
+    //    later submit failure still leaves a record of the ranked
+    //    candidate, and so the (future) broadcast-retry stage can
+    //    walk the queue without racing the broadcast attempt below.
+    let profit_cents = wei_to_usd_cents(opp.net_profit_wei);
+    pipeline.queue.push(opp.clone(), block).await;
+    charon_metrics::record_opportunity_queued(chain, profit_cents, true);
+
+    // g. Broadcast stage — only when `--execute` assembled the
+    //    harness on startup. Re-encodes calldata (pure local work;
+    //    no RPC) rather than threading the sim calldata through the
+    //    gate trait. The broadcast is deliberately best-effort: any
+    //    failure is logged and the opportunity stays queued, so a
+    //    future retry stage can pick it up. `Ok(true)` still reports
+    //    "enqueued"; broadcast success is an additional metric label.
+    if let Some(harness) = pipeline.exec_harness.as_ref() {
+        match broadcast_opportunity(pipeline.as_ref(), harness, &opp, &params, builder).await {
+            Ok(tx_hash) => {
                 info!(
+                    chain = %pipeline.chain_name,
                     borrower = %pos.borrower,
-                    net_profit_cents = net.net_usd_cents,
-                    %hash,
+                    %tx_hash,
+                    submitter = %harness.submitter_label,
+                    net_profit_cents = profit_cents,
                     "liquidation broadcast"
                 );
-                outcome = ProcessOutcome::Broadcast;
             }
             Err(err) => {
                 warn!(
+                    chain = %pipeline.chain_name,
                     borrower = %pos.borrower,
-                    error = ?err,
-                    "broadcast failed — opportunity left in queue"
+                    error = %format!("{err:#}"),
+                    submitter = %harness.submitter_label,
+                    "broadcast failed — opportunity left in queue for future retry"
                 );
             }
         }
     }
 
-    Ok(outcome)
+    Ok(true)
 }
 
-/// Sign and broadcast one opportunity that already passed simulation.
+/// Sign and broadcast one simulation-passing opportunity.
 ///
-/// Nonce-gap handling: when the node rejects with "nonce too low" /
-/// "already known" / similar, force a one-shot `NonceManager::resync`
-/// so the next block's broadcast sees the canonical on-chain value.
-/// Connection-lost errors leave the nonce where it is — the caller
-/// will reconnect and the counter stays locally consistent with what
-/// the pipeline actually issued.
-async fn broadcast(
+/// Flow:
+///   1. `GasOracle::fetch_params` for the current block. A
+///      `SkipCeilingExceeded` verdict drops the opportunity (the
+///      current tip of the mempool is too expensive for our
+///      `bot.max_gas_wei` ceiling to make economic sense).
+///   2. `eth_estimateGas` on a request with the resolved fees, then
+///      scale by [`BROADCAST_GAS_BUFFER_NUM`]/[`BROADCAST_GAS_BUFFER_DEN`]
+///      (30% headroom) to cover state drift between estimate and
+///      inclusion.
+///   3. `NonceManager::next()` claims a nonce atomically. The local
+///      counter is the source of truth for the in-flight window; the
+///      pending-block read only runs on init + resync, never on the
+///      hot path.
+///   4. `TxBuilder::build_tx` + `TxBuilder::sign` produce the raw
+///      EIP-2718 envelope.
+///   5. `Submitter::submit` posts to the private RPC with a single
+///      attempt. Timeout / rejection handling is encoded in
+///      `SubmitError`.
+///
+/// Nonce-gap handling — invariants mirror the submit doc:
+/// * Sign failure: tx never hit the wire but `next()` already
+///   consumed a nonce, so the counter is ahead of the chain. Force a
+///   resync before returning so the next broadcast sees canonical
+///   state.
+/// * `SubmitError::RpcRejected`: node rejected the tx (bad nonce,
+///   revert-on-broadcast, insufficient funds, rate-limit). Counter is
+///   ahead of the chain — resync.
+/// * `SubmitError::Timeout` / `SubmitError::ConnectionLost`: tx may
+///   still land (transport blip, vendor side spike). Leaving the
+///   counter alone is the correct call — a bogus resync here would
+///   reuse a nonce that a later block confirms. The next
+///   rejection-with-nonce-too-low drives a recovery.
+async fn broadcast_opportunity(
+    pipeline: &VenusPipeline,
     harness: &ExecHarness,
+    opp: &LiquidationOpportunity,
+    params: &LiquidationParams,
     builder: &TxBuilder,
-    provider: &alloy::providers::RootProvider<alloy::pubsub::PubSubFrontend>,
-    calldata: alloy::primitives::Bytes,
 ) -> Result<alloy::primitives::TxHash> {
-    // Fetch EIP-1559 fees; `None` = max-gas ceiling tripped, skip.
-    let Some(fees) = harness
+    let calldata: Bytes = builder
+        .encode_calldata(opp, params)
+        .context("broadcast: re-encode calldata failed")?;
+
+    // 1. Gas params (fee pair + ceiling check).
+    let decision = harness
         .gas_oracle
-        .fetch_params(provider)
+        .fetch_params(pipeline.provider.as_ref(), None)
         .await
-        .context("broadcast: gas oracle failed")?
-    else {
-        bail!("gas ceiling tripped");
+        .context("broadcast: gas oracle fetch_params failed")?;
+    let gas_params = match decision {
+        GasDecision::Proceed(p) => p,
+        GasDecision::SkipCeilingExceeded {
+            max_fee_wei,
+            ceiling_wei,
+        } => {
+            bail!(
+                "gas ceiling tripped: max_fee_wei={max_fee_wei} exceeds \
+                 bot.max_gas_wei={ceiling_wei}"
+            );
+        }
+        // `GasDecision` is `#[non_exhaustive]`; a new skip reason
+        // added upstream lands here and is treated as a drop until
+        // the broadcast call site is taught to handle it. Safer than
+        // a blanket `SkipCeilingExceeded` mapping that would silently
+        // reinterpret unrelated drops.
+        _ => bail!("broadcast: unknown gas-oracle decision variant"),
     };
 
-    // Estimate gas on a minimal request — the provider only needs
-    // to / from / data / fees to simulate.
+    // 2. Estimate gas on a minimal request — provider needs
+    //    from/to/data + fees to simulate execution. Then apply a
+    //    130% buffer (30% headroom). `provider.estimate_gas` is used
+    //    directly rather than `GasOracle::estimate_gas_units`
+    //    because the oracle's internal 120% buffer would compound
+    //    with ours; we want one explicit buffer at one call site.
     let est_tx = TransactionRequest::default()
         .with_from(harness.signer_address)
         .with_to(builder.liquidator())
         .with_input(calldata.clone())
-        .with_max_fee_per_gas(fees.max_fee_per_gas)
-        .with_max_priority_fee_per_gas(fees.max_priority_fee_per_gas);
-    let gas_units = harness
-        .gas_oracle
-        .estimate_gas_units(provider, &est_tx)
+        .with_max_fee_per_gas(gas_params.max_fee_per_gas)
+        .with_max_priority_fee_per_gas(gas_params.max_priority_fee_per_gas);
+    let gas_units = pipeline
+        .provider
+        .estimate_gas(&est_tx)
         .await
-        .context("broadcast: estimate_gas failed")?;
-    let gas_limit = gas_units.saturating_mul(GAS_LIMIT_BUFFER_NUM) / GAS_LIMIT_BUFFER_DEN;
+        .context("broadcast: eth_estimateGas failed")?;
+    let gas_limit = gas_units
+        .saturating_mul(BROADCAST_GAS_BUFFER_NUM)
+        / BROADCAST_GAS_BUFFER_DEN;
 
-    // Claim a nonce locally (atomic — no race with a parallel
-    // opportunity in the same block) and build the signed tx.
+    // 3. Claim a nonce locally — atomic, no race with a parallel
+    //    opportunity in the same block.
     let nonce = harness.nonce_manager.next();
-    let tx = builder.build_tx(
-        calldata,
-        nonce,
-        fees.max_fee_per_gas,
-        fees.max_priority_fee_per_gas,
-        gas_limit,
-    );
+
+    // 4. Build + sign.
+    let tx = builder
+        .build_tx(
+            calldata,
+            nonce,
+            gas_params.max_fee_per_gas,
+            gas_params.max_priority_fee_per_gas,
+            gas_limit,
+        )
+        .context("broadcast: build_tx failed")?;
     let raw = match builder.sign(tx).await {
         Ok(bytes) => bytes,
         Err(err) => {
-            // Nonce already consumed by `next()` above. Sign failure
-            // means no tx hits the wire, so the counter is ahead of
-            // the chain — force a resync to avoid a permanent gap.
-            if let Err(resync_err) = harness.nonce_manager.resync(provider).await {
-                warn!(error = ?resync_err, "nonce resync failed after sign error");
+            // Nonce consumed but no tx hit the wire — resync so the
+            // counter doesn't leave a permanent gap.
+            if let Err(resync_err) = harness
+                .nonce_manager
+                .resync(pipeline.provider.as_ref())
+                .await
+            {
+                warn!(
+                    error = %format!("{resync_err:#}"),
+                    "nonce resync failed after sign error"
+                );
             }
-            return Err(err.context("broadcast: sign failed"));
+            return Err(anyhow::Error::new(err).context("broadcast: sign failed"));
         }
     };
 
+    // 5. Submit.
     match harness.submitter.submit(raw).await {
         Ok(hash) => Ok(hash),
         Err(err) => {
-            // Any RpcRejected leaves our local counter ahead of the
-            // chain — resync unconditionally so we don't poison the
-            // sequence on non-nonce rejections (insufficient funds,
-            // gas too low, revert-on-broadcast). ConnectionLost is
-            // transport-level: the tx may still land, so leave the
-            // counter alone and let the next nonce-too-high reject
-            // drive a resync on the following block.
-            if matches!(err, SubmitError::RpcRejected(_))
-                && let Err(resync_err) = harness.nonce_manager.resync(provider).await
-            {
-                warn!(error = ?resync_err, "nonce resync failed after rejection");
+            if matches!(err, SubmitError::RpcRejected(_)) {
+                if let Err(resync_err) = harness
+                    .nonce_manager
+                    .resync(pipeline.provider.as_ref())
+                    .await
+                {
+                    warn!(
+                        error = %format!("{resync_err:#}"),
+                        "nonce resync failed after RPC rejection"
+                    );
+                }
             }
             Err(anyhow::Error::new(err).context("broadcast: submit failed"))
         }
     }
 }
 
-/// Convert a token amount into USD cents using a Chainlink price.
-///
-/// Inputs:
-/// - `amount` — raw units of the ERC-20 (`repay_amount`, `flash_fee`, …).
-/// - `token_decimals` — decimals of the ERC-20 itself (`USDT` = 6, `BTCB` = 18).
-/// - `price` — raw Chainlink aggregator answer (non-negative).
-/// - `price_decimals` — feed's `decimals()` (typically 8 on BSC).
-///
-/// Math:
-/// ```text
-/// usd_cents = amount × price × 100 / 10^(token_decimals + price_decimals)
-/// ```
-/// Every step is on `U256` with `saturating_mul`; the final cast
-/// clamps to `u64::MAX` so a pathological amount never panics.
-fn amount_to_usd_cents(
-    amount: U256,
-    token_decimals: u8,
-    price: U256,
-    price_decimals: u8,
-) -> u64 {
-    let numerator = amount
-        .saturating_mul(price)
-        .saturating_mul(U256::from(100u64));
-    let exponent = u64::from(token_decimals) + u64::from(price_decimals);
-    let divisor = U256::from(10u64).pow(U256::from(exponent));
-    if divisor.is_zero() {
-        return 0;
-    }
-    let cents = numerator / divisor;
+/// Convert a `net_profit_wei` (debt-token smallest units, assumed
+/// 18-decimal stablecoin for v0.1) to USD cents for the profit
+/// histogram. Saturates on overflow so a corrupted upper-bound sample
+/// never crashes the recorder. Placeholder until the per-token
+/// decimals + price bridge lands (#148).
+fn wei_to_usd_cents(wei: U256) -> u64 {
+    // 1 stable unit (18 decimals) ≈ $1 → 100 cents. Divide by 1e16.
+    let scale = U256::from(10u64).pow(U256::from(16u64));
+    let cents = wei / scale;
     u64::try_from(cents).unwrap_or(u64::MAX)
 }
 
+/// Convert a gas cost originally denominated in the chain's native
+/// token (BNB on BSC) into the debt-token's wei, using Chainlink
+/// prices normalised to 1e8 and the two tokens' decimals.
+///
+/// ```text
+/// native_wei = gas_units * max_fee_per_gas
+/// debt_wei   = native_wei
+///            * native_price_1e8 / debt_price_1e8
+///            * 10^debt_decimals / 10^native_decimals
+/// ```
+///
+/// All math is `U256` with `saturating_mul`; a zero or pathological
+/// `debt_price_1e8` is caller-gated (see `process_opportunity`) so
+/// the divisor here is never zero in practice. `decimals > 18` is
+/// already rejected inside `ProfitInputs::from_opportunity`.
+fn gas_cost_in_debt_wei(
+    gas_units: u64,
+    max_fee_per_gas: u128,
+    native_price_1e8: u64,
+    debt_price_1e8: u64,
+    native_decimals: u8,
+    debt_decimals: u8,
+) -> U256 {
+    if debt_price_1e8 == 0 {
+        return U256::ZERO;
+    }
+    let native_wei =
+        U256::from(gas_units).saturating_mul(U256::from(max_fee_per_gas));
+    let usd_numerator = native_wei.saturating_mul(U256::from(native_price_1e8));
+    // Apply the decimal delta between native and debt. Two separate
+    // branches avoid `pow(0)` path-noise and keep the intent obvious.
+    let usd_scaled = match debt_decimals.cmp(&native_decimals) {
+        std::cmp::Ordering::Equal => usd_numerator,
+        std::cmp::Ordering::Greater => {
+            let diff = debt_decimals - native_decimals;
+            usd_numerator.saturating_mul(U256::from(10u64).pow(U256::from(diff)))
+        }
+        std::cmp::Ordering::Less => {
+            let diff = native_decimals - debt_decimals;
+            usd_numerator / U256::from(10u64).pow(U256::from(diff))
+        }
+    };
+    usd_scaled / U256::from(debt_price_1e8)
+}
+
 #[cfg(test)]
-mod amount_to_usd_cents_tests {
+mod gas_cost_in_debt_wei_tests {
     use super::*;
 
     #[test]
-    fn usdt_6_decimals_at_1_dollar_gives_cents_scaled_by_100() {
-        // 1_000_000 raw USDT = 1 USDT @ 6 decimals × $1.00 = 100 cents
-        let cents = amount_to_usd_cents(U256::from(1_000_000u64), 6, U256::from(100_000_000u64), 8);
-        assert_eq!(cents, 100);
-    }
-
-    #[test]
-    fn btcb_18_decimals_at_60k_dollars_gives_six_million_cents() {
-        // 1 BTCB (1e18 raw) @ price 60_000 × 1e8 → 6_000_000 cents
-        let cents = amount_to_usd_cents(
-            U256::from(10u64).pow(U256::from(18u64)),
+    fn identical_tokens_and_prices_are_a_passthrough() {
+        // 100k gas * 10 gwei = 1e15 native wei. Same token, same
+        // price → same number of debt-wei.
+        let got = gas_cost_in_debt_wei(
+            100_000,
+            10_000_000_000u128, // 10 gwei
+            100_000_000,        // $1 @ 1e8
+            100_000_000,        // $1 @ 1e8
             18,
-            U256::from(60_000u64) * U256::from(100_000_000u64),
-            8,
-        );
-        assert_eq!(cents, 6_000_000);
-    }
-
-    #[test]
-    fn zero_price_returns_zero_cents() {
-        let cents = amount_to_usd_cents(U256::from(1u64), 18, U256::ZERO, 8);
-        assert_eq!(cents, 0);
-    }
-
-    #[test]
-    fn saturates_on_extreme_inputs() {
-        // price ~= 10^30 × amount ~= 10^30 → numerator ~10^62 /
-        // divisor 10^26 = 10^36, overflows u64 → saturates.
-        let cents = amount_to_usd_cents(
-            U256::from(10u64).pow(U256::from(30u64)),
             18,
-            U256::from(10u64).pow(U256::from(30u64)),
-            8,
         );
-        assert_eq!(cents, u64::MAX);
+        assert_eq!(got, U256::from(1_000_000_000_000_000u128));
+    }
+
+    #[test]
+    fn native_at_600_usd_debt_at_1_usd_scales_by_600() {
+        // 100k gas * 10 gwei = 1e15 native wei.
+        // BNB @ $600, USDT @ $1 → 6e17 USDT-wei (18 decimals each).
+        let got = gas_cost_in_debt_wei(
+            100_000,
+            10_000_000_000u128,
+            60_000_000_000u64, // $600 × 1e8
+            100_000_000,
+            18,
+            18,
+        );
+        assert_eq!(got, U256::from(600_000_000_000_000_000u128));
+    }
+
+    #[test]
+    fn debt_with_6_decimals_shrinks_by_1e12() {
+        // 100k gas * 10 gwei = 1e15 native wei.
+        // BNB @ $600, USDT @ $1, USDT is 6-dec → 6e5 USDT-wei.
+        let got = gas_cost_in_debt_wei(
+            100_000,
+            10_000_000_000u128,
+            60_000_000_000u64,
+            100_000_000,
+            18,
+            6,
+        );
+        assert_eq!(got, U256::from(600_000u64));
+    }
+
+    #[test]
+    fn zero_debt_price_returns_zero_not_panic() {
+        let got = gas_cost_in_debt_wei(100_000, 10_000_000_000u128, 60_000_000_000u64, 0, 18, 18);
+        assert_eq!(got, U256::ZERO);
+    }
+}
+
+/// Build the preview [`LiquidationOpportunity`] used as input to
+/// [`ProfitInputs::from_opportunity`]. The final opportunity stored
+/// in the queue comes out of [`LiquidationOpportunity::with_profit`]
+/// with a real `net_profit_wei`; the preview just carries the
+/// position + swap-amount context the profit calculator needs and
+/// holds a placeholder `net_profit_wei = 0`.
+fn preview_opportunity(
+    pos: &Position,
+    quote: &FlashLoanQuote,
+    repay: U256,
+) -> LiquidationOpportunity {
+    LiquidationOpportunity {
+        position: pos.clone(),
+        debt_to_repay: repay,
+        // Expected collateral out is the seized collateral after the
+        // liquidation bonus. Until the adapter surfaces a precise
+        // expected-seize figure, we forward `pos.collateral_amount`
+        // as an upper bound; the profit calc uses this purely as the
+        // slippage denominator, so an overestimate here is safe
+        // (slippage is charged *against* it).
+        expected_collateral_out: pos.collateral_amount,
+        flash_source: quote.source,
+        swap_route: charon_core::SwapRoute {
+            token_in: pos.collateral_token,
+            token_out: pos.debt_token,
+            amount_in: pos.collateral_amount,
+            min_amount_out: U256::ZERO,
+            pool_fee: Some(3_000),
+        },
+        net_profit_wei: U256::ZERO,
+    }
+}
+
+/// Drain a `JoinSet` of listener tasks and surface panics / errors
+/// per chain. Returns when every listener has exited so the caller
+/// can shut down.
+async fn supervise(listeners: &mut tokio::task::JoinSet<(String, Result<()>)>) {
+    while let Some(joined) = listeners.join_next().await {
+        match joined {
+            Ok((name, Ok(()))) => {
+                info!(chain = %name, "listener exited cleanly");
+            }
+            Ok((name, Err(err))) => {
+                warn!(chain = %name, error = ?err, "listener terminated with error");
+            }
+            Err(err) if err.is_panic() => {
+                warn!(error = ?err, "listener panicked");
+            }
+            Err(err) => {
+                warn!(error = ?err, "listener join error");
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+async fn wait_sigterm() {
+    use tokio::signal::unix::{SignalKind, signal};
+    match signal(SignalKind::terminate()) {
+        Ok(mut s) => {
+            let _ = s.recv().await;
+        }
+        Err(err) => {
+            tracing::warn!(error = %err, "failed to install SIGTERM handler");
+            std::future::pending::<()>().await
+        }
+    }
+}
+
+#[cfg(not(unix))]
+async fn wait_sigterm() {
+    std::future::pending::<()>().await
+}
+
+/// Drain pre-signed liquidations whose oracle trigger confirmed in
+/// `block_hash` and run each through the executor's simulation gate
+/// before the broadcast step (still non-goal per #299).
+///
+/// Fetches the block's confirmed tx-hash set via
+/// `eth_getBlockByHash` (hashes-only payload), calls
+/// [`PendingCache::drain_for_block`], and for each returned
+/// [`charon_scanner::UnverifiedPreSigned`] rebuilds the liquidator
+/// calldata via the adapter + builder, runs it through
+/// [`Simulator::simulate`], and only hands the pre-sign a
+/// [`SimulationVerdict::Ok`] proof token when the simulator returns
+/// success. `verify(Ok)` unwraps the pre-sign into a full
+/// `PreSignedLiquidation`; broadcast is explicitly out of scope
+/// (signer + liquidator bridge tracked separately) so the drained
+/// tx is logged and dropped.
+///
+/// Silently no-ops when the cache is `None` (mempool monitor is
+/// disabled) or when the builder/simulator/params for a pre-sign
+/// are unavailable — there is no way to honour the eth_call gate
+/// without them, so the safer action is to re-insert-or-drop per
+/// the cache's TTL and surface a warning.
+///
+/// Never panics. Every RPC/encode/sim failure is logged and the
+/// drain loop continues with the next pre-sign; the block-scanner
+/// path is independent and must not be blocked by mempool hiccups.
+async fn drain_mempool_for_block(
+    pipeline: &VenusPipeline,
+    block_hash: B256,
+    cache: Option<&PendingCache>,
+    signer_key: Option<&secrecy::SecretString>,
+) {
+    let Some(cache) = cache else {
+        return;
+    };
+    let chain = pipeline.chain_name.as_str();
+
+    // Fetch the block with hashes-only payload. `Hashes` keeps the
+    // response small — we only need the set membership check for
+    // `drain_for_block`, not full transaction envelopes.
+    let block = match pipeline
+        .provider
+        .get_block_by_hash(block_hash, BlockTransactionsKind::Hashes)
+        .await
+    {
+        Ok(Some(b)) => b,
+        Ok(None) => {
+            warn!(%block_hash, "block not found when draining mempool cache");
+            return;
+        }
+        Err(err) => {
+            warn!(%block_hash, ?err, "get_block_by_hash failed when draining mempool cache");
+            return;
+        }
+    };
+    let confirmed: HashSet<B256> = block.transactions.hashes().collect();
+
+    let drained = cache.drain_for_block(block_hash, &confirmed);
+    if drained.is_empty() {
+        return;
+    }
+    debug!(
+        chain,
+        %block_hash,
+        drained = drained.len(),
+        confirmed_tx_count = confirmed.len(),
+        "mempool cache drained for block"
+    );
+
+    // Materialise the executor pair lazily — if the operator runs
+    // scan-only (no signer) we cannot honour the eth_call gate, so we
+    // drop drained pre-signs with a warning. Same contract as
+    // `process_opportunity`: no signer → no simulation → no
+    // broadcast-ready artefact.
+    let Some((builder, sim)) = ensure_executor(pipeline, signer_key).await else {
+        warn!(
+            chain,
+            drained = drained.len(),
+            "pre-signs drained but no signer configured — dropping (sim gate cannot be honoured)"
+        );
+        return;
+    };
+
+    for presigned in drained {
+        let borrower = presigned.borrower();
+        let trigger = presigned.trigger_tx();
+        let opp = presigned.opportunity().clone();
+
+        // Rebuild calldata from the opportunity via the protocol
+        // adapter + builder — the pre-sign's own `raw_tx` is the
+        // signed envelope, which is intentionally unreachable without
+        // a `SimulationVerdict`.
+        let params = match pipeline.adapter.get_liquidation_params(&opp.position) {
+            Ok(p) => p,
+            Err(err) => {
+                warn!(
+                    chain,
+                    %borrower,
+                    error = ?err,
+                    "failed to rebuild liquidation params for drained pre-sign"
+                );
+                continue;
+            }
+        };
+        let calldata: Bytes = match builder.encode_calldata(&opp, &params) {
+            Ok(c) => c,
+            Err(err) => {
+                warn!(
+                    chain,
+                    %borrower,
+                    error = ?err,
+                    "failed to encode calldata for drained pre-sign"
+                );
+                continue;
+            }
+        };
+        match sim
+            .simulate(pipeline.provider.as_ref(), calldata, SIMULATION_GAS_LIMIT)
+            .await
+        {
+            Ok(()) => match presigned.verify(SimulationVerdict::approve()) {
+                Ok(ready) => {
+                    // Non-goal: eth_sendRawTransaction. The
+                    // `PreSignedLiquidation` is fully verified and
+                    // ready for the future broadcast call site; log
+                    // loudly so operators running the monitor end-to-end
+                    // can see the gate opening.
+                    info!(
+                        chain,
+                        %borrower,
+                        %trigger,
+                        raw_tx_len = ready.raw_tx.len(),
+                        "pre-sign simulated OK — ready for broadcast (broadcast wiring follow-up)"
+                    );
+                }
+                Err((returned, verdict)) => {
+                    warn!(
+                        chain,
+                        borrower = %returned.borrower(),
+                        ?verdict,
+                        "simulation verdict inconsistent with simulate outcome — dropping"
+                    );
+                }
+            },
+            Err(err) => {
+                debug!(
+                    chain,
+                    %borrower,
+                    %trigger,
+                    error = ?err,
+                    "pre-sign simulation reverted — dropping"
+                );
+            }
+        }
     }
 }

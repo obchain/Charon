@@ -215,7 +215,27 @@ impl Submitter {
             }
         };
 
-        match tokio::time::timeout(self.timeout, fut).await {
+        // Wrap the provider send in `time_rpc` so the RPC-latency
+        // histogram owns the sample regardless of outcome. Successes
+        // and provider-side rejections both land a duration; the
+        // hard timeout branch skips the histogram sample by
+        // construction (its duration would be ~self.timeout and
+        // carries no extra signal — `charon_rpc_errors_total{
+        // error_kind="timeout"}` is the canonical surface for that
+        // case). `endpoint_kind::PRIVATE` because the submitter only
+        // ever posts to the per-chain `private_rpc_url`; the scanner
+        // owns public reads.
+        let timed = tokio::time::timeout(
+            self.timeout,
+            charon_metrics::time_rpc(
+                charon_metrics::rpc_method::ETH_SEND_RAW_TRANSACTION,
+                charon_metrics::endpoint_kind::PRIVATE,
+                fut,
+            ),
+        )
+        .await;
+
+        match timed {
             Ok(Ok(hash)) => {
                 info!(endpoint = %self.endpoint_label, %hash, "tx submitted");
                 Ok(hash)
@@ -226,13 +246,31 @@ impl Submitter {
                     error = %err,
                     "submit rejected by RPC"
                 );
-                Err(classify_transport_error(err))
+                // Tag the error counter with the bucket produced by
+                // the full JSON-RPC / transport classifier so
+                // Grafana pivots on the exact same `rejected` vs
+                // `connection_lost` split that drives the typed
+                // `SubmitError`.
+                let classified = classify_transport_error(err);
+                let kind = match &classified {
+                    SubmitError::ConnectionLost(_) => charon_metrics::rpc_error::CONNECTION_LOST,
+                    _ => charon_metrics::rpc_error::REJECTED,
+                };
+                charon_metrics::record_rpc_error(
+                    charon_metrics::rpc_method::ETH_SEND_RAW_TRANSACTION,
+                    kind,
+                );
+                Err(classified)
             }
             Err(_) => {
                 warn!(
                     endpoint = %self.endpoint_label,
                     timeout_secs = self.timeout.as_secs(),
                     "submit timed out"
+                );
+                charon_metrics::record_rpc_error(
+                    charon_metrics::rpc_method::ETH_SEND_RAW_TRANSACTION,
+                    charon_metrics::rpc_error::TIMEOUT,
                 );
                 Err(SubmitError::Timeout(self.timeout))
             }
