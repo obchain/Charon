@@ -37,7 +37,9 @@ groups:
             on {{ $labels.instance }}. Either BSC is unusually healthy
             (possible), the scanner is broken (possible), or the health
             check thresholds are mis-tuned. Inspect
-            charon_scanner_positions_by_bucket to disambiguate.
+            charon_scanner_positions{bucket="near_liq"} and
+            charon_scanner_positions{bucket="liquidatable"} to
+            disambiguate.
 
   - name: charon-pipeline-health
     interval: 30s
@@ -56,7 +58,7 @@ groups:
 
       - alert: CharonSimulationFailureRateHigh
         expr: |
-          sum by (instance, chain) (rate(charon_executor_simulations_total{result="failure"}[5m]))
+          sum by (instance, chain) (rate(charon_executor_simulations_total{result=~"revert|error"}[5m]))
             /
           sum by (instance, chain) (rate(charon_executor_simulations_total[5m]))
             > 0.5
