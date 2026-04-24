@@ -3,13 +3,19 @@
 //! ```text
 //! CHARON_CONFIG=/etc/charon/default.toml charon listen
 //! charon --config config/default.toml listen
+//! charon --config config/default.toml listen --borrower 0xABC…
 //! charon --config config/default.toml test-connection --chain bnb
 //! ```
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
+use alloy::eips::BlockNumberOrTag;
+use alloy::primitives::Address;
+use alloy::providers::{ProviderBuilder, WsConnect};
 use anyhow::{Context, Result};
-use charon_core::Config;
+use charon_core::{Config, LendingProtocol};
+use charon_protocols::VenusAdapter;
 use charon_scanner::{BlockListener, ChainEvent, ChainProvider};
 use clap::{Parser, Subcommand};
 use tokio::sync::mpsc;
@@ -40,11 +46,20 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Command {
-    /// Spawn one block listener per configured chain and drain chain events.
+    /// Spawn one block listener per configured chain, drain chain events,
+    /// and run the Venus adapter every new block for the supplied borrower
+    /// list.
     ///
-    /// Downstream pipeline (scanner → profit calc → executor) consumes
-    /// the same channel once those layers land.
-    Listen,
+    /// Borrower discovery from indexed events is a follow-up; pass
+    /// `--borrower 0x…` one or more times to seed a test list. An empty
+    /// list is allowed — the adapter still connects so the operator can
+    /// confirm the WS pipeline.
+    Listen {
+        /// Addresses to scan on every new block. Repeat the flag for
+        /// multiple borrowers.
+        #[arg(long = "borrower")]
+        borrowers: Vec<Address>,
+    },
 
     /// Connect to a configured chain and print its latest block number.
     TestConnection {
@@ -89,8 +104,8 @@ async fn main() -> Result<()> {
     );
 
     match cli.command {
-        Command::Listen => {
-            run_listen(&config).await?;
+        Command::Listen { borrowers } => {
+            run_listen(&config, borrowers).await?;
         }
         Command::TestConnection { chain } => {
             let chain_cfg = config
@@ -110,10 +125,46 @@ async fn main() -> Result<()> {
 /// configured chain, drains the shared `ChainEvent` channel, and exits
 /// cleanly on SIGINT or SIGTERM so the Docker `stop` → SIGTERM → SIGKILL
 /// sequence never tears mid-operation.
-async fn run_listen(config: &Config) -> Result<()> {
+///
+/// For every `NewBlock` event on a chain with a `[protocol.venus]` entry,
+/// the Venus adapter scans the supplied borrower list anchored at the
+/// observed block. Chains without a Venus protocol config still flow
+/// through the drain loop but trigger no protocol scans (v0.1 scope).
+async fn run_listen(config: &Config, borrowers: Vec<Address>) -> Result<()> {
     if config.chain.is_empty() {
         anyhow::bail!("no chains configured — nothing to listen to");
     }
+
+    // Venus adapter is currently single-chain (BNB) per config scope.
+    // Build it only if `[protocol.venus]` exists and its target chain is
+    // configured; otherwise run the listener pipeline without a scanner.
+    let venus_adapter: Option<(String, Arc<VenusAdapter>)> = match config.protocol.get("venus") {
+        Some(venus_cfg) => {
+            let chain_name = &venus_cfg.chain;
+            let chain_cfg = config.chain.get(chain_name).with_context(|| {
+                format!(
+                    "protocol 'venus' references chain '{chain_name}' which is not in [chain.*]"
+                )
+            })?;
+            let adapter_ws = ProviderBuilder::new()
+                .on_ws(WsConnect::new(&chain_cfg.ws_url))
+                .await
+                .context("venus adapter: failed to connect over ws")?;
+            let adapter =
+                Arc::new(VenusAdapter::connect(Arc::new(adapter_ws), venus_cfg.comptroller).await?);
+            info!(
+                chain = %chain_name,
+                borrower_count = borrowers.len(),
+                market_count = adapter.markets().await.len(),
+                "venus adapter ready"
+            );
+            Some((chain_name.clone(), adapter))
+        }
+        None => {
+            info!("no [protocol.venus] configured — listener will drain events without scanning");
+            None
+        }
+    };
 
     let (tx, mut rx) = mpsc::channel::<ChainEvent>(CHAIN_EVENT_CHANNEL);
     let mut listeners: tokio::task::JoinSet<(String, Result<()>)> =
@@ -144,6 +195,34 @@ async fn run_listen(config: &Config) -> Result<()> {
                             backfill,
                             "cli drained event"
                         );
+                        // Route to Venus scan only when this event is for
+                        // the chain the Venus adapter was configured on.
+                        if let Some((venus_chain, adapter)) = venus_adapter.as_ref() {
+                            if venus_chain == &chain {
+                                let start = std::time::Instant::now();
+                                let block_tag = BlockNumberOrTag::Number(number);
+                                match adapter.fetch_positions(&borrowers, block_tag).await {
+                                    Ok(positions) => {
+                                        info!(
+                                            chain = %chain,
+                                            block = number,
+                                            timestamp,
+                                            backfill,
+                                            tracked = borrowers.len(),
+                                            returned = positions.len(),
+                                            scan_ms = start.elapsed().as_millis() as u64,
+                                            "venus scan"
+                                        );
+                                    }
+                                    Err(err) => warn!(
+                                        chain = %chain,
+                                        block = number,
+                                        error = ?err,
+                                        "venus scan failed"
+                                    ),
+                                }
+                            }
+                        }
                     }
                     _ => {}
                 }

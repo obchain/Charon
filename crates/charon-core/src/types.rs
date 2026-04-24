@@ -89,7 +89,16 @@ pub struct SwapRoute {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[non_exhaustive]
 pub enum LiquidationParams {
-    #[non_exhaustive]
+    // NOTE: this variant is intentionally *not* `#[non_exhaustive]`.
+    // The `LendingProtocol::get_liquidation_params` trait method is
+    // implemented outside `charon-core` (each adapter crate returns a
+    // protocol-specific variant), which requires each variant to be
+    // constructible via a struct expression from downstream crates.
+    // Enum-level `#[non_exhaustive]` still prevents breakage from adding
+    // new variants; that is the only forward-compat guarantee we need
+    // here. Adding or renaming a field on `Venus` is a semver break by
+    // design — every adapter call site must be audited when liquidation
+    // mechanics change.
     Venus {
         borrower: Address,
         /// vToken of the collateral asset (the token seized).

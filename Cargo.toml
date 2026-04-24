@@ -2,6 +2,7 @@
 resolver = "3"
 members = [
     "crates/charon-core",
+    "crates/charon-protocols",
     "crates/charon-scanner",
     "crates/charon-cli",
 ]
@@ -61,4 +62,5 @@ dotenvy = "0.15"
 
 # Internal crates
 charon-core = { path = "crates/charon-core" }
+charon-protocols = { path = "crates/charon-protocols" }
 charon-scanner = { path = "crates/charon-scanner" }
