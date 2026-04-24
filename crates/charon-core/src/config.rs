@@ -66,8 +66,25 @@ pub struct Config {
     /// Lending protocols keyed by short name (e.g. `"venus"`).
     pub protocol: HashMap<String, ProtocolConfig>,
     /// Flash-loan sources keyed by short name (e.g. `"aave_v3_bsc"`).
+    ///
+    /// `#[serde(default)]` so profiles targeting chains with no
+    /// flash-loan venue (e.g. BSC testnet / Chapel, where Aave V3 is
+    /// not deployed) can omit the section entirely. When empty, the
+    /// off-chain pipeline short-circuits at the router gate: the
+    /// scanner still runs, but no opportunity is enqueued because
+    /// [`FlashLoanRouter::route`] has no source to quote. Mainnet
+    /// profiles continue to populate this section in the usual way;
+    /// the default does not relax any mainnet invariant.
+    #[serde(default)]
     pub flashloan: HashMap<String, FlashLoanConfig>,
     /// Deployed liquidator contracts keyed by chain name.
+    ///
+    /// `#[serde(default)]` so profiles without a deployed liquidator
+    /// (testnet, or mainnet pre-deploy) can omit the section without
+    /// wedging the loader. Absence forces read-only mode: the CLI
+    /// refuses to build a `TxBuilder` because it has no receiver
+    /// address, so no calldata is signed or simulated.
+    #[serde(default)]
     pub liquidator: HashMap<String, LiquidatorConfig>,
     /// Chainlink feed addresses per chain, keyed by asset symbol
     /// (e.g. `chainlink.bnb.BNB = "0x…"`). Missing key = no feed
