@@ -10,12 +10,13 @@ name = "charon"
 path = "src/main.rs"
 
 [dependencies]
-tokio              = { workspace = true }
-clap               = { workspace = true }
-anyhow             = { workspace = true }
-tracing            = { workspace = true }
+charon-core = { workspace = true }
+clap = { workspace = true }
+tokio = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
-charon-core        = { workspace = true }
+dotenvy = { workspace = true }
 
 [lints]
 workspace = true
