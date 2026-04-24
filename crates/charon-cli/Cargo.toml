@@ -8,3 +8,14 @@ description = "Charon command-line entrypoint"
 [[bin]]
 name = "charon"
 path = "src/main.rs"
+
+[dependencies]
+tokio              = { workspace = true }
+clap               = { workspace = true }
+anyhow             = { workspace = true }
+tracing            = { workspace = true }
+tracing-subscriber = { workspace = true }
+charon-core        = { workspace = true }
+
+[lints]
+workspace = true

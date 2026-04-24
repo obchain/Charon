@@ -1,10 +1,19 @@
 [workspace]
-resolver = "2"
+resolver = "3"
 members = [
     "crates/charon-core",
     "crates/charon-scanner",
     "crates/charon-cli",
 ]
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+all = "warn"
+arithmetic_side_effects = "deny"
+cast_possible_truncation = "deny"
+unwrap_used = "deny"
 
 [workspace.package]
 version = "0.1.0"
