@@ -34,16 +34,16 @@ async fn connect_against_bsc_snapshots_markets() {
         .expect("venus connect");
 
     assert!(
-        !adapter.markets.is_empty(),
+        !adapter.markets().await.is_empty(),
         "Venus Comptroller should expose at least one vToken market"
     );
     assert_ne!(
-        adapter.oracle,
+        adapter.oracle().await,
         Address::ZERO,
         "Venus oracle address should be non-zero"
     );
     assert!(
-        adapter.close_factor_mantissa > U256::ZERO,
+        adapter.close_factor_mantissa().await > U256::ZERO,
         "close factor should be non-zero"
     );
 }

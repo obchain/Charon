@@ -1,23 +1,42 @@
 # Charon — local anvil fork profile (BSC mainnet state, local host).
 #
 # Pair with `scripts/anvil_fork.sh`. The fork process exposes HTTP+WS
-# on 127.0.0.1:8545 and mirrors every mainnet address the default
-# profile uses, so addresses here match `config/default.toml` exactly.
+# on 127.0.0.1:${CHARON_ANVIL_PORT:-8545} and mirrors every mainnet
+# address the default profile uses, so addresses here match
+# `config/default.toml` exactly.
 #
 # Why a separate file instead of reusing `default.toml`:
 # - RPC URLs point at localhost, not production endpoints.
-# - `private_rpc_url` is left empty — no private relay for a local
-#   fork; the local anvil IS the submission surface.
-# - `min_profit_usd` is lowered so synthetic / partial positions the
-#   operator stages manually aren't filtered out during demos.
+# - `private_rpc_url` is omitted — no private relay for a local
+#   fork; the local anvil IS the submission surface. The
+#   `profile_tag = "fork"` bypasses the PrivateRpcRequired gate.
+# - `min_profit_usd_1e6` is lowered so synthetic / partial positions
+#   the operator stages manually aren't filtered out during demos.
+#
+# Running a secondary fork on a different port:
+#   CHARON_ANVIL_PORT=8546 ./scripts/anvil_fork.sh
+#   CHARON_ANVIL_PORT=8546 charon --config config/fork.toml listen
+# Both the script and this profile read `CHARON_ANVIL_PORT` (falling
+# back to 8545) so a dev can spin up parallel forks without editing
+# the TOML.
 
 [bot]
 # Lower gate for demo staging — real ops should use default.toml.
-min_profit_usd         = 0.01
-max_gas_gwei           = 20
-scan_interval_ms       = 1000
-liquidatable_threshold = 1.0
-near_liq_threshold     = 1.05
+# $0.01 in USD × 1e6 fixed-point (post feat/19 integer schema).
+min_profit_usd_1e6 = 10000
+# 20 gwei, expressed in wei (decimal string). Matches the lowered
+# demo-gate intent: cheap anvil transactions shouldn't get filtered.
+max_gas_wei        = "20000000000"
+scan_interval_ms   = 1000
+# liquidatable/near_liq thresholds use serde defaults from BotConfig
+# (HF 1.0000 / 1.0500). Scanner bucket cadences also defaulted.
+# No signer key by default — the fork is read-only until the operator
+# exports CHARON_SIGNER_KEY and deploys CharonLiquidator via `forge create`.
+signer_key         = "${CHARON_SIGNER_KEY:-}"
+# Safety gate: `Config::validate` rejects this profile at startup if any
+# chain points at a non-loopback RPC. Keeps a lowered profit gate from
+# ever pointing at mainnet by accident (#254).
+profile_tag        = "fork"
 
 # ── Chains ────────────────────────────────────────────────────────────────
 [chain.bnb]
@@ -25,11 +44,12 @@ near_liq_threshold     = 1.05
 # transactions remain valid across operator/fork boundaries as long as
 # this matches what the script passes.
 chain_id          = 56
-ws_url            = "ws://127.0.0.1:8545"
-http_url          = "http://127.0.0.1:8545"
+ws_url            = "ws://127.0.0.1:${CHARON_ANVIL_PORT:-8545}"
+http_url          = "http://127.0.0.1:${CHARON_ANVIL_PORT:-8545}"
 priority_fee_gwei = 1
-# No private relay on a local fork.
-# private_rpc_url   = ""
+# No private relay on a local fork — the fork profile's loopback gate
+# (see `profile_tag = "fork"` above) bypasses the PrivateRpcRequired
+# check that the mainnet profile enforces.
 
 # ── Lending protocols ─────────────────────────────────────────────────────
 [protocol.venus]
@@ -41,26 +61,42 @@ comptroller = "0xfd36e2c2a6789db23113685031d7f16329158384"
 [flashloan.aave_v3_bsc]
 chain = "bnb"
 pool  = "0x6807dc923806fe8fd134338eabca509979a7e0cb"
+# Aave V3 PoolDataProvider on BSC — matches default.toml. Resolves
+# aTokens and reserve configuration bitmaps for the adapter.
+data_provider = "0x41393e5e337606dc3821075Af65AeE84D7688CBD"
 
 # ── Deployed liquidator contracts ─────────────────────────────────────────
-# Fork demo can run read-only (no liquidator deployed); once the
-# operator deploys `CharonLiquidator.sol` into the fork via forge,
-# replace the zero with the deployed address to exercise the
-# full route.
-[liquidator.bnb]
-chain            = "bnb"
-contract_address = "0x0000000000000000000000000000000000000000"
+# Liquidator section intentionally omitted — no CharonLiquidator is
+# deployed on the fork by default. A placeholder address(0) here would
+# let the scanner produce opportunities that then fail inside TxBuilder
+# with an opaque encoding error the moment the executor tries to build
+# calldata (#252). Omission flips the CLI onto the read-only arm in
+# `run_listen` (scanner + metrics only), matching the pattern that
+# `config/testnet.toml` uses for Chapel.
+#
+# After running `forge create` against the local anvil, add a
+# `[liquidator.bnb]` section pointing at the deployed address to
+# exercise the full route:
+#
+#   [liquidator.bnb]
+#   chain            = "bnb"
+#   contract_address = "0x<forge-create-output>"
 
 # ── Prometheus metrics exporter ───────────────────────────────────────────
+# Loopback-only bind: the fork profile is a local-only demo surface,
+# the exporter has no auth, and operators routinely run the fork from a
+# laptop on public Wi-Fi. `0.0.0.0` would silently publish /metrics
+# (scanner state, wallet balances, gas oracle reads) to the LAN —
+# loopback is the only responsible default (#249, cross-ref #213).
 [metrics]
 enabled = true
-bind    = "0.0.0.0:9091"
+bind    = "127.0.0.1:9091"
 
 # ── Chainlink price feeds (per chain, per asset symbol) ───────────────────
 # Mainnet feed addresses resolve against the fork.
 [chainlink.bnb]
 BNB  = "0x0567F2323251f0Aab15c8dFb1967E4e8A7D42aeE"
-BTCB = "0x264990fbd0A4796A3E3d8E37C4d5F87a3aCa5Ebf"
+BTCB = "0x264990fbd0A4796A3E3d8E37022BdAf1A5a4C1f0"
 ETH  = "0x9ef1B8c0E4F7dc8bF5719Ea496883DC6401d5b2e"
 USDT = "0xB97Ad0E74fa7d920791E90258A6E2085088b4320"
 USDC = "0x51597f405303C4377E36123cBc172b13269EA163"

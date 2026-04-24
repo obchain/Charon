@@ -12,7 +12,7 @@
       }
     ]
   },
-  "description": "Charon liquidation bot — scanner, executor, and profit telemetry. Scrapes the charon-metrics Prometheus exporter (default :9091).",
+  "description": "Charon liquidation bot — scanner, executor, and profit telemetry. Scrapes the charon-metrics Prometheus exporter (default :9091). Chain/Instance variables default to All (.*) so panels render before the first scrape populates label_values; they auto-refine once metrics flow. Mempool / gas / RPC-latency panels deferred pending backing series: mempool #300, gas #301, rpc-latency #302. Alerting rules live in deploy/grafana/alerts.yaml.",
   "editable": true,
   "fiscalYearStartMonth": 0,
   "graphTooltip": 1,
@@ -64,7 +64,7 @@
     },
     {
       "datasource": { "type": "prometheus", "uid": "${datasource}" },
-      "description": "Per-block pipeline wall-clock latency. p50 and p95 from the histogram.",
+      "description": "Per-block pipeline wall-clock latency. p50 and p95 from the histogram. BSC produces a block every ~3s; quantiles use a [5m] range (~100 observations) so they stay stable across scrapes.",
       "fieldConfig": {
         "defaults": {
           "color": { "mode": "palette-classic" },
@@ -193,7 +193,7 @@
     },
     {
       "datasource": { "type": "prometheus", "uid": "${datasource}" },
-      "description": "Cumulative profit across all opportunities that cleared the profit gate (USD).",
+      "description": "Profit across all opportunities that cleared the profit gate (USD), summed over the selected dashboard time range. Uses increase() over the histogram _sum accumulator so process restarts do not appear as negative steps; the window follows the top-right time picker.",
       "fieldConfig": {
         "defaults": {
           "color": { "mode": "thresholds" },
@@ -223,13 +223,13 @@
         {
           "datasource": { "type": "prometheus", "uid": "${datasource}" },
           "editorMode": "code",
-          "expr": "sum(charon_executor_profit_usd_cents_sum{instance=~\"$instance\",chain=~\"$chain\"}) / 100",
-          "legendFormat": "total profit",
+          "expr": "sum(increase(charon_executor_profit_usd_cents_sum{instance=~\"$instance\",chain=~\"$chain\"}[$__range])) / 100",
+          "legendFormat": "profit (selected range)",
           "range": true,
           "refId": "A"
         }
       ],
-      "title": "Cumulative profit",
+      "title": "Profit (selected range)",
       "type": "stat"
     },
     {
@@ -275,7 +275,7 @@
     },
     {
       "datasource": { "type": "prometheus", "uid": "${datasource}" },
-      "description": "Opportunity outcomes: queued (passed every gate) vs dropped (and at which stage).",
+      "description": "Opportunity funnel, per minute, grouped by stage. `queued` counts entries that cleared the profit gate and landed in the queue (the #220 `simulated` label is rolled up here); `router`, `profit`, `simulation`, and `build` are drop stages. Both series share the same `stage` axis so intake and losses are directly comparable.",
       "fieldConfig": {
         "defaults": {
           "color": { "mode": "palette-classic" },
@@ -301,8 +301,8 @@
         {
           "datasource": { "type": "prometheus", "uid": "${datasource}" },
           "editorMode": "code",
-          "expr": "sum(rate(charon_executor_opportunities_queued_total{instance=~\"$instance\",chain=~\"$chain\"}[1m])) * 60",
-          "legendFormat": "queued",
+          "expr": "label_replace(sum(rate(charon_executor_opportunities_queued_total{instance=~\"$instance\",chain=~\"$chain\"}[1m])) * 60, \"stage\", \"queued\", \"\", \"\")",
+          "legendFormat": "{{stage}}",
           "range": true,
           "refId": "A"
         },
@@ -310,7 +310,7 @@
           "datasource": { "type": "prometheus", "uid": "${datasource}" },
           "editorMode": "code",
           "expr": "sum by (stage) (rate(charon_executor_opportunities_dropped_total{instance=~\"$instance\",chain=~\"$chain\"}[1m])) * 60",
-          "legendFormat": "dropped — {{stage}}",
+          "legendFormat": "{{stage}}",
           "range": true,
           "refId": "B"
         }
@@ -365,7 +365,7 @@
     },
     {
       "datasource": { "type": "prometheus", "uid": "${datasource}" },
-      "description": "Running build metadata. `version` and `git_sha` come from the Charon process at startup.",
+      "description": "Running build metadata. Only `version` is surfaced; `git_sha` is intentionally hidden via transform exclusion until /metrics has auth (open #214) and LAN exposure is addressed (#213). Surfacing the exact SHA of a running binary to anyone with Grafana read access is an intelligence leak while those are unresolved.",
       "fieldConfig": {
         "defaults": { "custom": { "align": "auto" } },
         "overrides": []
@@ -395,7 +395,7 @@
         {
           "id": "organize",
           "options": {
-            "excludeByName": { "Time": true, "Value": true, "__name__": true, "job": true },
+            "excludeByName": { "Time": true, "Value": true, "__name__": true, "job": true, "git_sha": true },
             "indexByName": {},
             "renameByName": {}
           }
@@ -425,9 +425,11 @@
         "type": "datasource"
       },
       {
-        "current": { "selected": false, "text": "All", "value": "$__all" },
+        "allValue": ".*",
+        "current": { "selected": true, "text": "All", "value": "$__all" },
         "datasource": { "type": "prometheus", "uid": "${datasource}" },
         "definition": "label_values(charon_scanner_blocks_total, chain)",
+        "description": "Chain label. Defaults to All (.*) so panels render data even before label_values is populated (fresh import or cold start).",
         "hide": 0,
         "includeAll": true,
         "label": "Chain",
@@ -442,9 +444,11 @@
         "type": "query"
       },
       {
-        "current": { "selected": false, "text": "All", "value": "$__all" },
+        "allValue": ".*",
+        "current": { "selected": true, "text": "All", "value": "$__all" },
         "datasource": { "type": "prometheus", "uid": "${datasource}" },
         "definition": "label_values(charon_build_info, instance)",
+        "description": "Instance label (Prometheus scrape target). Defaults to All (.*) so panels render before the first scrape populates the dropdown.",
         "hide": 0,
         "includeAll": true,
         "label": "Instance",
