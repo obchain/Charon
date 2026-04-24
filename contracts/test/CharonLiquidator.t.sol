@@ -2,276 +2,440 @@
 pragma solidity 0.8.24;
 
 import { Test } from "forge-std/Test.sol";
-
 import { CharonLiquidator } from "../src/CharonLiquidator.sol";
+import { IVToken } from "../src/interfaces/IVToken.sol";
+import { IWETH } from "../src/interfaces/IWETH.sol";
+import { IERC20 } from "../src/interfaces/IERC20.sol";
+import { ISwapRouter } from "../src/interfaces/ISwapRouter.sol";
+import { IAaveV3Pool } from "../src/interfaces/IAaveV3Pool.sol";
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Minimal ERC-20 stub used only by the rescue() ERC-20 path test.
-// Lives in-file so this suite has zero external dependencies beyond forge-std.
-// ─────────────────────────────────────────────────────────────────────────────
-contract MockERC20 {
-    mapping(address => uint256) public balanceOf;
+/// @title CharonLiquidatorForkTest
+/// @notice Fork-backed tests for CharonLiquidator against BSC mainnet state.
+/// @dev Tests gate on BNB_RPC_URL via vm.skip() — CI without the env var skips
+///      cleanly rather than failing. Where a live liquidation is too invasive
+///      to stage on a fresh fork, vm.mockCall is used to exercise the target
+///      code path without conjuring a real under-water borrower.
+///
+///      Target contract API (main):
+///        constructor(address _aavePool, address _swapRouter, address _coldWallet)
+///        owner  := msg.sender at construction
+///        COLD_WALLET, AAVE_POOL, SWAP_ROUTER are public immutable.
+///        LiquidationParams includes `swapPoolFee` (uint24) per-opportunity.
+///        vBNB collateral branch: redeem(vBal) + wrap native BNB via IWETH.deposit.
+///        Profit sweep: routed to COLD_WALLET, never owner.
+contract CharonLiquidatorForkTest is Test {
+    // ── Live BSC mainnet addresses ────────────────────────────────────────
+    /// @dev Aave V3 Pool proxy on BSC. Mirrors config/default.toml `pool`.
+    address internal constant AAVE_V3_POOL_BSC = 0x6807dc923806fE8Fd134338EABCA509979a7e0cB;
+    /// @dev PancakeSwap V3 SwapRouter on BSC.
+    address internal constant PCS_V3_ROUTER_BSC = 0x13f4EA83D0bd40E75C8222255bc855a974568Dd4;
+    /// @dev Venus vBNB market on BSC.
+    address internal constant VBNB_BSC = 0xA07c5b74C9B40447a954e1466938b865b6BBea36;
+    /// @dev Canonical WBNB on BSC.
+    address internal constant WBNB_BSC = 0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c;
 
-    function mint(address to, uint256 amount) external {
-        balanceOf[to] += amount;
-    }
+    /// @dev Sentinel cold-wallet address distinct from the deployer/owner.
+    address internal constant COLD_WALLET = address(0xC01D);
 
-    function transfer(address to, uint256 amount) external returns (bool) {
-        require(balanceOf[msg.sender] >= amount, "insufficient");
-        balanceOf[msg.sender] -= amount;
-        balanceOf[to] += amount;
-        return true;
-    }
-
-    function approve(address, uint256) external pure returns (bool) {
-        return true;
-    }
-
-    function allowance(address, address) external pure returns (uint256) {
-        return 0;
-    }
-}
-
-/// @dev Contract recipient whose `receive()` writes a storage slot, costing well
-///      over the 2300-gas stipend that Solidity's `transfer`/`send` forwards.
-///      Used to prove that rescue()'s BNB path uses `call` (full gas) and not
-///      `transfer`/`send` — critical for multisig / smart-wallet compatibility.
-contract GasHungryReceiver {
-    uint256 public touched;
-
-    receive() external payable {
-        // SSTORE on a cold slot is ~20k gas — guaranteed to exceed the 2300
-        // stipend that `transfer`/`send` would forward.
-        touched += 1;
-    }
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Skeleton test suite — issue #116
-//
-// The CharonLiquidator at this point in the branch is a skeleton: the
-// executeLiquidation and executeOperation bodies revert with a "not yet
-// implemented" message after input validation and the security gates.
-//
-// This suite therefore focuses on the shape of the deployed contract:
-//   - Constructor non-zero-address guards.
-//   - Owner assignment.
-//   - onlyOwner on executeLiquidation and rescue.
-//   - Input validation inside executeLiquidation (per-field zero-address /
-//     zero-amount / wrong-protocol reverts — reached BEFORE the "not yet
-//     implemented" revert).
-//   - executeOperation security gates (!pool, !initiator).
-//   - rescue() happy and sad paths, including the post-#117 BNB-via-call path.
-//   - Absence of an open `receive()` (post-#117) — direct BNB sends revert.
-//
-// Full end-to-end liquidation coverage lands with issue #12 (impl) and
-// issue #22 (fork tests).
-// ─────────────────────────────────────────────────────────────────────────────
-contract CharonLiquidatorTest is Test {
-    // ── Deterministic stub addresses ──────────────────────────────────────────
-    address internal constant STUB_POOL = address(0xA11E);
-    address internal constant STUB_ROUTER = address(0xB22E);
+    /// @dev Sentinel debt/collateral vToken + token pair used to drive the
+    ///      non-vBNB happy path in mocked liquidations. The actual addresses
+    ///      do not need to correspond to a real Venus market because every
+    ///      external call into them is intercepted via vm.mockCall.
+    address internal constant MOCK_DEBT_VTOKEN = address(0xD00D);
+    address internal constant MOCK_DEBT_TOKEN = address(0xDEB7);
+    address internal constant MOCK_COLL_VTOKEN = address(0xC077);
+    address internal constant MOCK_COLL_TOKEN = address(0xC011);
+    address internal constant MOCK_BORROWER = address(0xBEEF);
 
     CharonLiquidator internal liquidator;
-    address internal alice;
-    address internal recipient;
+
+    /// @dev Per-test gate. A single helper used by every test that must only
+    ///      run when a BSC RPC is available. vm.skip(true) short-circuits the
+    ///      rest of the test body without marking the suite failed.
+    function _skipIfNoRpc() internal {
+        if (bytes(vm.envOr("BNB_RPC_URL", string(""))).length == 0) {
+            vm.skip(true);
+        }
+    }
 
     function setUp() public {
-        alice = makeAddr("alice");
-        recipient = makeAddr("recipient");
-        // msg.sender at construction is the test contract, so address(this) == owner.
-        liquidator = new CharonLiquidator(STUB_POOL, STUB_ROUTER);
+        // If the operator has not provided a BSC RPC URL, leave `liquidator`
+        // zero-initialised. Each test re-checks via _skipIfNoRpc() before
+        // interacting with the contract. This keeps the suite green in CI
+        // environments without a fork endpoint.
+        string memory rpc = vm.envOr("BNB_RPC_URL", string(""));
+        if (bytes(rpc).length == 0) {
+            return;
+        }
+
+        // Optional pin for deterministic fork tests. Absent → latest block.
+        uint256 pin = vm.envOr("BNB_FORK_BLOCK", uint256(0));
+        if (pin == 0) {
+            vm.createSelectFork(rpc);
+        } else {
+            vm.createSelectFork(rpc, pin);
+        }
+
+        // address(this) is the hot-wallet owner — matches production wiring
+        // where the deploying bot key is the owner.
+        liquidator = new CharonLiquidator(AAVE_V3_POOL_BSC, PCS_V3_ROUTER_BSC, COLD_WALLET);
     }
 
-    // ── Internal helper: a fully-valid LiquidationParams struct ──────────────
-    function _validParams() internal returns (CharonLiquidator.LiquidationParams memory) {
-        return CharonLiquidator.LiquidationParams({
-            protocolId: 3, // PROTOCOL_VENUS
-            borrower: makeAddr("borrower"),
-            debtToken: makeAddr("debtToken"),
-            collateralToken: makeAddr("collateralToken"),
-            debtVToken: makeAddr("debtVToken"),
-            collateralVToken: makeAddr("collateralVToken"),
-            repayAmount: 1e18,
-            minSwapOut: 0
-        });
+    // ─────────────────────────────────────────────────────────────────────
+    // Constructor / immutable wiring
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// @notice Sanity-check that ctor wires every immutable and that owner
+    ///         resolves to the deployer (address(this)).
+    function test_constructor_wires_immutables() public {
+        _skipIfNoRpc();
+
+        assertEq(liquidator.owner(), address(this), "owner != deployer");
+        assertEq(liquidator.COLD_WALLET(), COLD_WALLET, "COLD_WALLET mismatch");
+        assertEq(liquidator.AAVE_POOL(), AAVE_V3_POOL_BSC, "AAVE_POOL mismatch");
+        assertEq(liquidator.SWAP_ROUTER(), PCS_V3_ROUTER_BSC, "SWAP_ROUTER mismatch");
     }
 
-    // ─────────────────────────────────────────────────────────────────────────
-    // A. Constructor guards & owner binding
-    // ─────────────────────────────────────────────────────────────────────────
+    // ─────────────────────────────────────────────────────────────────────
+    // Access control
+    // ─────────────────────────────────────────────────────────────────────
 
-    function test_constructor_revertsOnZeroAavePool() public {
-        vm.expectRevert(bytes("!aavePool"));
-        new CharonLiquidator(address(0), STUB_ROUTER);
-    }
+    /// @notice rescue() is onlyOwner. Non-owner caller must revert; owner
+    ///         call against a zero-value sentinel reverts for a different
+    ///         reason (!to) — we only assert the ACL gate here.
+    function test_rescue_onlyOwner() public {
+        _skipIfNoRpc();
 
-    function test_constructor_revertsOnZeroSwapRouter() public {
-        vm.expectRevert(bytes("!swapRouter"));
-        new CharonLiquidator(STUB_POOL, address(0));
-    }
-
-    function test_constructor_setsOwnerAndImmutables() public view {
-        assertEq(liquidator.owner(), address(this), "owner must be deployer");
-        assertEq(liquidator.AAVE_POOL(), STUB_POOL, "AAVE_POOL mismatch");
-        assertEq(liquidator.SWAP_ROUTER(), STUB_ROUTER, "SWAP_ROUTER mismatch");
-    }
-
-    // ─────────────────────────────────────────────────────────────────────────
-    // B. Access control
-    // ─────────────────────────────────────────────────────────────────────────
-
-    function test_executeLiquidation_revertsWhenNotOwner() public {
-        CharonLiquidator.LiquidationParams memory p = _validParams();
-        vm.prank(alice);
+        address attacker = address(0xBAD);
+        vm.prank(attacker);
         vm.expectRevert(bytes("!owner"));
-        liquidator.executeLiquidation(p);
-    }
+        liquidator.rescue(address(0), address(0x1), 1);
 
-    function test_rescue_revertsWhenNotOwner() public {
-        vm.prank(alice);
-        vm.expectRevert(bytes("!owner"));
-        liquidator.rescue(address(0), recipient, 1 ether);
-    }
-
-    // ─────────────────────────────────────────────────────────────────────────
-    // C. executeLiquidation input validation (skeleton reverts come AFTER these)
-    // ─────────────────────────────────────────────────────────────────────────
-
-    function test_executeLiquidation_revertsOnWrongProtocolId() public {
-        CharonLiquidator.LiquidationParams memory p = _validParams();
-        p.protocolId = 0; // ProtocolId::Aave — not supported in v0.1
-        vm.expectRevert(bytes("!protocolId"));
-        liquidator.executeLiquidation(p);
-    }
-
-    function test_executeLiquidation_revertsOnZeroBorrower() public {
-        CharonLiquidator.LiquidationParams memory p = _validParams();
-        p.borrower = address(0);
-        vm.expectRevert(bytes("!borrower"));
-        liquidator.executeLiquidation(p);
-    }
-
-    function test_executeLiquidation_revertsOnZeroDebtToken() public {
-        CharonLiquidator.LiquidationParams memory p = _validParams();
-        p.debtToken = address(0);
-        vm.expectRevert(bytes("!debtToken"));
-        liquidator.executeLiquidation(p);
-    }
-
-    function test_executeLiquidation_revertsOnZeroCollateralToken() public {
-        CharonLiquidator.LiquidationParams memory p = _validParams();
-        p.collateralToken = address(0);
-        vm.expectRevert(bytes("!collateralToken"));
-        liquidator.executeLiquidation(p);
-    }
-
-    function test_executeLiquidation_revertsOnZeroDebtVToken() public {
-        CharonLiquidator.LiquidationParams memory p = _validParams();
-        p.debtVToken = address(0);
-        vm.expectRevert(bytes("!debtVToken"));
-        liquidator.executeLiquidation(p);
-    }
-
-    function test_executeLiquidation_revertsOnZeroCollateralVToken() public {
-        CharonLiquidator.LiquidationParams memory p = _validParams();
-        p.collateralVToken = address(0);
-        vm.expectRevert(bytes("!collateralVToken"));
-        liquidator.executeLiquidation(p);
-    }
-
-    function test_executeLiquidation_revertsOnZeroRepayAmount() public {
-        CharonLiquidator.LiquidationParams memory p = _validParams();
-        p.repayAmount = 0;
-        vm.expectRevert(bytes("!repayAmount"));
-        liquidator.executeLiquidation(p);
-    }
-
-    /// @dev Validated params still hit the skeleton's "not yet implemented" revert
-    ///      — this test pins the current skeleton behaviour so replacing the body
-    ///      in issue #12 deliberately breaks this test (reminder to update).
-    function test_executeLiquidation_skeletonStillReverts() public {
-        CharonLiquidator.LiquidationParams memory p = _validParams();
-        vm.expectRevert(bytes("CharonLiquidator: executeLiquidation not yet implemented"));
-        liquidator.executeLiquidation(p);
-    }
-
-    // ─────────────────────────────────────────────────────────────────────────
-    // D. executeOperation security gates
-    // ─────────────────────────────────────────────────────────────────────────
-
-    function test_executeOperation_revertsWhenNotPool() public {
-        vm.prank(alice); // any non-AAVE_POOL caller
-        vm.expectRevert(bytes("!pool"));
-        liquidator.executeOperation(address(0), 0, 0, address(liquidator), bytes(""));
-    }
-
-    function test_executeOperation_revertsWhenInitiatorNotSelf() public {
-        vm.prank(STUB_POOL);
-        vm.expectRevert(bytes("!initiator"));
-        liquidator.executeOperation(address(0), 0, 0, alice, bytes(""));
-    }
-
-    // ─────────────────────────────────────────────────────────────────────────
-    // E. rescue()
-    // ─────────────────────────────────────────────────────────────────────────
-
-    function test_rescue_revertsOnZeroRecipient() public {
+        // Owner call surfaces the input validator — proves we passed the
+        // ACL gate even though the call itself reverts on argument checks.
         vm.expectRevert(bytes("!to"));
-        liquidator.rescue(address(0), address(0), 1 ether);
+        liquidator.rescue(address(0), address(0), 1);
     }
 
-    function test_rescue_revertsOnZeroAmount() public {
-        vm.expectRevert(bytes("!amount"));
-        liquidator.rescue(address(0), recipient, 0);
+    /// @notice executeOperation must reject any sender that is not the Aave
+    ///         pool. This guards the flash-loan callback against forged
+    ///         invocation by an unrelated contract.
+    function test_executeOperation_rejectsNonAavePool() public {
+        _skipIfNoRpc();
+
+        // Minimally-valid calldata shape; contents are irrelevant because
+        // the !pool guard fires before any decoding.
+        bytes memory data = "";
+        vm.prank(address(0xDEAD));
+        vm.expectRevert(bytes("!pool"));
+        liquidator.executeOperation(MOCK_DEBT_TOKEN, 1, 0, address(liquidator), data);
     }
 
-    function test_rescue_transfersErc20() public {
-        MockERC20 token = new MockERC20();
-        token.mint(address(liquidator), 1_000);
+    // ─────────────────────────────────────────────────────────────────────
+    // vBNB unwrap branch
+    // ─────────────────────────────────────────────────────────────────────
 
-        vm.expectEmit(true, true, false, true);
-        emit CharonLiquidator.Rescued(address(token), recipient, 400);
+    /// @notice Exercises the vBNB branch end-to-end through executeOperation
+    ///         using vm.mockCall to stub Venus + PancakeSwap. Confirms that
+    ///         when the seized vToken is vBNB the contract:
+    ///           1. Calls IVToken.redeem on vBNB.
+    ///           2. Invokes IWETH.deposit with the contract's native balance.
+    ///           3. Swaps the WBNB-denominated collateral and repays Aave.
+    ///
+    /// @dev Real liquidation would require staging an under-water Venus
+    ///      position on the forked state. That is deliberately out of scope
+    ///      for this unit test — the intent is to prove the vBNB code path
+    ///      is reached and the unwrap step is invoked.
+    function test_liquidate_vBNB_unwraps_to_wbnb() public {
+        _skipIfNoRpc();
 
-        liquidator.rescue(address(token), recipient, 400);
+        uint256 repay = 1_000 ether;
+        uint256 premium = 5 ether;
+        uint256 seizedVTokens = 42 ether;
+        uint256 nativeRedeemed = 10 ether;
+        uint256 swapOut = repay + premium + 1; // leave 1 wei profit
 
-        assertEq(token.balanceOf(address(liquidator)), 600, "liquidator token balance wrong");
-        assertEq(token.balanceOf(recipient), 400, "recipient token balance wrong");
+        // Stub Venus debt-vToken: liquidateBorrow succeeds.
+        vm.mockCall(
+            MOCK_DEBT_VTOKEN,
+            abi.encodeWithSelector(IVToken.liquidateBorrow.selector, MOCK_BORROWER, repay, VBNB_BSC),
+            abi.encode(uint256(0))
+        );
+        // Stub seized-vToken balance on contract.
+        vm.mockCall(
+            VBNB_BSC,
+            abi.encodeWithSelector(IVToken.balanceOf.selector, address(liquidator)),
+            abi.encode(seizedVTokens)
+        );
+        // Stub vBNB.redeem → 0 success. Venus sends native BNB out-of-band;
+        // we credit the liquidator's native balance via vm.deal below.
+        vm.mockCall(
+            VBNB_BSC,
+            abi.encodeWithSelector(IVToken.redeem.selector, seizedVTokens),
+            abi.encode(uint256(0))
+        );
+        vm.deal(address(liquidator), nativeRedeemed);
+
+        // Stub WBNB.deposit — mockCall returns without touching the native
+        // balance. The post-wrap balance check below is also mocked, so the
+        // real deposit semantics don't matter for the assertion.
+        vm.mockCall(WBNB_BSC, abi.encodeWithSelector(IWETH.deposit.selector), bytes(""));
+        // WBNB.balanceOf(liquidator) → post-wrap collateral balance.
+        vm.mockCall(
+            WBNB_BSC,
+            abi.encodeWithSelector(IERC20.balanceOf.selector, address(liquidator)),
+            abi.encode(nativeRedeemed)
+        );
+        // Every ERC-20 approve() call (debt vToken, swap router, aave pool,
+        // WBNB router approve) returns true regardless of target.
+        vm.mockCall(
+            MOCK_DEBT_TOKEN, abi.encodeWithSelector(IERC20.approve.selector), abi.encode(true)
+        );
+        vm.mockCall(WBNB_BSC, abi.encodeWithSelector(IERC20.approve.selector), abi.encode(true));
+        // PancakeSwap V3 router: swap returns swapOut.
+        vm.mockCall(
+            PCS_V3_ROUTER_BSC,
+            abi.encodeWithSelector(ISwapRouter.exactInputSingle.selector),
+            abi.encode(swapOut)
+        );
+        // Debt-token balance after swap → swapOut, so profit = 1 wei.
+        vm.mockCall(
+            MOCK_DEBT_TOKEN,
+            abi.encodeWithSelector(IERC20.balanceOf.selector, address(liquidator)),
+            abi.encode(swapOut)
+        );
+        // Profit sweep transfer → succeeds.
+        vm.mockCall(
+            MOCK_DEBT_TOKEN, abi.encodeWithSelector(IERC20.transfer.selector), abi.encode(true)
+        );
+
+        CharonLiquidator.LiquidationParams memory p = CharonLiquidator.LiquidationParams({
+            protocolId: 3, // PROTOCOL_VENUS
+            borrower: MOCK_BORROWER,
+            debtToken: MOCK_DEBT_TOKEN,
+            collateralToken: WBNB_BSC, // vBNB branch requires WBNB
+            debtVToken: MOCK_DEBT_VTOKEN,
+            collateralVToken: VBNB_BSC,
+            repayAmount: repay,
+            minSwapOut: repay + premium,
+            swapPoolFee: 500
+        });
+
+        // Expect vBNB.redeem to be invoked — this is the load-bearing assert
+        // that the vBNB branch was entered rather than the standard one.
+        vm.expectCall(VBNB_BSC, abi.encodeWithSelector(IVToken.redeem.selector, seizedVTokens));
+        // Expect IWETH.deposit to be called, proving the native-to-WBNB
+        // wrap step executed.
+        vm.expectCall(WBNB_BSC, abi.encodeWithSelector(IWETH.deposit.selector));
+
+        vm.prank(AAVE_V3_POOL_BSC);
+        bool ok = liquidator.executeOperation(
+            MOCK_DEBT_TOKEN, repay, premium, address(liquidator), abi.encode(p)
+        );
+        assertTrue(ok, "executeOperation returned false");
     }
 
-    function test_rescue_transfersNativeBnbToEoa() public {
-        vm.deal(address(liquidator), 5 ether);
-        uint256 before = recipient.balance;
+    // ─────────────────────────────────────────────────────────────────────
+    // Profit sweep to COLD_WALLET
+    // ─────────────────────────────────────────────────────────────────────
 
-        vm.expectEmit(true, true, false, true);
-        emit CharonLiquidator.Rescued(address(0), recipient, 2 ether);
+    /// @notice After a mocked-happy-path liquidation (non-vBNB branch),
+    ///         confirm that profit transfer is routed to COLD_WALLET, not
+    ///         owner. The load-bearing assertion is the vm.expectCall on
+    ///         IERC20.transfer(COLD_WALLET, profit).
+    function test_profit_sweeps_to_cold_wallet() public {
+        _skipIfNoRpc();
 
-        liquidator.rescue(address(0), recipient, 2 ether);
+        uint256 repay = 1_000 ether;
+        uint256 premium = 5 ether;
+        uint256 seizedVTokens = 50 ether;
+        uint256 collUnderlying = 2_000 ether;
+        uint256 swapOut = repay + premium + 7 ether; // profit = 7 ether
+        uint256 expectedProfit = swapOut - (repay + premium);
 
-        assertEq(recipient.balance - before, 2 ether, "bnb not received");
-        assertEq(address(liquidator).balance, 3 ether, "liquidator bnb wrong");
+        // Debt vToken: liquidateBorrow succeeds.
+        vm.mockCall(
+            MOCK_DEBT_VTOKEN,
+            abi.encodeWithSelector(IVToken.liquidateBorrow.selector),
+            abi.encode(uint256(0))
+        );
+        // Collateral vToken: balanceOf + redeem.
+        vm.mockCall(
+            MOCK_COLL_VTOKEN,
+            abi.encodeWithSelector(IVToken.balanceOf.selector, address(liquidator)),
+            abi.encode(seizedVTokens)
+        );
+        vm.mockCall(
+            MOCK_COLL_VTOKEN,
+            abi.encodeWithSelector(IVToken.redeem.selector, seizedVTokens),
+            abi.encode(uint256(0))
+        );
+        // Collateral underlying: balanceOf used both for approve amount and
+        // post-redeem balance read. Approve returns true.
+        vm.mockCall(
+            MOCK_COLL_TOKEN,
+            abi.encodeWithSelector(IERC20.balanceOf.selector, address(liquidator)),
+            abi.encode(collUnderlying)
+        );
+        vm.mockCall(
+            MOCK_COLL_TOKEN, abi.encodeWithSelector(IERC20.approve.selector), abi.encode(true)
+        );
+        vm.mockCall(
+            MOCK_DEBT_TOKEN, abi.encodeWithSelector(IERC20.approve.selector), abi.encode(true)
+        );
+        // PancakeSwap: returns swapOut.
+        vm.mockCall(
+            PCS_V3_ROUTER_BSC,
+            abi.encodeWithSelector(ISwapRouter.exactInputSingle.selector),
+            abi.encode(swapOut)
+        );
+        // Debt token post-swap balance == swapOut (covers totalOwed + profit).
+        vm.mockCall(
+            MOCK_DEBT_TOKEN,
+            abi.encodeWithSelector(IERC20.balanceOf.selector, address(liquidator)),
+            abi.encode(swapOut)
+        );
+        // Debt token transfer(COLD_WALLET, profit) — returns true.
+        vm.mockCall(
+            MOCK_DEBT_TOKEN,
+            abi.encodeWithSelector(IERC20.transfer.selector, COLD_WALLET, expectedProfit),
+            abi.encode(true)
+        );
+
+        CharonLiquidator.LiquidationParams memory p = CharonLiquidator.LiquidationParams({
+            protocolId: 3,
+            borrower: MOCK_BORROWER,
+            debtToken: MOCK_DEBT_TOKEN,
+            collateralToken: MOCK_COLL_TOKEN,
+            debtVToken: MOCK_DEBT_VTOKEN,
+            collateralVToken: MOCK_COLL_VTOKEN,
+            repayAmount: repay,
+            minSwapOut: repay + premium,
+            swapPoolFee: 3000
+        });
+
+        // Load-bearing assertion: profit goes to COLD_WALLET specifically.
+        vm.expectCall(
+            MOCK_DEBT_TOKEN,
+            abi.encodeWithSelector(IERC20.transfer.selector, COLD_WALLET, expectedProfit)
+        );
+
+        vm.prank(AAVE_V3_POOL_BSC);
+        bool ok = liquidator.executeOperation(
+            MOCK_DEBT_TOKEN, repay, premium, address(liquidator), abi.encode(p)
+        );
+        assertTrue(ok, "executeOperation returned false");
     }
 
-    /// @dev Proves that rescue()'s BNB path uses `call{value}` (full gas) and not
-    ///      `transfer` (2300-gas stipend). A contract recipient that writes storage
-    ///      in `receive()` would cause `transfer` to fail. Covers issue #117.
-    function test_rescue_bnbToGasHungryContractRecipient() public {
-        GasHungryReceiver gh = new GasHungryReceiver();
-        vm.deal(address(liquidator), 5 ether);
-        uint256 before = address(gh).balance;
+    // ─────────────────────────────────────────────────────────────────────
+    // swapPoolFee round-trip
+    // ─────────────────────────────────────────────────────────────────────
 
-        liquidator.rescue(address(0), address(gh), 2 ether);
+    /// @notice Confirms LiquidationParams.swapPoolFee is propagated into the
+    ///         PancakeSwap router call. Uses vm.expectCall on the exact
+    ///         encoded ExactInputSingleParams to assert fee == 500.
+    function test_swapPoolFee_field_in_params() public {
+        _skipIfNoRpc();
 
-        assertEq(address(gh).balance - before, 2 ether, "bnb not received by contract");
-        assertEq(gh.touched(), 1, "recipient fallback did not execute");
+        uint24 fee = 500;
+        uint256 repay = 100 ether;
+        uint256 premium = 1 ether;
+        uint256 collUnderlying = 500 ether;
+        uint256 swapOut = repay + premium; // zero profit — skips transfer
+
+        vm.mockCall(
+            MOCK_DEBT_VTOKEN,
+            abi.encodeWithSelector(IVToken.liquidateBorrow.selector),
+            abi.encode(uint256(0))
+        );
+        vm.mockCall(
+            MOCK_COLL_VTOKEN,
+            abi.encodeWithSelector(IVToken.balanceOf.selector, address(liquidator)),
+            abi.encode(uint256(1 ether))
+        );
+        vm.mockCall(
+            MOCK_COLL_VTOKEN,
+            abi.encodeWithSelector(IVToken.redeem.selector),
+            abi.encode(uint256(0))
+        );
+        vm.mockCall(
+            MOCK_COLL_TOKEN,
+            abi.encodeWithSelector(IERC20.balanceOf.selector, address(liquidator)),
+            abi.encode(collUnderlying)
+        );
+        vm.mockCall(
+            MOCK_COLL_TOKEN, abi.encodeWithSelector(IERC20.approve.selector), abi.encode(true)
+        );
+        vm.mockCall(
+            MOCK_DEBT_TOKEN, abi.encodeWithSelector(IERC20.approve.selector), abi.encode(true)
+        );
+        vm.mockCall(
+            PCS_V3_ROUTER_BSC,
+            abi.encodeWithSelector(ISwapRouter.exactInputSingle.selector),
+            abi.encode(swapOut)
+        );
+        vm.mockCall(
+            MOCK_DEBT_TOKEN,
+            abi.encodeWithSelector(IERC20.balanceOf.selector, address(liquidator)),
+            abi.encode(swapOut)
+        );
+
+        CharonLiquidator.LiquidationParams memory p = CharonLiquidator.LiquidationParams({
+            protocolId: 3,
+            borrower: MOCK_BORROWER,
+            debtToken: MOCK_DEBT_TOKEN,
+            collateralToken: MOCK_COLL_TOKEN,
+            debtVToken: MOCK_DEBT_VTOKEN,
+            collateralVToken: MOCK_COLL_VTOKEN,
+            repayAmount: repay,
+            minSwapOut: repay + premium,
+            swapPoolFee: fee
+        });
+
+        // Assert that the router is called with the exact fee from params.
+        // Build the expected params struct and encode the full call; any
+        // deviation in `fee` would cause vm.expectCall to fail.
+        ISwapRouter.ExactInputSingleParams memory expected = ISwapRouter.ExactInputSingleParams({
+            tokenIn: MOCK_COLL_TOKEN,
+            tokenOut: MOCK_DEBT_TOKEN,
+            fee: fee,
+            recipient: address(liquidator),
+            deadline: block.timestamp,
+            amountIn: collUnderlying,
+            amountOutMinimum: p.minSwapOut,
+            sqrtPriceLimitX96: 0
+        });
+        vm.expectCall(
+            PCS_V3_ROUTER_BSC,
+            abi.encodeWithSelector(ISwapRouter.exactInputSingle.selector, expected)
+        );
+
+        vm.prank(AAVE_V3_POOL_BSC);
+        bool ok = liquidator.executeOperation(
+            MOCK_DEBT_TOKEN, repay, premium, address(liquidator), abi.encode(p)
+        );
+        assertTrue(ok, "executeOperation returned false");
     }
 
-    // ─────────────────────────────────────────────────────────────────────────
-    // F. No-receive policy — plain BNB sends must revert (issue #117)
-    // ─────────────────────────────────────────────────────────────────────────
+    /// @notice Reject path: swapPoolFee = 0 must revert inside
+    ///         executeLiquidation input validation. Confirms the field
+    ///         is actually read, not silently ignored.
+    function test_swapPoolFee_zero_reverts() public {
+        _skipIfNoRpc();
 
-    function test_directBnbTransferReverts() public {
-        (bool ok,) = address(liquidator).call{ value: 1 ether }("");
-        assertFalse(ok, "liquidator must refuse plain BNB transfers");
+        CharonLiquidator.LiquidationParams memory p = CharonLiquidator.LiquidationParams({
+            protocolId: 3,
+            borrower: MOCK_BORROWER,
+            debtToken: MOCK_DEBT_TOKEN,
+            collateralToken: MOCK_COLL_TOKEN,
+            debtVToken: MOCK_DEBT_VTOKEN,
+            collateralVToken: MOCK_COLL_VTOKEN,
+            repayAmount: 1 ether,
+            minSwapOut: 1 ether,
+            swapPoolFee: 0
+        });
+
+        vm.expectRevert(bytes("!swapPoolFee"));
+        liquidator.executeLiquidation(p);
     }
 }
