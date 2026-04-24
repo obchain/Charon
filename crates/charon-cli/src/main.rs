@@ -1,6 +1,7 @@
 //! Charon command-line entrypoint.
 //!
 //! ```text
+//! CHARON_CONFIG=/etc/charon/default.toml charon listen
 //! charon --config config/default.toml listen
 //! charon --config config/default.toml test-connection --chain bnb
 //! ```
@@ -25,7 +26,12 @@ const CHAIN_EVENT_CHANNEL: usize = 1024;
 #[command(version, about, long_about = None)]
 struct Cli {
     /// Path to the TOML config file.
-    #[arg(long, short = 'c', default_value = "config/default.toml")]
+    ///
+    /// No default — the operator must supply the path explicitly via
+    /// `--config` or the `CHARON_CONFIG` environment variable. Avoids the
+    /// silent cwd-relative `config/default.toml` fallback which breaks inside
+    /// the Docker deploy image where WORKDIR may differ from the repo root.
+    #[arg(long, short = 'c', env = "CHARON_CONFIG")]
     config: PathBuf,
 
     #[command(subcommand)]
@@ -34,7 +40,7 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Command {
-    /// Spawn one block listener per configured chain and print new blocks.
+    /// Spawn one block listener per configured chain and drain chain events.
     ///
     /// Downstream pipeline (scanner → profit calc → executor) consumes
     /// the same channel once those layers land.
@@ -48,14 +54,18 @@ enum Command {
     },
 }
 
-#[tokio::main]
+// Explicit multi-thread flavor so the concurrency contract survives any
+// future trimming of tokio's `full` feature set.
+#[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<()> {
     // Load `.env` if present. Silent no-op if the file isn't there.
     let _ = dotenvy::dotenv();
 
-    // Structured logging. Override verbosity with RUST_LOG=debug etc.
+    // Structured logs go to stderr so `listen` can eventually emit a JSON
+    // data stream on stdout without interleaving. Verbosity via RUST_LOG.
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
+        .with_writer(std::io::stderr)
         .init();
 
     let cli = Cli::parse();
@@ -66,17 +76,22 @@ async fn main() -> Result<()> {
     let config = Config::load(&cli.config)
         .with_context(|| format!("failed to load config from {}", cli.config.display()))?;
 
+    // SECURITY: only counts and non-secret scalars here.
+    // Never log ws_url, http_url, private keys, wallet addresses, or the
+    // full Debug of Config / ChainConfig — RPC URLs embed API keys.
     info!(
         chains = config.chain.len(),
         protocols = config.protocol.len(),
         flashloan_sources = config.flashloan.len(),
         liquidators = config.liquidator.len(),
-        min_profit_usd = config.bot.min_profit_usd,
+        min_profit_usd_1e6 = config.bot.min_profit_usd_1e6,
         "config loaded"
     );
 
     match cli.command {
-        Command::Listen => run_listen(config).await?,
+        Command::Listen => {
+            run_listen(&config).await?;
+        }
         Command::TestConnection { chain } => {
             let chain_cfg = config
                 .chain
@@ -91,9 +106,11 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-/// Spawn one `BlockListener` per configured chain, drain the shared
-/// `ChainEvent` channel, and exit on Ctrl-C.
-async fn run_listen(config: Config) -> Result<()> {
+/// Long-running listener entry point. Spawns one `BlockListener` per
+/// configured chain, drains the shared `ChainEvent` channel, and exits
+/// cleanly on SIGINT or SIGTERM so the Docker `stop` → SIGTERM → SIGKILL
+/// sequence never tears mid-operation.
+async fn run_listen(config: &Config) -> Result<()> {
     if config.chain.is_empty() {
         anyhow::bail!("no chains configured — nothing to listen to");
     }
@@ -102,14 +119,18 @@ async fn run_listen(config: Config) -> Result<()> {
     let mut listeners: tokio::task::JoinSet<(String, Result<()>)> =
         tokio::task::JoinSet::new();
 
-    for (name, chain_cfg) in config.chain {
+    // `ChainConfig: Clone` — we only borrow `config`, so each listener task
+    // gets its own owned copy.
+    for (name, chain_cfg) in &config.chain {
+        let name = name.clone();
+        let chain_cfg = chain_cfg.clone();
         let listener = BlockListener::new(name.clone(), chain_cfg, tx.clone());
         listeners.spawn(async move { (name, listener.run().await) });
     }
     // Drop our sender so the channel closes when every listener exits.
     drop(tx);
 
-    info!("listen: draining chain events (Ctrl-C to stop)");
+    info!("listen: draining chain events (Ctrl-C or SIGTERM to stop)");
 
     tokio::select! {
         _ = async {
@@ -134,7 +155,11 @@ async fn run_listen(config: Config) -> Result<()> {
             info!("all listener tasks terminated");
         }
         _ = tokio::signal::ctrl_c() => {
-            info!("ctrl-c received, shutting down");
+            info!("received SIGINT, shutting down");
+            listeners.shutdown().await;
+        }
+        _ = wait_sigterm() => {
+            info!("received SIGTERM, shutting down");
             listeners.shutdown().await;
         }
     }
@@ -163,4 +188,23 @@ async fn supervise(
             }
         }
     }
+}
+
+#[cfg(unix)]
+async fn wait_sigterm() {
+    use tokio::signal::unix::{SignalKind, signal};
+    match signal(SignalKind::terminate()) {
+        Ok(mut s) => {
+            let _ = s.recv().await;
+        }
+        Err(err) => {
+            tracing::warn!(error = %err, "failed to install SIGTERM handler");
+            std::future::pending::<()>().await
+        }
+    }
+}
+
+#[cfg(not(unix))]
+async fn wait_sigterm() {
+    std::future::pending::<()>().await
 }
