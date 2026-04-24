@@ -3,12 +3,14 @@
 //! ```text
 //! CHARON_CONFIG=/etc/charon/default.toml charon listen
 //! charon --config config/default.toml listen
+//! charon --config config/default.toml test-connection --chain bnb
 //! ```
 
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use charon_core::Config;
+use charon_scanner::ChainProvider;
 use clap::{Parser, Subcommand};
 use tracing::info;
 use tracing_subscriber::EnvFilter;
@@ -33,8 +35,15 @@ struct Cli {
 #[derive(Subcommand, Debug)]
 enum Command {
     /// Listen to chain events and track positions.
-    /// (Scanner wiring arrives in Day 2 — for now this just loads config.)
+    /// (Scanner wiring lands across multiple M1 issues — currently a stub.)
     Listen,
+
+    /// Connect to a configured chain and print its latest block number.
+    TestConnection {
+        /// Chain key (must match a `[chain.<name>]` section in the config).
+        #[arg(long, default_value = "bnb")]
+        chain: String,
+    },
 }
 
 // Explicit multi-thread flavor so the concurrency contract survives any
@@ -47,9 +56,7 @@ async fn main() -> Result<()> {
     // Structured logs go to stderr so `listen` can eventually emit a JSON
     // data stream on stdout without interleaving. Verbosity via RUST_LOG.
     tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
-        )
+        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
         .with_writer(std::io::stderr)
         .init();
 
@@ -76,6 +83,15 @@ async fn main() -> Result<()> {
     match cli.command {
         Command::Listen => {
             run_listen(&config).await?;
+        }
+        Command::TestConnection { chain } => {
+            let chain_cfg = config
+                .chain
+                .get(&chain)
+                .with_context(|| format!("chain '{chain}' not found in config"))?;
+            let provider = ChainProvider::connect(&chain, chain_cfg).await?;
+            let block = provider.test_connection().await?;
+            info!(chain = %chain, block = block, "connected — latest block");
         }
     }
 

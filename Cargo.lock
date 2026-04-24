@@ -1127,6 +1127,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "charon-core",
+ "charon-scanner",
  "clap",
  "dotenvy",
  "tokio",
@@ -1149,6 +1150,14 @@ dependencies = [
 [[package]]
 name = "charon-scanner"
 version = "0.1.0"
+dependencies = [
+ "alloy",
+ "anyhow",
+ "async-trait",
+ "charon-core",
+ "tokio",
+ "tracing",
+]
 
 [[package]]
 name = "clap"
