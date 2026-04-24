@@ -132,6 +132,35 @@ pub struct LiquidationOpportunity {
     pub net_profit_wei: U256,
 }
 
+impl LiquidationOpportunity {
+    /// Build an opportunity and copy the authoritative
+    /// `net_profit_wei` out of a [`crate::profit::NetProfit`]
+    /// breakdown.
+    ///
+    /// The breakdown itself (gross, fee, gas, slippage) stays local to
+    /// the caller for logging / tracing — only the final
+    /// `net_profit_wei` is stored on the opportunity. This is the only
+    /// sanctioned constructor that ties a stored profit figure back to
+    /// the calculator that produced it.
+    pub fn with_profit(
+        position: Position,
+        debt_to_repay: U256,
+        expected_collateral_out: U256,
+        flash_source: FlashLoanSource,
+        swap_route: SwapRoute,
+        net_profit: crate::profit::NetProfit,
+    ) -> Self {
+        Self {
+            position,
+            debt_to_repay,
+            expected_collateral_out,
+            flash_source,
+            swap_route,
+            net_profit_wei: net_profit.net_profit_wei,
+        }
+    }
+}
+
 impl Ord for LiquidationOpportunity {
     /// Ranks opportunities by `net_profit_wei` ascending so that a
     /// `BinaryHeap<LiquidationOpportunity>` pops the highest-profit entry first.
