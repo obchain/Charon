@@ -26,7 +26,7 @@ import { IAaveV3Pool } from "../src/interfaces/IAaveV3Pool.sol";
 contract CharonLiquidatorForkTest is Test {
     // ── Live BSC mainnet addresses ────────────────────────────────────────
     /// @dev Aave V3 Pool proxy on BSC. Mirrors config/default.toml `pool`.
-    address internal constant AAVE_V3_POOL_BSC = 0x6807dc923806FE8Fd134338EABCA509979a7e0cB;
+    address internal constant AAVE_V3_POOL_BSC = 0x6807dc923806fE8Fd134338EABCA509979a7e0cB;
     /// @dev PancakeSwap V3 SwapRouter on BSC.
     address internal constant PCS_V3_ROUTER_BSC = 0x13f4EA83D0bd40E75C8222255bc855a974568Dd4;
     /// @dev Venus vBNB market on BSC.
