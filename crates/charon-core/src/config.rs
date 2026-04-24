@@ -186,12 +186,25 @@ fn default_cold_scan_blocks() -> u64 {
 
 /// RPC endpoints for a single chain. **The URLs typically embed API keys;
 /// `Debug` prints `<redacted>` rather than the URL.**
+///
+/// `priority_fee_gwei` is the EIP-1559 priority fee (tip) the gas
+/// oracle attaches per chain, expressed in gwei for operator
+/// readability. Defaults to `1` — BSC validators are fine with a
+/// 1 gwei tip; L2s running sub-gwei tips should override explicitly.
+/// The oracle converts to wei internally; mixing units silently
+/// under-filters at 1e9×.
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ChainConfig {
     pub chain_id: u64,
     pub ws_url: String,
     pub http_url: String,
+    #[serde(default = "default_priority_fee_gwei")]
+    pub priority_fee_gwei: u64,
+}
+
+fn default_priority_fee_gwei() -> u64 {
+    1
 }
 
 impl fmt::Debug for ChainConfig {
@@ -200,6 +213,7 @@ impl fmt::Debug for ChainConfig {
             .field("chain_id", &self.chain_id)
             .field("ws_url", &"<redacted>")
             .field("http_url", &"<redacted>")
+            .field("priority_fee_gwei", &self.priority_fee_gwei)
             .finish()
     }
 }
