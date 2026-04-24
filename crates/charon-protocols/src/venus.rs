@@ -6,10 +6,16 @@
 //! means the account is liquidatable. The adapter translates that shape
 //! into the shared `Position` type and encodes liquidation calls through
 //! `VToken.liquidateBorrow(borrower, repayAmount, vTokenCollateral)`.
+//!
+//! All view calls accept a `BlockNumberOrTag` so the scanner can pin a
+//! snapshot to an observed head and avoid oracle/exchange-rate drift
+//! between reads. Internally we convert to `alloy::eips::BlockId` which
+//! is the argument type the sol!-generated call builder expects.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use alloy::eips::{BlockId, BlockNumberOrTag};
 use alloy::primitives::{Address, U256, address};
 use alloy::providers::{Provider, RootProvider};
 use alloy::pubsub::PubSubFrontend;
@@ -17,7 +23,9 @@ use alloy::sol;
 use alloy::sol_types::SolCall;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
-use charon_core::{LendingProtocol, LiquidationParams, Position, ProtocolId};
+use charon_core::{
+    LendingProtocol, LendingProtocolError, LendingResult, LiquidationParams, Position, ProtocolId,
+};
 use futures_util::stream::{FuturesUnordered, StreamExt};
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
@@ -30,6 +38,14 @@ const WBNB: Address = address!("bb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c");
 /// 1e18 — reused constant to avoid re-computing inside tight loops.
 fn one_e18() -> U256 {
     U256::from(10u64).pow(U256::from(18u64))
+}
+
+/// Map any internal `anyhow::Error` produced inside helper paths to the
+/// `LendingProtocolError::Rpc` variant. RPC failures dominate this adapter's
+/// error surface; callers that need finer distinctions should construct
+/// `LendingProtocolError` directly.
+fn rpc_err<E: std::fmt::Display>(e: E) -> LendingProtocolError {
+    LendingProtocolError::Rpc(e.to_string())
 }
 
 /// On-chain ABI bindings used by the Venus adapter.
@@ -249,18 +265,26 @@ impl VenusAdapter {
         self.snapshot.read().await.liquidation_incentive_mantissa
     }
 
-    /// Fetch one borrower's largest debt/collateral pair, if any.
+    /// Fetch one borrower's largest debt/collateral pair, if any, with every
+    /// sub-call anchored to `block` so oracle price, exchange rate, borrow
+    /// balance, and liquidity are read from the same chain state.
     ///
     /// Walks `getAssetsIn(borrower)`, reads per-vToken borrow + supply
     /// balances and oracle prices through pure view methods only
     /// (`balanceOf * exchangeRateStored / 1e18`; never `balanceOfUnderlying`
     /// which triggers `accrueInterest` and breaks on view-only endpoints).
-    async fn fetch_position_inner(&self, borrower: Address) -> Result<Option<Position>> {
+    async fn fetch_position_inner(
+        &self,
+        borrower: Address,
+        block: BlockNumberOrTag,
+    ) -> Result<Option<Position>> {
+        let block_id: BlockId = block.into();
         let snap = self.snapshot.read().await.clone();
         let comp = abi::IVenusComptroller::new(self.comptroller, self.provider.clone());
 
         let liq = comp
             .getAccountLiquidity(borrower)
+            .block(block_id)
             .call()
             .await
             .with_context(|| format!("getAccountLiquidity({borrower}) failed"))?;
@@ -269,6 +293,7 @@ impl VenusAdapter {
 
         let assets = comp
             .getAssetsIn(borrower)
+            .block(block_id)
             .call()
             .await
             .with_context(|| format!("getAssetsIn({borrower}) failed"))?
@@ -291,7 +316,7 @@ impl VenusAdapter {
             };
             let vt = abi::IVToken::new(*vtoken, self.provider.clone());
 
-            let borrow = match vt.borrowBalanceStored(borrower).call().await {
+            let borrow = match vt.borrowBalanceStored(borrower).block(block_id).call().await {
                 Ok(r) => r._0,
                 Err(err) => {
                     warn!(%vtoken, %borrower, ?err, "borrowBalanceStored failed");
@@ -299,14 +324,14 @@ impl VenusAdapter {
                 }
             };
             // View-only underlying balance: vToken shares × exchangeRate / 1e18.
-            let v_balance = match vt.balanceOf(borrower).call().await {
+            let v_balance = match vt.balanceOf(borrower).block(block_id).call().await {
                 Ok(r) => r._0,
                 Err(err) => {
                     warn!(%vtoken, %borrower, ?err, "balanceOf failed");
                     continue;
                 }
             };
-            let exchange_rate = match vt.exchangeRateStored().call().await {
+            let exchange_rate = match vt.exchangeRateStored().block(block_id).call().await {
                 Ok(r) => r._0,
                 Err(err) => {
                     warn!(%vtoken, ?err, "exchangeRateStored failed");
@@ -315,7 +340,12 @@ impl VenusAdapter {
             };
             let supply = v_balance.saturating_mul(exchange_rate) / scale;
 
-            let price = match oracle.getUnderlyingPrice(*vtoken).call().await {
+            let price = match oracle
+                .getUnderlyingPrice(*vtoken)
+                .block(block_id)
+                .call()
+                .await
+            {
                 Ok(r) => r._0,
                 Err(err) => {
                     warn!(%vtoken, ?err, "oracle.getUnderlyingPrice failed");
@@ -347,16 +377,7 @@ impl VenusAdapter {
         // HF = effective_collateral / total_borrow_val:
         //   shortfall > 0:  eff_coll = total_borrow_val - shortfall
         //   otherwise:      eff_coll = total_borrow_val + liquidity
-        let health_factor = if total_borrow_val.is_zero() {
-            // No debt priced this block → treat as healthy marker.
-            scale.saturating_mul(U256::from(2u64))
-        } else if shortfall > U256::ZERO {
-            let eff = total_borrow_val.saturating_sub(shortfall);
-            eff.saturating_mul(scale) / total_borrow_val
-        } else {
-            let eff = total_borrow_val.saturating_add(liquidity);
-            eff.saturating_mul(scale) / total_borrow_val
-        };
+        let health_factor = compute_health_factor(total_borrow_val, liquidity, shortfall, scale);
 
         // Liquidation bonus bps from live snapshot.
         // mantissa = 1e18 + bonus → bps = (mantissa - 1e18) / 1e14
@@ -385,21 +406,48 @@ impl VenusAdapter {
     }
 }
 
+/// Compute the 1e18-scaled health factor from Comptroller account-liquidity
+/// values, factored out so `get_health_factor` can reuse it without walking
+/// the full position-building path.
+fn compute_health_factor(
+    total_borrow_val: U256,
+    liquidity: U256,
+    shortfall: U256,
+    scale: U256,
+) -> U256 {
+    if total_borrow_val.is_zero() {
+        // No debt priced this block → treat as healthy marker.
+        return scale.saturating_mul(U256::from(2u64));
+    }
+    if shortfall > U256::ZERO {
+        let eff = total_borrow_val.saturating_sub(shortfall);
+        eff.saturating_mul(scale) / total_borrow_val
+    } else {
+        let eff = total_borrow_val.saturating_add(liquidity);
+        eff.saturating_mul(scale) / total_borrow_val
+    }
+}
+
 #[async_trait]
 impl LendingProtocol for VenusAdapter {
     fn id(&self) -> ProtocolId {
         ProtocolId::Venus
     }
 
-    /// Fetch positions for every borrower concurrently via `FuturesUnordered`.
+    /// Fetch positions for every borrower concurrently via `FuturesUnordered`,
+    /// with every sub-call anchored to `block` for snapshot consistency.
     /// Concurrency cap is the borrower count; each borrower still issues
     /// sequential per-vToken calls, which is the next optimization target
     /// (Multicall3 aggregate — follow-up).
-    async fn fetch_positions(&self, borrowers: &[Address]) -> Result<Vec<Position>> {
+    async fn fetch_positions(
+        &self,
+        borrowers: &[Address],
+        block: BlockNumberOrTag,
+    ) -> LendingResult<Vec<Position>> {
         let mut futs = FuturesUnordered::new();
         for &borrower in borrowers {
             futs.push(async move {
-                (borrower, self.fetch_position_inner(borrower).await)
+                (borrower, self.fetch_position_inner(borrower, block).await)
             });
         }
         let mut out = Vec::with_capacity(borrowers.len());
@@ -413,41 +461,118 @@ impl LendingProtocol for VenusAdapter {
         Ok(out)
     }
 
-    fn get_liquidation_params(&self, position: &Position) -> Result<LiquidationParams> {
-        let snap = self
-            .snapshot
-            .try_read()
-            .context("Venus: snapshot is being refreshed — retry")?;
+    /// Return the 1e18-scaled health factor for `borrower` at `block`.
+    ///
+    /// Uses the Comptroller's `getAccountLiquidity` directly: that call
+    /// already aggregates oracle-USD collateral and borrow values across
+    /// every asset the borrower has entered, so one round-trip is enough
+    /// for a gating decision. No oracle / vToken fan-out is needed.
+    async fn get_health_factor(
+        &self,
+        borrower: Address,
+        block: BlockNumberOrTag,
+    ) -> LendingResult<U256> {
+        let block_id: BlockId = block.into();
+        let comp = abi::IVenusComptroller::new(self.comptroller, self.provider.clone());
+        let liq = comp
+            .getAccountLiquidity(borrower)
+            .block(block_id)
+            .call()
+            .await
+            .map_err(|e| {
+                LendingProtocolError::Rpc(format!("getAccountLiquidity({borrower}): {e}"))
+            })?;
+        let err_code = liq._0;
+        let liquidity = liq._1;
+        let shortfall = liq._2;
+        if !err_code.is_zero() {
+            return Err(LendingProtocolError::ProtocolState(format!(
+                "Comptroller.getAccountLiquidity returned non-zero error code {err_code} for {borrower}"
+            )));
+        }
+
+        // `getAccountLiquidity` reports only net liquidity/shortfall, not
+        // total borrow value. Without the latter the HF ratio is not
+        // uniquely defined, so a single aggregate call is not sufficient
+        // for an oracle-exact HF. Reuse the full position walker, which
+        // anchors every sub-call to `block`, and derive HF from the same
+        // totals the scanner would compute.
+        //
+        // OPTIMIZATION: a Multicall3 batch of (borrowBalanceStored ×
+        // getUnderlyingPrice) per entered market would cut this to one
+        // RPC round-trip. Out of scope for this change.
+        let _ = (liquidity, shortfall);
+        let pos = self
+            .fetch_position_inner(borrower, block)
+            .await
+            .map_err(rpc_err)?;
+        match pos {
+            Some(p) => Ok(p.health_factor),
+            None => {
+                // No debt → treat as very healthy (2e18). Matches the
+                // convention used inside `fetch_position_inner`.
+                Ok(one_e18().saturating_mul(U256::from(2u64)))
+            }
+        }
+    }
+
+    /// Close factor on Venus is a **global** Comptroller parameter
+    /// (`closeFactorMantissa`), not per-market. We ignore `market` and
+    /// return the cached value from the latest snapshot.
+    ///
+    /// Returns `LendingProtocolError::ProtocolState` if the snapshot is
+    /// currently being refreshed (write-locked); the caller should retry.
+    /// This keeps the method synchronous as the trait requires while
+    /// avoiding a spinning busy-wait.
+    fn get_close_factor(&self, _market: Address) -> LendingResult<U256> {
+        match self.snapshot.try_read() {
+            Ok(snap) => Ok(snap.close_factor_mantissa),
+            Err(_) => Err(LendingProtocolError::ProtocolState(
+                "Venus snapshot is being refreshed — retry".into(),
+            )),
+        }
+    }
+
+    /// Liquidation incentive on Venus is also a **global** Comptroller
+    /// parameter (`liquidationIncentiveMantissa`), not per-market.
+    /// `collateral_market` is accepted to match the trait shape.
+    async fn get_liquidation_incentive(
+        &self,
+        _collateral_market: Address,
+    ) -> LendingResult<U256> {
+        Ok(self.snapshot.read().await.liquidation_incentive_mantissa)
+    }
+
+    fn get_liquidation_params(&self, position: &Position) -> LendingResult<LiquidationParams> {
+        let snap = self.snapshot.try_read().map_err(|_| {
+            LendingProtocolError::ProtocolState("Venus snapshot is being refreshed — retry".into())
+        })?;
         let collateral_vtoken = snap
             .underlying_to_vtoken
             .get(&position.collateral_token)
             .copied()
-            .with_context(|| {
-                format!(
-                    "Venus: no vToken mapped for collateral underlying {}",
-                    position.collateral_token
-                )
+            .ok_or_else(|| {
+                LendingProtocolError::UnsupportedAsset(position.collateral_token)
             })?;
         let debt_vtoken = snap
             .underlying_to_vtoken
             .get(&position.debt_token)
             .copied()
-            .with_context(|| {
-                format!(
-                    "Venus: no vToken mapped for debt underlying {}",
-                    position.debt_token
-                )
-            })?;
+            .ok_or_else(|| LendingProtocolError::UnsupportedAsset(position.debt_token))?;
 
         let scale = one_e18();
         let repay_amount = position
             .debt_amount
             .checked_mul(snap.close_factor_mantissa)
-            .context("Venus: repay-amount overflow")?
+            .ok_or_else(|| {
+                LendingProtocolError::ProtocolState("Venus: repay-amount overflow".into())
+            })?
             / scale;
 
         if repay_amount.is_zero() {
-            anyhow::bail!("Venus: computed repay_amount is zero (debt or close_factor is zero)");
+            return Err(LendingProtocolError::InvalidPosition(
+                "Venus: computed repay_amount is zero (debt or close_factor is zero)".into(),
+            ));
         }
 
         Ok(LiquidationParams::Venus {
@@ -458,18 +583,27 @@ impl LendingProtocol for VenusAdapter {
         })
     }
 
-    fn build_liquidation_calldata(&self, params: &LiquidationParams) -> Result<Vec<u8>> {
+    fn build_liquidation_calldata(&self, params: &LiquidationParams) -> LendingResult<Vec<u8>> {
         encode_liquidate_borrow_calldata(params)
     }
 }
 
-fn encode_liquidate_borrow_calldata(params: &LiquidationParams) -> Result<Vec<u8>> {
+fn encode_liquidate_borrow_calldata(params: &LiquidationParams) -> LendingResult<Vec<u8>> {
+    // `LiquidationParams` is `#[non_exhaustive]` so the pattern is refutable
+    // from a downstream crate even though `Venus` is the only variant today.
+    // Any non-Venus variant is a caller bug — route through the router that
+    // pairs a `Venus` params struct with this adapter.
     let LiquidationParams::Venus {
         borrower,
         collateral_vtoken,
         debt_vtoken: _,
         repay_amount,
-    } = params;
+    } = params
+    else {
+        return Err(LendingProtocolError::ProtocolState(
+            "encode_liquidate_borrow_calldata called with non-Venus LiquidationParams".into(),
+        ));
+    };
 
     let call = abi::IVToken::liquidateBorrowCall {
         borrower: *borrower,

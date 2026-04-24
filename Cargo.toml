@@ -1,11 +1,20 @@
 [workspace]
-resolver = "2"
+resolver = "3"
 members = [
     "crates/charon-core",
     "crates/charon-protocols",
     "crates/charon-scanner",
     "crates/charon-cli",
 ]
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+all = "warn"
+arithmetic_side_effects = "deny"
+cast_possible_truncation = "deny"
+unwrap_used = "deny"
 
 [workspace.package]
 version = "0.1.0"
@@ -31,6 +40,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # Error handling
 anyhow = "1"
+thiserror = "2"
 
 # Async trait objects
 async-trait = "0.1"
@@ -38,8 +48,14 @@ async-trait = "0.1"
 # Stream adapters (StreamExt for subscription streams)
 futures-util = "0.3"
 
+# Backoff jitter
+rand = "0.8"
+
+# Prometheus-style metrics recorder facade
+metrics = "0.24"
+
 # CLI
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4", features = ["derive", "env"] }
 
 # .env loader
 dotenvy = "0.15"
