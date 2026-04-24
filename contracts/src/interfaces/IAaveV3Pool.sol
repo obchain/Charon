@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-pragma solidity =0.8.24;
+pragma solidity 0.8.24;
 
 /// @title IAaveV3Pool
 /// @notice Stub interface for the Aave V3 Pool contract deployed on BNB Chain.

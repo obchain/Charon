@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-pragma solidity =0.8.24;
+pragma solidity 0.8.24;
 
 /// @title IFlashLoanSimpleReceiver
 /// @notice Aave V3 flash-loan simple receiver callback interface.

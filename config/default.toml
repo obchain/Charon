@@ -4,16 +4,22 @@
 # load time — see `.env.example` for the full list of expected vars.
 
 [bot]
-# Drop opportunities below this USD profit threshold.
-min_profit_usd   = 5.0
-# Skip liquidations when gas price exceeds this (gwei).
-max_gas_gwei     = 10
+# Drop opportunities below this USD profit threshold, in USD × 1e6.
+# 5_000_000 = $5.00. Integer fixed-point to avoid f64 precision.
+min_profit_usd_1e6 = 5000000
+# Skip liquidations when gas price exceeds this, in wei (decimal string).
+# "3000000000" = 3 gwei. Sub-gwei priority fees are representable.
+max_gas_wei = "3000000000"
 # Polling cadence for protocols without push events (ms).
 scan_interval_ms = 1000
-# Health factor at or below which a position is liquidatable (1e18 = 1.0).
-liquidatable_threshold = 1.0
-# Upper bound of the near-liquidation watch band.
-near_liq_threshold     = 1.05
+# Health-factor band (bps of 1e18): liquidatable ≤ 10_000, near-liq window
+# up to `near_liq_threshold_bps`. Omitted keys fall back to serde defaults:
+#   liquidatable_threshold_bps = 10000  (HF = 1.00)
+#   near_liq_threshold_bps     = 10500  (HF = 1.05)
+# Scan cadences per bucket (blocks): defaults hot=1 / warm=10 / cold=100.
+#   hot_scan_blocks  = 1
+#   warm_scan_blocks = 10
+#   cold_scan_blocks = 100
 
 # ── Chains ────────────────────────────────────────────────────────────────
 [chain.bnb]
@@ -34,17 +40,15 @@ chain = "bnb"
 pool  = "0x6807dc923806fe8fd134338eabca509979a7e0cb"
 
 # ── Deployed liquidator contracts ─────────────────────────────────────────
-[liquidator.bnb]
-chain            = "bnb"
-# Placeholder — replaced once CharonLiquidator.sol is deployed on BSC.
-contract_address = "0x0000000000000000000000000000000000000000"
+# Populated once CharonLiquidator.sol is deployed on BSC mainnet. Do not
+# add a zero-address placeholder — config validation rejects it.
 
 # ── Chainlink price feeds (per chain, per asset symbol) ───────────────────
 # Only feeds listed here are polled by the PriceCache. Add more as new
 # Venus markets become relevant. Feed addresses from docs.chain.link.
 [chainlink.bnb]
 BNB  = "0x0567F2323251f0Aab15c8dFb1967E4e8A7D42aeE"
-BTCB = "0x264990fbd0A4796A3E3d8E37C4d5F87a3aCa5Ebf"
+BTCB = "0x264990fbd0A4796A3E3d8E37022BdAf1A5a4C1f0" # BTC / USD (canonical, docs.chain.link)
 ETH  = "0x9ef1B8c0E4F7dc8bF5719Ea496883DC6401d5b2e"
 USDT = "0xB97Ad0E74fa7d920791E90258A6E2085088b4320"
 USDC = "0x51597f405303C4377E36123cBc172b13269EA163"
