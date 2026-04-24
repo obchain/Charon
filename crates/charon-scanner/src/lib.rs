@@ -13,5 +13,5 @@ pub use mempool::{
     legacy_selectors,
 };
 pub use oracle::{CachedPrice, DEFAULT_MAX_AGE, PriceCache};
-pub use provider::ChainProvider;
-pub use scanner::{BucketCounts, BucketedPosition, HealthScanner, PositionBucket};
+pub use provider::{ChainProvider, ChainProviderT, MockChainProvider};
+pub use scanner::{BucketCounts, BucketedPosition, HealthScanner, PositionBucket, ScanScheduler};

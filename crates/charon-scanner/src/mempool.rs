@@ -925,9 +925,9 @@ mod tests {
                 token_out: address!("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
                 amount_in: U256::from(275u64),
                 min_amount_out: U256::from(260u64),
-                pool_fee: 3_000,
+                pool_fee: Some(3_000),
             },
-            net_profit_usd_cents: 5_000,
+            net_profit_wei: U256::from(5_000u64),
         }
     }
 

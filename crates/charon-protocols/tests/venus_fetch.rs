@@ -8,6 +8,7 @@
 use std::str::FromStr;
 use std::sync::Arc;
 
+use alloy::eips::BlockNumberOrTag;
 use alloy::primitives::Address;
 use alloy::providers::{ProviderBuilder, WsConnect};
 use charon_core::{LendingProtocol, ProtocolId};
@@ -38,7 +39,7 @@ async fn fetch_positions_returns_ok_for_empty_address() {
 
     let empty = Address::from_str(EMPTY_ADDRESS).unwrap();
     let positions = adapter
-        .fetch_positions(&[empty])
+        .fetch_positions(&[empty], BlockNumberOrTag::Latest)
         .await
         .expect("fetch_positions should not error on a clean address");
 
