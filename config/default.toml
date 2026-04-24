@@ -4,10 +4,12 @@
 # load time — see `.env.example` for the full list of expected vars.
 
 [bot]
-# Drop opportunities below this USD profit threshold.
-min_profit_usd   = 5.0
-# Skip liquidations when gas price exceeds this (gwei).
-max_gas_gwei     = 10
+# Drop opportunities below this USD profit threshold, in USD × 1e6.
+# 5_000_000 = $5.00. Integer fixed-point to avoid f64 precision.
+min_profit_usd_1e6 = 5000000
+# Skip liquidations when gas price exceeds this, in wei (decimal string).
+# "3000000000" = 3 gwei. Sub-gwei priority fees are representable.
+max_gas_wei = "3000000000"
 # Polling cadence for protocols without push events (ms).
 scan_interval_ms = 1000
 
@@ -30,7 +32,5 @@ chain = "bnb"
 pool  = "0x6807dc923806fe8fd134338eabca509979a7e0cb"
 
 # ── Deployed liquidator contracts ─────────────────────────────────────────
-[liquidator.bnb]
-chain            = "bnb"
-# Placeholder — replaced once CharonLiquidator.sol is deployed on BSC.
-contract_address = "0x0000000000000000000000000000000000000000"
+# Populated once CharonLiquidator.sol is deployed on BSC mainnet. Do not
+# add a zero-address placeholder — config validation rejects it.
