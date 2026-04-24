@@ -8,17 +8,16 @@
 //!    Solidity-side `LiquidationParams` struct and ABI-encode the
 //!    `executeLiquidation(...)` call.
 //! 2. [`TxBuilder::build_tx`] — wrap the calldata in an unsigned
-//!    [`TransactionRequest`] with EIP-1559 fee fields and the
-//!    **pending** nonce for the bot's hot wallet.
+//!    [`TransactionRequest`] with EIP-1559 fee fields and a nonce
+//!    supplied by the caller (typically [`crate::NonceManager::next`]).
 //! 3. [`TxBuilder::sign`] — sign the request, returning the raw bytes
 //!    that go into `eth_sendRawTransaction` (or a Flashbots bundle).
 
 use std::fmt;
 
-use alloy::eips::{BlockId, BlockNumberOrTag, eip2718::Encodable2718};
+use alloy::eips::eip2718::Encodable2718;
 use alloy::network::{EthereumWallet, TransactionBuilder};
 use alloy::primitives::{Address, Bytes};
-use alloy::providers::Provider;
 use alloy::rpc::types::TransactionRequest;
 use alloy::signers::local::PrivateKeySigner;
 use alloy::sol;
@@ -209,31 +208,27 @@ impl TxBuilder {
     /// Build an unsigned EIP-1559 [`TransactionRequest`] pointing at
     /// the configured liquidator.
     ///
-    /// Pulls the **pending** nonce from `provider` so a broadcast
-    /// that is still in the mempool does not collide with the newly
-    /// built transaction. `gas_limit` is supplied by the caller
-    /// (typically a multiple of `eth_estimateGas` plus a safety
-    /// buffer). Fee fields are passed through; producing them is
-    /// the gas oracle's job, not the builder's.
+    /// The caller supplies the nonce (typically from
+    /// [`crate::NonceManager::next`]) and gas parameters from the gas
+    /// oracle. This method intentionally does **not** hit the provider
+    /// — doing so would race against the `NonceManager`'s local counter
+    /// and hand out duplicate nonces when two opportunities land in the
+    /// same block. `gas_limit` is supplied by the caller (typically a
+    /// multiple of `eth_estimateGas` plus a safety buffer). Fee fields
+    /// are passed through; producing them is the gas oracle's job, not
+    /// the builder's.
     ///
     /// Fee invariant: `max_priority_fee_per_gas <= max_fee_per_gas`.
     /// Violating it is rejected here rather than letting the node
     /// reject it after a network round-trip.
-    // TODO(#43): replace the direct `eth_getTransactionCount` read
-    // with the upcoming `NonceManager` once PR #43 lands, so bursty
-    // submission windows don't have to re-RPC for every tx.
-    pub async fn build_tx<P, T>(
+    pub fn build_tx(
         &self,
-        provider: &P,
         calldata: Bytes,
+        nonce: u64,
         max_fee_per_gas: u128,
         max_priority_fee_per_gas: u128,
         gas_limit: u64,
-    ) -> Result<TransactionRequest, BuilderError>
-    where
-        P: Provider<T>,
-        T: alloy::transports::Transport + Clone,
-    {
+    ) -> Result<TransactionRequest, BuilderError> {
         if max_priority_fee_per_gas > max_fee_per_gas {
             return Err(BuilderError::InvalidFees(
                 max_priority_fee_per_gas,
@@ -242,12 +237,6 @@ impl TxBuilder {
         }
 
         let from = self.signer.address();
-        let nonce = provider
-            .get_transaction_count(from)
-            .block_id(BlockId::Number(BlockNumberOrTag::Pending))
-            .await
-            .map_err(BuilderError::NonceFetch)?;
-
         let tx = TransactionRequest::default()
             .with_from(from)
             .with_to(self.liquidator)
