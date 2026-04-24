@@ -1,0 +1,130 @@
+# Charon — BSC testnet (Chapel, chainId 97) profile.
+#
+# Purpose: run the scanner + Prometheus exporter against a live but
+# non-production chain so the Grafana demo can show real block activity
+# without touching mainnet keys or capital.
+#
+# Scope caveat — flash-loan and liquidator sections are intentionally
+# OMITTED. Aave V3 is NOT deployed on BSC testnet, so there is no
+# flash-loan venue for Charon to route through; without a route, the
+# off-chain pipeline short-circuits at the router gate and nothing is
+# enqueued. Omitting the sections (rather than filling them with
+# placeholder addresses) keeps `Config::validate` happy while making
+# the read-only posture explicit.
+#
+# `allow_public_mempool = true` is REQUIRED here because no private
+# RPC endpoint exists on Chapel; `Config::validate` would otherwise
+# refuse to start the chain. This flag is a testnet / dev-only
+# escape hatch — NEVER enable it on a mainnet profile, because
+# broadcasting liquidation calldata to the public mempool is a
+# guaranteed front-run.
+#
+# Environment variables below (dollar-sign + braces) are substituted
+# at load time — see `.env.example` for the full list of expected
+# vars. `${CHARON_SIGNER_KEY:-}` resolves to an empty string when the
+# var is unset, which collapses to `None` on the typed config so the
+# bot stays in scan-only mode without the operator setting a literal.
+
+[bot]
+# Low threshold so any testnet-scale opportunity can cross the gate.
+# 10_000 = $0.01 in fixed-point (USD × 1e6).
+min_profit_usd_1e6 = 10000
+# 20 gwei ceiling, expressed in wei. Generous for Chapel where traffic
+# is light; mirrors mainnet units so the same knob works everywhere.
+max_gas_wei = "20000000000"
+scan_interval_ms = 1000
+# Default bps thresholds (10_000 = HF 1.0000, 10_500 = HF 1.0500) and
+# default per-bucket scan cadences (1 / 10 / 100 blocks). Omitted so
+# `serde` defaults kick in; that keeps testnet aligned with mainnet if
+# the defaults ever shift.
+# No signer on testnet — leave empty so the CLI stays in scan-only
+# mode (no simulation, no enqueue).
+signer_key = "${CHARON_SIGNER_KEY:-}"
+
+# ── Chains ────────────────────────────────────────────────────────────────
+[chain.bnb]
+chain_id          = 97
+ws_url            = "${CHARON_BNB_TESTNET_WS_URL}"
+http_url          = "${CHARON_BNB_TESTNET_HTTP_URL}"
+priority_fee_gwei = 1
+# No private RPC on testnet — env-substitutes to an empty string which
+# the typed config coerces to `None`. Pairs with
+# `allow_public_mempool = true` below so `Config::validate` accepts
+# the unset endpoint without tripping the `PrivateRpcRequired` gate.
+private_rpc_url   = "${CHARON_BNB_TESTNET_PRIVATE_RPC_URL:-}"
+# Testnet / dev only — public-mempool fallback. NEVER set this on a
+# mainnet profile.
+allow_public_mempool = true
+
+# ── Lending protocols ─────────────────────────────────────────────────────
+[protocol.venus]
+chain = "bnb"
+# Venus Unitroller proxy on BSC testnet (Chapel, Core Pool comptroller).
+# Source: VenusProtocol/venus-protocol → deployments/bsctestnet/Unitroller.json
+# Verified: 2026-03-02. Chapel contracts redeploy more frequently than BSC
+# mainnet during Venus protocol upgrades — re-verify this address after any
+# Venus release and bump the date above. A stale address here is silent:
+# every RPC call returns empty/revert and the scanner reports zero positions,
+# which is indistinguishable from "no liquidatable borrowers."
+comptroller = "0x94d1820b2D1c7c7452A163983Dc888CEC546b77D"
+
+# ── Flash-loan sources ────────────────────────────────────────────────────
+# Aave V3 is NOT deployed on BSC testnet (Chapel). Intentionally
+# omitted so the pipeline short-circuits at the router gate — see the
+# file header for the read-only posture this produces.
+
+# ── Deployed liquidator contracts ─────────────────────────────────────────
+# No liquidator deployed on Chapel. Intentionally omitted.
+
+# ── Prometheus metrics exporter ───────────────────────────────────────────
+# Bound to loopback so the endpoint is unreachable from the public
+# internet on a bare VPS — `Config::validate` would otherwise require
+# an `auth_token` when bound to a non-loopback address, and adding a
+# shared secret into a committed testnet profile defeats the point of
+# the token. Scrape via reverse proxy / SSH tunnel / compose network.
+[metrics]
+enabled = true
+bind    = "127.0.0.1:9091"
+
+# ── Chainlink price feeds (per chain, per asset symbol) ───────────────────
+#
+# Source of truth: Chainlink's public data-feeds directory at
+# https://data.chain.link (network filter: "BNB Chain Testnet"). Only
+# aggregator proxy addresses that are *currently listed* on that page
+# for Chapel (chainId 97) should appear below — never a historical
+# mirror, blog post, or third-party aggregator.
+#
+# Verification date: 2026-04-23 (addresses below cross-checked against
+# docs.chain.link/data-feeds/price-feeds, BNB Chain Testnet tab).
+#
+# Re-verification cadence: Chainlink rarely redeploys feeds on Chapel,
+# but testnet feeds are not covered by the same SLA as mainnet and can
+# be retired or repointed between releases. Spot-check this section on
+# data.chain.link before every demo and after any Chainlink testnet
+# announcement; bump the verification date above when you do.
+#
+# Silent-failure mode if an address drifts: PriceCache::refresh calls
+# `latestRoundData()` on whatever address is wired here. If the address
+# is wrong, not a contract, or the ABI no longer matches, the call
+# reverts or returns zero — the cache silently produces no value for
+# that symbol, and the scanner falls back to Venus's ResilientOracle
+# for that asset. There is no hard error and no panic; the only
+# externally visible symptom is that the Chainlink-vs-protocol price
+# cross-check quietly degrades to a single-source read, which defeats
+# the purpose of wiring Chainlink in the first place. Treat any
+# unexplained absence of a symbol from the cache as a drifted address
+# until proven otherwise.
+#
+# Symbol keys match the Venus market short names used elsewhere in
+# this config (BNB = wrapped BNB, BTCB = Bitcoin BEP-20, ETH = Ether
+# BEP-20, USDT/USDC/DAI = stablecoin, LINK = Chainlink). PriceCache
+# looks these up by exact string so a mismatch between the key here
+# and the symbol passed to `get()` silently misses the feed.
+[chainlink.bnb]
+BNB  = "0x2514895c72f50D8bd4B4F9b1110F0D6bD2c97526"  # BNB  / USD — Chainlink Chapel aggregator proxy
+BTCB = "0x5741306c21795FdCBb9b265Ea0255F499DFe515C"  # BTC  / USD — Chainlink Chapel aggregator proxy
+ETH  = "0x143db3CEEfbdfe5631aDD3E50f7614B6ba708BA7"  # ETH  / USD — Chainlink Chapel aggregator proxy
+USDT = "0xEca2605f0BCF2BA5966372C99837b1F182d3D620"  # USDT / USD — Chainlink Chapel aggregator proxy
+USDC = "0x90c069C4538adAc136E051052E14c1cD799C41B7"  # USDC / USD — Chainlink Chapel aggregator proxy
+DAI  = "0xE4eE17114774713d2De0eC0f035d4F7665fc025D"  # DAI  / USD — Chainlink Chapel aggregator proxy
+LINK = "0x1B329402Cb1825C6F30A0d92aB9E2862BE47333f"  # LINK / USD — Chainlink Chapel aggregator proxy

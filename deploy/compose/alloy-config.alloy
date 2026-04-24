@@ -1,0 +1,50 @@
+// Charon — Grafana Alloy scrape + remote_write sidecar.
+//
+// Scrapes the `charon` container's Prometheus endpoint over the
+// compose internal network and forwards every series to Grafana
+// Cloud. Env vars are resolved via `sys.env` so the config file
+// itself carries no credentials.
+//
+// Required environment variables (loaded from `.env`):
+//   GRAFANA_CLOUD_PROM_URL      e.g. https://prometheus-prod-XX.grafana.net/api/prom/push
+//   GRAFANA_CLOUD_PROM_USER     numeric instance id from Grafana Cloud UI
+//   GRAFANA_CLOUD_PROM_PASSWORD access token with the metrics-push scope
+
+prometheus.scrape "charon" {
+    // DNS name from the compose network; `:9091` is the exporter bind
+    // port defined in `config/*.toml`.
+    targets = [
+        {"__address__" = "charon:9091", "job" = "charon"},
+    ]
+
+    scrape_interval = "15s"
+    scrape_timeout  = "10s"
+
+    forward_to = [prometheus.remote_write.grafana_cloud.receiver]
+}
+
+prometheus.remote_write "grafana_cloud" {
+    endpoint {
+        url = sys.env("GRAFANA_CLOUD_PROM_URL")
+
+        basic_auth {
+            username = sys.env("GRAFANA_CLOUD_PROM_USER")
+            password = sys.env("GRAFANA_CLOUD_PROM_PASSWORD")
+        }
+    }
+
+    // Cap the on-disk WAL so a Grafana Cloud outage or a revoked
+    // token cannot buffer indefinitely and exhaust the 40 GB CX22
+    // disk. 2h of retention covers short network hiccups; older
+    // samples are dropped once the WAL reaches min_keepalive_time
+    // past their age. See #293.
+    //
+    // Alloy validates truncate_frequency < min_keepalive_time at
+    // startup (the underlying Prometheus WAL rejects equal values),
+    // so keep truncate on a 15m cadence under a 30m floor.
+    wal {
+        truncate_frequency = "15m"
+        min_keepalive_time = "30m"
+        max_keepalive_time = "2h"
+    }
+}

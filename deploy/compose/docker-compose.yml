@@ -1,0 +1,106 @@
+# Charon — single-host deploy target.
+#
+# Designed for a Hetzner CX22 (2 vCPU / 4 GB RAM / 40 GB disk) or
+# any equivalent box. Two services:
+#   - charon : the bot binary (Dockerfile at repo root)
+#   - alloy  : Grafana Alloy sidecar; scrapes charon:9091 locally and
+#              forwards the series to Grafana Cloud via remote_write
+#
+# We ship Alloy rather than a local Prometheus server because the
+# Grafana Cloud free tier is the intended visualisation surface; a
+# local Prom would just be another thing to tune on a 4 GB box.
+#
+# Usage:
+#   cp .env.example .env          # fill in RPC + Grafana Cloud creds
+#   docker compose up -d --build
+#
+# Secrets:
+#   `.env` is git-ignored and read by both services via `env_file`.
+#   Do not commit it. The `.env.example` in this directory is the
+#   canonical list of required variables.
+
+services:
+  charon:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    image: charon:local
+    restart: unless-stopped
+    env_file:
+      - ./.env
+    volumes:
+      # Config is read-only from the host so rotating a profile
+      # (mainnet → testnet → fork) doesn't require an image rebuild.
+      - ../../config:/app/config:ro
+    networks:
+      - charon_net
+    # `:9091` stays on the internal compose network. Alloy talks to it
+    # by DNS name, so the metrics endpoint never hits the public
+    # internet — one less public-facing port on the Hetzner box.
+    expose:
+      - "9091"
+    # Keep the container from hogging a 4 GB box if the bot spins;
+    # these limits match typical steady-state plus headroom.
+    deploy:
+      resources:
+        limits:
+          cpus: "1.5"
+          memory: 1G
+    # Cap per-service log storage — json-file driver has no default
+    # rotation and charon emits ~1 info/block on a 3s BSC cadence.
+    # 5 × 50 MB keeps ~a week of history on a 40 GB CX22 without
+    # filling the disk (see #291).
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "5"
+
+  alloy:
+    # Digest-pinned: Docker Hub tags are mutable (maintainers can
+    # republish under the same tag) and this stack already pins every
+    # other image by digest. Bump in a dedicated commit when refreshing
+    # the sidecar — never as a drive-by.
+    image: grafana/alloy:v1.4.3@sha256:06bdcbb51fc22b16c2e96b31cbdf9cb0972e3bdedfbac2cc55ed36743f7fb9aa
+    restart: unless-stopped
+    # `run` subcommand and the default server port (12345) are enough
+    # for a scrape + remote_write topology; we don't expose the UI.
+    #
+    # Admin HTTP binds to loopback inside the container so no other
+    # service on charon_net can reach the config, /-/reload, or
+    # component-graph endpoints. If UI access is ever needed, run
+    # `docker compose exec alloy wget http://127.0.0.1:12345/...` or
+    # tunnel the port on demand.
+    command:
+      - "run"
+      - "--server.http.listen-addr=127.0.0.1:12345"
+      - "--storage.path=/var/lib/alloy/data"
+      - "/etc/alloy/config.alloy"
+    env_file:
+      - ./.env
+    volumes:
+      - ./alloy-config.alloy:/etc/alloy/config.alloy:ro
+      - alloy_data:/var/lib/alloy/data
+    networks:
+      - charon_net
+    depends_on:
+      charon:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 256M
+    # Match charon's rotation policy so a Grafana Cloud outage
+    # (every scrape logs a remote_write retry) cannot fill the disk.
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "5"
+
+networks:
+  charon_net: {}
+
+volumes:
+  alloy_data: {}
