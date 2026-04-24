@@ -249,6 +249,17 @@ contract CharonLiquidatorForkTest is Test {
     }
 
     function setUp() public {
+        // Gate on `BNB_HTTP_URL` up front so CI without the env var skips
+        // cleanly rather than exploding inside `vm.createSelectFork("bnb",
+        // ...)` — the `bnb` alias in `contracts/foundry.toml` resolves the
+        // env var at fork-create time and raises a hard failure when it
+        // is missing. Mirrors the skip-on-env gate used by the unit
+        // suite in `CharonLiquidator.t.sol` (#120 / fork-tests spec).
+        if (bytes(vm.envOr("BNB_HTTP_URL", string(""))).length == 0) {
+            vm.skip(true, "BNB_HTTP_URL not set - skipping BSC fork tests");
+            return;
+        }
+
         // `bnb` is aliased to `${BNB_HTTP_URL}` in `contracts/foundry.toml`.
         // Fork pinned to `FORK_BLOCK` for deterministic state; operators
         // can override per-invocation with `BSC_FORK_BLOCK=<number> forge
@@ -364,7 +375,12 @@ contract CharonLiquidatorForkTest is Test {
             debtVToken: m.debtVToken,
             collateralVToken: m.collateralVToken,
             repayAmount: m.repayAmount,
-            minSwapOut: minSwapOut
+            minSwapOut: minSwapOut,
+            // Pool fee tier must match the tier quoted in `_minOutFromQuoter`
+            // (fee: 3000) so `executeOperation`'s on-fork swap hits the same
+            // PCS V3 pool the quote was drawn from. Changing one requires
+            // changing the other, else `minSwapOut` becomes meaningless.
+            swapPoolFee: 3000
         });
     }
 
@@ -386,12 +402,18 @@ contract CharonLiquidatorForkTest is Test {
 
         // Typed event expect: the signature is compiler-checked, so
         // renaming the event breaks the test at compile time rather than
-        // failing a runtime keccak comparison (#273). We match the two
-        // indexed topics (borrower, debtToken) plus data; repayAmount is
-        // deterministic, profit is not (depends on on-fork swap output),
-        // so only topics are asserted strict.
-        vm.expectEmit(true, true, false, false, address(liquidator));
-        emit CharonLiquidator.LiquidationExecuted(borrower, m.debtToken, m.repayAmount, 0);
+        // failing a runtime keccak comparison (#273). Post-#38 the event
+        // carries three indexed topics (borrower, debtToken, recipient)
+        // plus two data fields (repayAmount, profit). We match all three
+        // topics — critically, the recipient topic asserts profit routes
+        // to the cold wallet at the log level — and skip data because
+        // profit depends on the on-fork swap output and is not
+        // deterministic. repayAmount is passed for signature-shape
+        // matching only; it is not compared when `checkData = false`.
+        vm.expectEmit(true, true, true, false, address(liquidator));
+        emit CharonLiquidator.LiquidationExecuted(
+            borrower, m.debtToken, m.repayAmount, 0, coldWallet
+        );
 
         uint256 gasBefore = gasleft();
         liquidator.executeLiquidation(_params(m, minOut));
