@@ -1,5 +1,5 @@
 [workspace]
-resolver = "2"
+resolver = "3"
 members = [
     "crates/charon-core",
     "crates/charon-executor",
@@ -33,7 +33,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # Error handling
 anyhow = "1"
-thiserror = "1"
+thiserror = "2"
 
 # Async trait objects
 async-trait = "0.1"
@@ -44,8 +44,14 @@ futures-util = "0.3"
 # Lock-free concurrent hashmap for scanner state
 dashmap = "6"
 
+# Backoff jitter
+rand = "0.8"
+
+# Prometheus-style metrics recorder facade
+metrics = "0.24"
+
 # CLI
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4", features = ["derive", "env"] }
 
 # .env loader
 dotenvy = "0.15"
@@ -70,6 +76,7 @@ charon-scanner = { path = "crates/charon-scanner" }
 unsafe_code = "forbid"
 
 [workspace.lints.clippy]
+all = "warn"
 arithmetic_side_effects = "deny"
 cast_possible_truncation = "deny"
 unwrap_used = "deny"

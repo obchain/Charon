@@ -89,6 +89,15 @@ pub enum BuilderError {
     /// the provider during tx construction.
     #[error("rpc error: {0}")]
     Rpc(#[from] TransportError),
+
+    /// The opportunity's [`LiquidationParams`] variant is not handled
+    /// by this builder. Payload is the `Debug` rendering of the
+    /// variant so logs can identify which protocol adapter is still
+    /// pending executor support. Surfaced when a future non-`Venus`
+    /// variant lands in `charon-core` and reaches the encoder before
+    /// the executor has been taught to emit its calldata.
+    #[error("unsupported liquidation protocol: {0}")]
+    UnsupportedProtocol(String),
 }
 
 /// Builder bound to one bot signer + one liquidator deployment.
@@ -156,12 +165,24 @@ impl TxBuilder {
         opp: &LiquidationOpportunity,
         params: &LiquidationParams,
     ) -> Result<Bytes, BuilderError> {
-        let LiquidationParams::Venus {
-            borrower,
-            collateral_vtoken,
-            debt_vtoken,
-            repay_amount,
-        } = params;
+        // Exhaustive match (rather than a refutable `let` on the only
+        // present variant) so that when a new `LiquidationParams`
+        // variant lands in `charon-core` the compiler forces this
+        // builder to be audited before it silently accepts the new
+        // protocol. `LiquidationParams` is `#[non_exhaustive]`, hence
+        // the trailing wildcard arm that surfaces the miss as an
+        // explicit `Unsupported` error rather than a panic.
+        let (borrower, collateral_vtoken, debt_vtoken, repay_amount) = match params {
+            LiquidationParams::Venus {
+                borrower,
+                collateral_vtoken,
+                debt_vtoken,
+                repay_amount,
+            } => (borrower, collateral_vtoken, debt_vtoken, repay_amount),
+            other => {
+                return Err(BuilderError::UnsupportedProtocol(format!("{other:?}")));
+            }
+        };
 
         let sol_params = CharonLiquidationParams {
             protocolId: PROTOCOL_VENUS,
@@ -302,9 +323,9 @@ mod tests {
                 token_out: address!("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
                 amount_in: U256::from(275u64),
                 min_amount_out: U256::from(260u64),
-                pool_fee: 3_000,
+                pool_fee: Some(3_000),
             },
-            net_profit_usd_cents: 5_000,
+            net_profit_wei: U256::from(5_000u64),
         }
     }
 

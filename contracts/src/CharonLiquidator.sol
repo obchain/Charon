@@ -1,11 +1,12 @@
 // SPDX-License-Identifier: MIT
-pragma solidity ^0.8.24;
+pragma solidity 0.8.24;
 
 import { IFlashLoanSimpleReceiver } from "./interfaces/IFlashLoanSimpleReceiver.sol";
 import { IAaveV3Pool } from "./interfaces/IAaveV3Pool.sol";
 import { IVToken } from "./interfaces/IVToken.sol";
 import { ISwapRouter } from "./interfaces/ISwapRouter.sol";
 import { IERC20 } from "./interfaces/IERC20.sol";
+import { IWETH } from "./interfaces/IWETH.sol";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // CharonLiquidator — multi-chain flash-loan liquidation engine, v0.1
@@ -17,8 +18,10 @@ import { IERC20 } from "./interfaces/IERC20.sol";
 //        a. Approve Venus vToken to spend the debt asset.
 //        b. Call vToken.liquidateBorrow() — repay debt, seize collateral vTokens.
 //        c. Call vToken.redeem() — convert ALL seized vTokens to underlying.
-//        d. Swap collateral → debt asset via PancakeSwap V3.
-//        e. Sweep profit to owner.
+//           Special case: vBNB returns native BNB, which we wrap into WBNB.
+//        d. Swap collateral → debt asset via PancakeSwap V3 at the caller-supplied
+//           fee tier (500 / 3000 / 10000 depending on the pool).
+//        e. Sweep profit to the COLD wallet — hot wallet (owner) holds gas only.
 //        f. Approve Aave for repayment (amount + premium); Aave pulls it after return.
 //
 // Security invariants:
@@ -31,6 +34,8 @@ import { IERC20 } from "./interfaces/IERC20.sol";
 //     flash-loan, re-entering executeLiquidation's guard frame. The msg.sender
 //     == AAVE_POOL gate is the equivalent protection for the callback.
 //   - Lingering approvals zeroed after each consume point (vToken, SwapRouter).
+//   - Profit is swept to the immutable COLD_WALLET, never to the hot wallet.
+//     This enforces the CLAUDE.md safety invariant: "hot wallet holds gas only".
 //   - No tx.origin usage. No delegatecall. No assembly. No upgradeability.
 //   - No external library imports — all interfaces are inline/local.
 // ─────────────────────────────────────────────────────────────────────────────
@@ -40,6 +45,7 @@ import { IERC20 } from "./interfaces/IERC20.sol";
 ///         v0.1 supports Venus Protocol on BNB Chain.
 /// @dev Implements IFlashLoanSimpleReceiver for the Aave V3 flash-loan callback.
 ///      The bot (hot wallet = owner) is the sole authorized caller of executeLiquidation.
+///      All profit is routed to the immutable cold wallet set at construction.
 contract CharonLiquidator is IFlashLoanSimpleReceiver {
     // ─────────────────────────────────────────────────────────────────────────
     // Protocol ID constants — must mirror the Rust `ProtocolId` enum order.
@@ -47,6 +53,22 @@ contract CharonLiquidator is IFlashLoanSimpleReceiver {
 
     /// @dev ProtocolId::Venus = 3 in the Rust enum (0-indexed: Aave=0, Compound=1, ...).
     uint8 internal constant PROTOCOL_VENUS = 3;
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // BNB Chain canonical addresses — hard-coded for the v0.1 BSC-only scope.
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// @notice Venus vBNB market — the only vToken whose underlying is native BNB.
+    ///         Venus `redeem()` on this market transfers native BNB to msg.sender
+    ///         rather than calling `IERC20.transfer`, so the standard ERC-20
+    ///         balance read used for every other vToken returns zero here.
+    ///         Mainnet: https://bscscan.com/address/0xA07c5b74C9B40447a954e1466938b865b6BBea36
+    address internal constant VBNB = 0xA07c5b74C9B40447a954e1466938b865b6BBea36;
+
+    /// @notice Canonical Wrapped BNB (WBNB). PancakeSwap V3 pools are quoted in WBNB,
+    ///         so any vBNB-seized position must be wrapped before the swap leg.
+    ///         Mainnet: https://bscscan.com/address/0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c
+    address internal constant WBNB = 0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c;
 
     // ─────────────────────────────────────────────────────────────────────────
     // Reentrancy guard — simple two-state lock.
@@ -61,7 +83,8 @@ contract CharonLiquidator is IFlashLoanSimpleReceiver {
     // Immutable configuration — set once at construction, never changed.
     // ─────────────────────────────────────────────────────────────────────────
 
-    /// @notice The bot's hot wallet. Only address authorised to call executeLiquidation and rescue.
+    /// @notice The bot's hot wallet. Only address authorised to call executeLiquidation
+    ///         and rescue. By policy it holds gas only — profit is never routed here.
     address public immutable owner;
 
     /// @notice Aave V3 Pool proxy on BNB Chain.
@@ -72,6 +95,12 @@ contract CharonLiquidator is IFlashLoanSimpleReceiver {
     ///         Mainnet: 0x13f4EA83D0bd40E75C8222255bc855a974568Dd4
     address public immutable SWAP_ROUTER;
 
+    /// @notice Cold wallet — sole recipient of liquidation profit.
+    /// @dev Profit is transferred here inside executeOperation, never to the hot
+    ///      wallet. Enforces the CLAUDE.md safety invariant that the bot wallet
+    ///      holds gas only. Set once at construction and immutable thereafter.
+    address public immutable COLD_WALLET;
+
     // ─────────────────────────────────────────────────────────────────────────
     // Structs
     // ─────────────────────────────────────────────────────────────────────────
@@ -80,6 +109,9 @@ contract CharonLiquidator is IFlashLoanSimpleReceiver {
     /// @dev Packed into `bytes` and forwarded through Aave's flashLoanSimple `params`
     ///      argument so executeOperation can decode them without extra storage.
     ///      Field layout must remain stable — the Rust side abi-encodes this struct.
+    ///      NOTE: the companion Rust `LiquidationParams` builder lives in the
+    ///      charon-executor crate (landing in a later PR). When that crate is added
+    ///      it must mirror this layout exactly, including `swapPoolFee`.
     struct LiquidationParams {
         /// @dev Protocol identifier. Must equal PROTOCOL_VENUS (3) for v0.1.
         uint8 protocolId;
@@ -87,7 +119,9 @@ contract CharonLiquidator is IFlashLoanSimpleReceiver {
         address borrower;
         /// @dev Underlying ERC-20 token that the borrower owes (e.g., USDT).
         address debtToken;
-        /// @dev Underlying ERC-20 token posted as collateral (e.g., BNB/WBNB).
+        /// @dev Underlying ERC-20 token posted as collateral (e.g., WBNB for vBNB).
+        ///      For the vBNB path this MUST be WBNB — the contract wraps the
+        ///      native BNB returned by Venus into WBNB before the swap.
         address collateralToken;
         /// @dev Venus vToken representing the debt side (e.g., vUSDT).
         address debtVToken;
@@ -98,6 +132,13 @@ contract CharonLiquidator is IFlashLoanSimpleReceiver {
         /// @dev Minimum amount of debtToken to receive from the collateral swap.
         ///      Acts as a slippage floor — revert if swap output falls below this.
         uint256 minSwapOut;
+        /// @dev PancakeSwap V3 pool fee tier (hundredths of a bip) for the
+        ///      collateral → debt swap. Live tiers on PCS V3: 100 / 500 / 2500 /
+        ///      10000; Uniswap-equivalent 3000 is also deployed. BTCB, ETH and XVS
+        ///      deep pools are at 500 or 10000, not 3000 — hardcoding would route
+        ///      through an empty pool and revert. Supplied per-opportunity by the
+        ///      off-chain router. Must be non-zero.
+        uint24 swapPoolFee;
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -108,9 +149,15 @@ contract CharonLiquidator is IFlashLoanSimpleReceiver {
     /// @param borrower    The liquidated account.
     /// @param debtToken   The underlying asset that was repaid.
     /// @param repayAmount The amount of debtToken that was repaid.
-    /// @param profit      Net profit in debtToken units retained by this contract.
+    /// @param profit      Net profit in debtToken units swept to the cold wallet.
+    /// @param recipient   The cold wallet address that received `profit` (indexed
+    ///                    so off-chain monitors can filter by destination).
     event LiquidationExecuted(
-        address indexed borrower, address indexed debtToken, uint256 repayAmount, uint256 profit
+        address indexed borrower,
+        address indexed debtToken,
+        uint256 repayAmount,
+        uint256 profit,
+        address indexed recipient
     );
 
     /// @notice Emitted when the owner recovers tokens or native BNB via rescue().
@@ -145,18 +192,23 @@ contract CharonLiquidator is IFlashLoanSimpleReceiver {
     // Constructor
     // ─────────────────────────────────────────────────────────────────────────
 
-    /// @notice Deploys CharonLiquidator and permanently binds it to one Aave Pool
-    ///         and one PancakeSwap V3 router.
+    /// @notice Deploys CharonLiquidator and permanently binds it to one Aave Pool,
+    ///         one PancakeSwap V3 router, and one cold-wallet profit recipient.
     /// @dev msg.sender becomes the immutable owner (the bot's hot wallet).
-    ///      Both addresses are validated non-zero at construction.
+    ///      All three addresses are validated non-zero at construction.
+    ///      The cold wallet is required: the CLAUDE.md safety invariant forbids
+    ///      parking profit in the hot wallet.
     /// @param _aavePool   Aave V3 Pool proxy address on BNB Chain.
     /// @param _swapRouter PancakeSwap V3 SwapRouter address on BNB Chain.
-    constructor(address _aavePool, address _swapRouter) {
+    /// @param _coldWallet Cold-wallet address that receives all liquidation profit.
+    constructor(address _aavePool, address _swapRouter, address _coldWallet) {
         require(_aavePool != address(0), "!aavePool");
         require(_swapRouter != address(0), "!swapRouter");
+        require(_coldWallet != address(0), "!coldWallet");
         owner = msg.sender;
         AAVE_POOL = _aavePool;
         SWAP_ROUTER = _swapRouter;
+        COLD_WALLET = _coldWallet;
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -187,6 +239,14 @@ contract CharonLiquidator is IFlashLoanSimpleReceiver {
         require(params.debtVToken != address(0), "!debtVToken");
         require(params.collateralVToken != address(0), "!collateralVToken");
         require(params.repayAmount > 0, "!repayAmount");
+        require(params.swapPoolFee > 0, "!swapPoolFee");
+        // On the vBNB path the underlying returned by Venus is native BNB, which
+        // the contract wraps into WBNB before swapping. Enforce that the caller
+        // declared WBNB as collateralToken so the swap leg routes through a real
+        // pool and post-swap balance checks read the correct token.
+        if (params.collateralVToken == VBNB) {
+            require(params.collateralToken == WBNB, "vBNB requires WBNB");
+        }
 
         // ── Encode params and request the flash loan ──────────────────────────
         // Aave forwards `encoded` verbatim to executeOperation as the `data`
@@ -221,10 +281,12 @@ contract CharonLiquidator is IFlashLoanSimpleReceiver {
     ///        c. Approve debtVToken and call liquidateBorrow on Venus.
     ///        d. Zero out debtVToken approval (consumed).
     ///        e. Redeem all seized collateral vTokens for underlying.
-    ///        f. Swap collateral underlying → debt token via PancakeSwap V3.
+    ///           If the seized vToken is vBNB, wrap the returned native BNB into WBNB.
+    ///        f. Swap collateral underlying → debt token via PancakeSwap V3 at the
+    ///           caller-supplied pool fee tier.
     ///        g. Zero out SwapRouter approval (consumed).
     ///        h. Verify post-swap balance covers totalOwed.
-    ///        i. Sweep profit to owner.
+    ///        i. Sweep profit to COLD_WALLET (NEVER to the hot wallet / owner).
     ///        j. Emit LiquidationExecuted.
     ///        k. Approve Aave Pool for totalOwed (Aave pulls this after we return).
     ///        l. Return true.
@@ -291,8 +353,20 @@ contract CharonLiquidator is IFlashLoanSimpleReceiver {
         uint256 redeemErr = IVToken(p.collateralVToken).redeem(vBal);
         require(redeemErr == 0, "venus redeem failed");
 
+        // vBNB returns NATIVE BNB, not an ERC-20. Wrap the full native balance
+        // into WBNB so the swap leg can treat it uniformly with every other
+        // vToken underlying. Reading IERC20(vBNB-underlying).balanceOf would
+        // return zero and the swap would revert. Wrapping before the balance
+        // read ensures `collateralBal` picks up the full seized amount.
+        if (p.collateralVToken == VBNB) {
+            uint256 nativeBal = address(this).balance;
+            require(nativeBal > 0, "no native BNB redeemed");
+            IWETH(WBNB).deposit{ value: nativeBal }();
+        }
+
         // ── Step 5: swap collateral underlying → debt token via PancakeSwap V3 ─
-        // Read the full collateral balance just redeemed; use it as exact amountIn.
+        // Read the full collateral balance just redeemed (or wrapped, for vBNB);
+        // use it as exact amountIn.
         uint256 collateralBal = IERC20(p.collateralToken).balanceOf(address(this));
 
         // Approve the router for the exact amount we are about to swap.
@@ -303,7 +377,7 @@ contract CharonLiquidator is IFlashLoanSimpleReceiver {
                 ISwapRouter.ExactInputSingleParams({
                     tokenIn: p.collateralToken,
                     tokenOut: p.debtToken,
-                    fee: 3000, // 0.30 % pool — most liquid tier on PCS V3 for major pairs
+                    fee: p.swapPoolFee, // caller-supplied — 500 / 2500 / 3000 / 10000 depending on pool
                     recipient: address(this),
                     deadline: block.timestamp,
                     amountIn: collateralBal,
@@ -324,19 +398,23 @@ contract CharonLiquidator is IFlashLoanSimpleReceiver {
         // minSwapOut was set below totalOwed by the caller.
         require(finalBal >= totalOwed, "swap output below repayment");
 
-        // ── Step 7: sweep profit to owner ─────────────────────────────────────
-        // Profit must leave this contract before we approve Aave, otherwise Aave
-        // could theoretically pull more than totalOwed if the token has quirks.
+        // ── Step 7: sweep profit to COLD WALLET ───────────────────────────────
+        // Profit must leave this contract to the cold wallet (NOT the hot-wallet
+        // owner) before we approve Aave. This enforces the CLAUDE.md safety
+        // invariant: hot wallet holds gas only. Sweeping before approval also
+        // prevents Aave from pulling more than totalOwed if the debt token has
+        // quirks (fee-on-transfer, rebasing, etc.).
         uint256 profit = finalBal - totalOwed;
         if (profit > 0) {
-            // transfer return value not checked: owner is a trusted address set at
-            // construction; a failure here reverts the whole tx (excess funds stay
-            // in the contract until rescued). Standard ERC-20s revert on failure.
-            IERC20(p.debtToken).transfer(owner, profit);
+            // transfer return value not checked: COLD_WALLET is a trusted address
+            // set at construction; a failure here reverts the whole tx (excess
+            // funds stay in the contract until rescued). Standard ERC-20s revert
+            // on failure.
+            IERC20(p.debtToken).transfer(COLD_WALLET, profit);
         }
 
         // ── Step 8: emit before the final approval so logs reflect the full state ─
-        emit LiquidationExecuted(p.borrower, p.debtToken, p.repayAmount, profit);
+        emit LiquidationExecuted(p.borrower, p.debtToken, p.repayAmount, profit, COLD_WALLET);
 
         // ── Step 9: approve Aave to pull totalOwed ────────────────────────────
         // Aave pulls amount + premium from this contract after executeOperation
@@ -353,8 +431,8 @@ contract CharonLiquidator is IFlashLoanSimpleReceiver {
 
     /// @notice Recovers ERC-20 tokens or native BNB that are stuck in this contract.
     /// @dev Fully implemented — this is a safety hatch, not core liquidation logic.
-    ///      For ERC-20: calls token.transfer(to, amount).
-    ///      For native BNB: uses payable(to).transfer(amount).
+    ///      For ERC-20: calls token.transfer(to, amount) and checks the return value.
+    ///      For native BNB: uses a low-level call{value: amount}("") with success check.
     ///
     ///      Security notes:
     ///        - onlyOwner: only the hot wallet can pull funds.
@@ -362,8 +440,13 @@ contract CharonLiquidator is IFlashLoanSimpleReceiver {
     ///        - Uses IERC20.transfer directly (no SafeERC20) because this is a
     ///          no-external-dependency build; fee-on-transfer tokens may transfer
     ///          less than `amount` — that edge case is acceptable in rescue context.
-    ///        - Native transfer uses Solidity's `transfer` which forwards 2300 gas
-    ///          and reverts on failure — appropriate for a trusted owner address.
+    ///        - Native transfer uses `call` rather than `transfer` or `send`.
+    ///          Solidity's `transfer` forwards a hard-coded 2300-gas stipend which
+    ///          reverts against any recipient whose fallback does non-trivial work
+    ///          (Gnosis Safe and most multisigs, smart-contract wallets, any
+    ///          custody solution that logs inbound receipts). `call` forwards the
+    ///          remaining gas and is the EIP-1884-safe primitive; its boolean
+    ///          return value is checked to surface failures as reverts.
     ///
     /// @param token  ERC-20 contract address, or address(0) for native BNB.
     /// @param to     Recipient address. Must be non-zero.
@@ -374,9 +457,12 @@ contract CharonLiquidator is IFlashLoanSimpleReceiver {
 
         if (token == address(0)) {
             // Native BNB path.
-            // `transfer` reverts on failure and caps forwarded gas at 2300,
-            // which is appropriate for a trusted owner EOA.
-            payable(to).transfer(amount);
+            // Use `call` with full remaining gas so the recipient may be a multisig
+            // or smart-contract wallet (Gnosis Safe, etc.). The 2300-gas stipend of
+            // `transfer`/`send` is insufficient post-EIP-1884 for such recipients
+            // and would trap funds in this contract.
+            (bool ok,) = payable(to).call{ value: amount }("");
+            require(ok, "rescue: bnb transfer failed");
         } else {
             // ERC-20 path.
             // The return value is checked to handle tokens that return false rather than reverting.
@@ -390,10 +476,21 @@ contract CharonLiquidator is IFlashLoanSimpleReceiver {
     }
 
     // ─────────────────────────────────────────────────────────────────────────
-    // Receive — accept native BNB
+    // Receive — native BNB is intentionally rejected
     // ─────────────────────────────────────────────────────────────────────────
-
-    /// @notice Allows this contract to receive native BNB (e.g., from vBNB redemption
-    ///         or direct top-up by the operator) so that rescue() can withdraw it.
-    receive() external payable { }
+    //
+    // No `receive()` or `fallback()` is defined. Plain BNB transfers to this
+    // contract revert. Rationale:
+    //   - v0.1 does not liquidate the vBNB native-BNB market; all supported
+    //     Venus markets settle collateral in ERC-20 (WBNB, BUSD, USDT, ...).
+    //   - An open `receive()` would silently accumulate BNB from any sender,
+    //     making misrouted funds hard to notice and providing free storage
+    //     for griefers / mixers.
+    //   - If the vBNB market is added later, reintroduce a gated `receive()`
+    //     that requires `msg.sender == vBNB_MARKET` so only the Venus
+    //     contract can push native BNB into this contract during redeem.
+    //
+    // If BNB is ever trapped here (e.g. as a SELFDESTRUCT beneficiary), the
+    // owner can still recover it via rescue(address(0), ...) because
+    // SELFDESTRUCT credits the balance without invoking `receive()`.
 }
