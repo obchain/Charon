@@ -7,6 +7,7 @@ description = "Chain listener and health-factor scanner for Charon"
 
 [dependencies]
 charon-core = { workspace = true }
+charon-metrics = { workspace = true }
 alloy = { workspace = true }
 anyhow = { workspace = true }
 thiserror = { workspace = true }

@@ -77,6 +77,14 @@ impl BlockListener {
     /// Run the listener forever. Reconnects with jittered exponential backoff
     /// on any connection or subscription error. Returns `Ok(())` only if the
     /// receiving side of the channel is dropped.
+    ///
+    /// Increments both the per-chain listener counters
+    /// (`charon_listener_connects_total`,
+    /// `charon_listener_disconnects_total`) and
+    /// [`charon_rpc_connection_reconnects_total`](charon_metrics::names::RPC_RECONNECTS_TOTAL)
+    /// under `endpoint_kind="public"` on every reconnect attempt
+    /// (issue #302) — the `newHeads` stream rides the chain's
+    /// public pubsub endpoint.
     pub async fn run(mut self) -> Result<()> {
         let mut backoff = Duration::from_secs(1);
         loop {
@@ -93,6 +101,13 @@ impl BlockListener {
                         "chain" => self.name.clone()
                     )
                     .increment(1);
+                    // Cross-chain RPC-reconnect counter (#302).
+                    // `newHeads` rides the public chain RPC, so
+                    // `endpoint_kind::PUBLIC` is the right label —
+                    // the submitter (PRIVATE) owns its own counter.
+                    charon_metrics::record_rpc_reconnect(
+                        charon_metrics::endpoint_kind::PUBLIC,
+                    );
                     let jitter_ms = rand::thread_rng()
                         .gen_range(0..=(backoff.as_millis() as u64).saturating_div(4));
                     let wait = backoff + Duration::from_millis(jitter_ms);

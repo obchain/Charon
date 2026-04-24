@@ -118,7 +118,22 @@ impl Simulator {
             .with_input(calldata)
             .with_gas_limit(gas_limit);
 
-        match provider.call(&req).await {
+        // `time_rpc` owns the latency histogram sample; the error
+        // branch below classifies rejections/timeouts separately so
+        // Grafana can pivot on `error_kind`. The simulator talks to
+        // the same chain RPC the scanner uses (no private submission
+        // relay) so the endpoint is `public`. `provider.call(..)` in
+        // alloy 0.8 returns an `EthCall` builder that is
+        // `IntoFuture`, not a `Future`; wrap the await in an async
+        // block so `time_rpc` sees a real `Future`.
+        let outcome = charon_metrics::time_rpc(
+            charon_metrics::rpc_method::ETH_CALL,
+            charon_metrics::endpoint_kind::PUBLIC,
+            async { provider.call(&req).await },
+        )
+        .await;
+
+        match outcome {
             Ok(out) => {
                 debug!(
                     sender = %self.sender,
@@ -148,13 +163,26 @@ impl Simulator {
                 // Distinguish a true revert (node replied with error
                 // data) from a transport-level failure. `alloy`
                 // surfaces both on the same error arm, so the
-                // presence of returndata is the discriminator.
+                // presence of returndata is the discriminator. The
+                // RPC error counter is labelled `rejected` on a
+                // deterministic node-side rejection vs
+                // `connection_lost` on a transport blip — dashboards
+                // pivot on that label to separate "upstream unstable"
+                // from "our calldata keeps reverting".
                 if revert.is_some() {
+                    charon_metrics::record_rpc_error(
+                        charon_metrics::rpc_method::ETH_CALL,
+                        charon_metrics::rpc_error::REJECTED,
+                    );
                     Err(SimulationError::Reverted {
                         selector_hex,
                         data_hex,
                     })
                 } else {
+                    charon_metrics::record_rpc_error(
+                        charon_metrics::rpc_method::ETH_CALL,
+                        charon_metrics::rpc_error::CONNECTION_LOST,
+                    );
                     Err(SimulationError::Provider(err))
                 }
             }

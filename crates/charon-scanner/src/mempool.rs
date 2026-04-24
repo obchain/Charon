@@ -393,10 +393,30 @@ pub struct PendingCache {
     selectors: HashSet<FixedBytes<4>>,
     pending: DashMap<Address, PreSignedLiquidation>,
     max_pending_age_secs: u64,
+    /// Short chain name used as the `chain` label on every mempool
+    /// metric emitted from this cache (issues #300 / #222). Empty
+    /// string means "unlabelled" — unit tests use `new` /
+    /// `with_defaults` which default to empty; production callers
+    /// use `new_for_chain` / `with_defaults_for_chain` so dashboards
+    /// pivot on the same chain dimension the scanner uses.
+    chain: String,
 }
 
 impl PendingCache {
     pub fn new(
+        oracle: Address,
+        selectors: HashSet<FixedBytes<4>>,
+        max_pending_age: Duration,
+    ) -> Self {
+        Self::new_for_chain(String::new(), oracle, selectors, max_pending_age)
+    }
+
+    /// Constructor that binds a `chain` short-name onto every metric
+    /// emission. Label is the same string the scanner uses (`"bnb"`
+    /// on BSC) so Grafana joins mempool, scanner, and executor
+    /// panels on one dimension.
+    pub fn new_for_chain(
+        chain: impl Into<String>,
         oracle: Address,
         selectors: HashSet<FixedBytes<4>>,
         max_pending_age: Duration,
@@ -406,11 +426,30 @@ impl PendingCache {
             selectors,
             pending: DashMap::new(),
             max_pending_age_secs: max_pending_age.as_secs(),
+            chain: chain.into(),
         }
     }
 
     pub fn with_defaults(oracle: Address) -> Self {
         Self::new(oracle, default_selectors(), DEFAULT_MAX_PENDING_AGE)
+    }
+
+    /// Chain-labelled variant of [`PendingCache::with_defaults`].
+    /// Use in production so `charon_mempool_*` samples carry the
+    /// `chain` label.
+    pub fn with_defaults_for_chain(chain: impl Into<String>, oracle: Address) -> Self {
+        Self::new_for_chain(
+            chain,
+            oracle,
+            default_selectors(),
+            DEFAULT_MAX_PENDING_AGE,
+        )
+    }
+
+    /// Chain short-name this cache labels its metrics with. Empty
+    /// when constructed via the non-chain-aware constructors.
+    pub fn chain(&self) -> &str {
+        &self.chain
     }
 
     pub fn oracle(&self) -> Address {
@@ -432,6 +471,15 @@ impl PendingCache {
             "pre-signed liquidation armed"
         );
         self.pending.insert(tx.borrower, tx);
+        // Gauge: live pending-oracle-update count. `pending_len()`
+        // reads the DashMap length after the insert lands, so a
+        // concurrent drain racing this insert still surfaces a
+        // well-defined value (count is eventually consistent, which
+        // is what dashboards need — not per-event accuracy).
+        charon_metrics::set_mempool_pending_oracle_updates(
+            &self.chain,
+            self.pending.len() as u64,
+        );
     }
 
     pub fn pending_len(&self) -> usize {
@@ -525,6 +573,16 @@ impl PendingCache {
             stale,
             "mempool cache drained for block"
         );
+        // Counter: drained pre-signs this block, + gauge snapshot of
+        // the remaining pending set after re-queue. Dashboards graph
+        // these together so a spike in drained+a flat pending means
+        // "happy path", whereas drained=0 + pending climbing means
+        // "triggers not landing on-chain, TTL about to sweep".
+        charon_metrics::record_mempool_drained(&self.chain, out.len() as u64);
+        charon_metrics::set_mempool_pending_oracle_updates(
+            &self.chain,
+            self.pending.len() as u64,
+        );
         out
     }
 
@@ -603,7 +661,9 @@ pub struct MempoolMonitor {
 }
 
 impl MempoolMonitor {
-    /// Full-control constructor.
+    /// Full-control constructor. Metrics emitted from the inner
+    /// cache carry an empty `chain` label — use
+    /// [`MempoolMonitor::new_for_chain`] in production.
     pub fn new(
         provider: Arc<RootProvider<PubSubFrontend>>,
         oracle: Address,
@@ -616,10 +676,47 @@ impl MempoolMonitor {
         }
     }
 
+    /// Chain-labelled full-control constructor.
+    pub fn new_for_chain(
+        chain: impl Into<String>,
+        provider: Arc<RootProvider<PubSubFrontend>>,
+        oracle: Address,
+        selectors: HashSet<FixedBytes<4>>,
+        max_pending_age: Duration,
+    ) -> Self {
+        Self {
+            provider,
+            cache: Arc::new(PendingCache::new_for_chain(
+                chain,
+                oracle,
+                selectors,
+                max_pending_age,
+            )),
+        }
+    }
+
     /// Convenience: build with [`default_selectors`] and
     /// [`DEFAULT_MAX_PENDING_AGE`].
     pub fn with_defaults(provider: Arc<RootProvider<PubSubFrontend>>, oracle: Address) -> Self {
         Self::new(
+            provider,
+            oracle,
+            default_selectors(),
+            DEFAULT_MAX_PENDING_AGE,
+        )
+    }
+
+    /// Chain-labelled variant of [`MempoolMonitor::with_defaults`].
+    /// Use in production so `charon_mempool_*` samples carry the
+    /// `chain` label — the CLI wires this with the venus pipeline's
+    /// chain name.
+    pub fn with_defaults_for_chain(
+        chain: impl Into<String>,
+        provider: Arc<RootProvider<PubSubFrontend>>,
+        oracle: Address,
+    ) -> Self {
+        Self::new_for_chain(
+            chain,
             provider,
             oracle,
             default_selectors(),
@@ -669,6 +766,18 @@ impl MempoolMonitor {
                         error = ?err,
                         backoff_secs = backoff.as_secs(),
                         "mempool subscription error, reconnecting after backoff"
+                    );
+                    // Two counters on one event: the mempool-specific
+                    // reconnect counter carries the `chain` label so
+                    // operators can pinpoint which chain's upstream
+                    // is flaky, and the cross-chain RPC reconnect
+                    // counter (#302) pivots on `endpoint_kind` so the
+                    // "public upstream is wobbling" dashboard also
+                    // picks this up without depending on the mempool
+                    // being wired.
+                    charon_metrics::record_mempool_ws_reconnect(self.cache.chain());
+                    charon_metrics::record_rpc_reconnect(
+                        charon_metrics::endpoint_kind::PUBLIC,
                     );
                     tokio::time::sleep(backoff).await;
                     backoff = backoff_with_jitter(backoff, MAX_BACKOFF);

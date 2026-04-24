@@ -61,6 +61,7 @@ use charon_core::{
 };
 use charon_executor::{Simulator, TxBuilder};
 use charon_flashloan::{AaveFlashLoan, FlashLoanRouter};
+use charon_metrics::{bucket, drop_stage, sim_result};
 use charon_protocols::VenusAdapter;
 use charon_scanner::{
     BlockListener, ChainEvent, ChainProvider, DEFAULT_MAX_AGE, HealthScanner, MempoolMonitor,
@@ -432,6 +433,48 @@ async fn run_listen(config: &Config, borrowers: Vec<Address>) -> Result<()> {
     let (tx, mut rx) = mpsc::channel::<ChainEvent>(CHAIN_EVENT_CHANNEL);
     let mut listeners: tokio::task::JoinSet<(String, Result<()>)> = tokio::task::JoinSet::new();
 
+    // ── Prometheus exporter (#222) ────────────────────────────────────
+    // Install the global metrics recorder and push the HTTP-listener
+    // future onto the same JoinSet that supervises block/mempool tasks
+    // so a panic in `hyper`/`tokio` inside the exporter triggers the
+    // same controlled-shutdown path (SIGINT / SIGTERM / supervise).
+    // `install` returns `Ok(None)` on a repeat call in the same
+    // process (#223) — nothing to supervise on re-invocation.
+    if config.metrics.enabled {
+        match charon_metrics::install(config.metrics.bind) {
+            Ok(Some(exporter)) => {
+                charon_metrics::set_build_info(
+                    env!("CARGO_PKG_VERSION"),
+                    option_env!("CHARON_GIT_SHA").unwrap_or("unknown"),
+                );
+                listeners.spawn(async move {
+                    let res: Result<()> = exporter
+                        .await
+                        .map_err(|err| anyhow::anyhow!("metrics exporter: {err:?}"));
+                    ("metrics".to_string(), res)
+                });
+                info!(bind = %config.metrics.bind, "metrics exporter listening on /metrics");
+            }
+            Ok(None) => {
+                info!(
+                    bind = %config.metrics.bind,
+                    "metrics exporter already installed — skipping duplicate install"
+                );
+            }
+            Err(err) => {
+                // Refuse to start with a broken exporter: dashboards
+                // would silently go dark and an operator would not
+                // catch it until the next alert fire.
+                return Err(anyhow::anyhow!(
+                    "failed to install metrics exporter on {}: {err}",
+                    config.metrics.bind
+                ));
+            }
+        }
+    } else {
+        info!("metrics exporter disabled via [metrics].enabled = false");
+    }
+
     // ── Mempool monitor (#46 / #299) ──────────────────────────────────
     // Spawn the pending-tx monitor alongside `BlockListener` on the
     // Venus pipeline's shared provider. Enabled only when the operator
@@ -453,7 +496,8 @@ async fn run_listen(config: &Config, borrowers: Vec<Address>) -> Result<()> {
             (Some(pipeline), Ok(hex)) if !hex.is_empty() => {
                 match Address::from_str(hex.trim()) {
                     Ok(oracle) => {
-                        let monitor = Arc::new(MempoolMonitor::with_defaults(
+                        let monitor = Arc::new(MempoolMonitor::with_defaults_for_chain(
+                            pipeline.chain_name.clone(),
                             pipeline.provider.clone(),
                             oracle,
                         ));
@@ -657,6 +701,12 @@ async fn run_block_pipeline(
 ) {
     let start = std::time::Instant::now();
 
+    // One-shot block counter per pipeline pass (#222). Counted even
+    // when `scan_set` is empty — the block still ticked through the
+    // drain loop and dashboards otherwise silently lose visibility on
+    // "bot is alive, nothing to scan" intervals.
+    charon_metrics::record_block_scanned(pipeline.chain_name.as_str());
+
     // Which borrowers to scan this tick. First real block uses the
     // operator's seed list; thereafter the scheduler picks buckets
     // whose cadence fires.
@@ -706,6 +756,22 @@ async fn run_block_pipeline(
     metrics::histogram!("charon_scanner_scan_duration_seconds")
         .record(start.elapsed().as_secs_f64());
 
+    // Per-bucket position gauges — feat/22 `set_position_bucket`.
+    // Emitted every tick so dashboards track live bucket sizes
+    // rather than a stale counter that decays with TTL.
+    let chain = pipeline.chain_name.as_str();
+    charon_metrics::set_position_bucket(chain, bucket::HEALTHY, counts.healthy as u64);
+    charon_metrics::set_position_bucket(
+        chain,
+        bucket::NEAR_LIQ,
+        counts.near_liquidation as u64,
+    );
+    charon_metrics::set_position_bucket(
+        chain,
+        bucket::LIQUIDATABLE,
+        counts.liquidatable as u64,
+    );
+
     // Walk each liquidatable position through the e2e pipeline. Only
     // opportunities that pass the simulation gate reach the queue.
     let liquidatable = pipeline.scanner.liquidatable();
@@ -723,6 +789,12 @@ async fn run_block_pipeline(
     }
 
     let queue_len = pipeline.queue.len().await;
+    // Queue depth + full per-block pipeline duration. The histogram
+    // uses the domain-scaled buckets registered in
+    // `charon_metrics::install` so BSC's ~3s heartbeat lands inside
+    // meaningful quantiles rather than collapsing into `+Inf`.
+    charon_metrics::set_queue_depth(queue_len as u64);
+    charon_metrics::observe_block_duration(chain, start.elapsed().as_secs_f64());
     info!(
         chain = %pipeline.chain_name,
         block,
@@ -874,9 +946,12 @@ async fn process_opportunity(
         }
     };
 
+    let chain = pipeline.chain_name.as_str();
+
     // b. Router: pick cheapest flash-loan source for (debt token,
     //    repay amount).
     let Some(quote) = pipeline.router.route(pos.debt_token, repay).await else {
+        charon_metrics::record_opportunity_dropped(chain, drop_stage::ROUTER);
         return Ok(false);
     };
 
@@ -899,6 +974,7 @@ async fn process_opportunity(
     ) {
         Ok(i) => i,
         Err(err) => {
+            charon_metrics::record_opportunity_dropped(chain, drop_stage::PROFIT);
             debug!(borrower = %pos.borrower, error = ?err, "profit inputs rejected");
             return Ok(false);
         }
@@ -906,6 +982,7 @@ async fn process_opportunity(
     let net = match calculate_profit(&inputs, pipeline.min_profit_usd_1e6) {
         Ok(n) => n,
         Err(err) => {
+            charon_metrics::record_opportunity_dropped(chain, drop_stage::PROFIT);
             debug!(borrower = %pos.borrower, error = ?err, "profit gate dropped");
             return Ok(false);
         }
@@ -952,6 +1029,10 @@ async fn process_opportunity(
     //    broadcast stage assumes every queued entry is known-good
     //    against the latest state.
     let Some((builder, sim)) = ensure_executor(pipeline.as_ref(), signer_key).await else {
+        // Scan-only mode: no signer, no simulation, no enqueue. Count
+        // as a simulation-stage drop so dashboards surface scan-only
+        // runs without hiding them under router/profit gates.
+        charon_metrics::record_opportunity_dropped(chain, drop_stage::SIMULATION);
         debug!(
             borrower = %pos.borrower,
             "simulation skipped — no signer configured; opportunity not enqueued"
@@ -965,13 +1046,32 @@ async fn process_opportunity(
         provider: pipeline.provider.as_ref(),
     };
     if let Err(err) = gate.encode_and_simulate(&opp, &params).await {
+        charon_metrics::record_simulation(chain, sim_result::REVERT);
+        charon_metrics::record_opportunity_dropped(chain, drop_stage::SIMULATION);
         debug!(borrower = %pos.borrower, error = ?err, "simulation gate dropped");
         return Ok(false);
     }
+    charon_metrics::record_simulation(chain, sim_result::OK);
 
-    // f. Push to the profit-ordered queue.
+    // f. Push to the profit-ordered queue. `simulated = true` because
+    //    the production path only reaches here after a successful
+    //    `eth_call` gate — dry-run entries never get here.
+    let profit_cents = wei_to_usd_cents(opp.net_profit_wei);
     pipeline.queue.push(opp, block).await;
+    charon_metrics::record_opportunity_queued(chain, profit_cents, true);
     Ok(true)
+}
+
+/// Convert a `net_profit_wei` (debt-token smallest units, assumed
+/// 18-decimal stablecoin for v0.1) to USD cents for the profit
+/// histogram. Saturates on overflow so a corrupted upper-bound sample
+/// never crashes the recorder. Placeholder until the per-token
+/// decimals + price bridge lands (#148).
+fn wei_to_usd_cents(wei: U256) -> u64 {
+    // 1 stable unit (18 decimals) ≈ $1 → 100 cents. Divide by 1e16.
+    let scale = U256::from(10u64).pow(U256::from(16u64));
+    let cents = wei / scale;
+    u64::try_from(cents).unwrap_or(u64::MAX)
 }
 
 /// Build the preview [`LiquidationOpportunity`] used as input to

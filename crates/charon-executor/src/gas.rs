@@ -118,6 +118,12 @@ struct CacheEntry {
 /// [`ChainConfig::priority_fee_gwei`]: charon_core::config::ChainConfig::priority_fee_gwei
 #[derive(Debug)]
 pub struct GasOracle {
+    /// Short chain name used as the `chain` label on every gas
+    /// metric emitted from this oracle (#301). Empty string means
+    /// "unlabelled" — unit tests use `new` which defaults to empty;
+    /// production call sites use `new_for_chain` so dashboards can
+    /// pivot on chain.
+    chain: String,
     /// Drop the tx if `max_fee_per_gas` exceeds this (wei).
     max_gas_wei: U256,
     /// EIP-1559 priority fee (gwei). Scaled to wei on every call.
@@ -135,10 +141,27 @@ impl GasOracle {
     /// [`ChainConfig::priority_fee_gwei`]) and gets converted to wei
     /// inside `fetch_params`.
     ///
+    /// Gas-oracle metrics emitted by this constructor carry an empty
+    /// `chain` label — use [`GasOracle::new_for_chain`] in
+    /// production so every sample is tagged with the chain key.
+    ///
     /// [`BotConfig::max_gas_wei`]: charon_core::config::BotConfig::max_gas_wei
     /// [`ChainConfig::priority_fee_gwei`]: charon_core::config::ChainConfig::priority_fee_gwei
     pub fn new(max_gas_wei: U256, priority_fee_gwei: u64) -> Self {
+        Self::new_for_chain(String::new(), max_gas_wei, priority_fee_gwei)
+    }
+
+    /// Construct a new oracle labelled with a `chain` short name
+    /// (e.g. `"bnb"`). Every metric emitted from this oracle carries
+    /// that label so scanner and executor panels in Grafana can pivot
+    /// on the same `chain` dimension.
+    pub fn new_for_chain(
+        chain: impl Into<String>,
+        max_gas_wei: U256,
+        priority_fee_gwei: u64,
+    ) -> Self {
         Self {
+            chain: chain.into(),
             max_gas_wei,
             priority_fee_gwei,
             cache: Mutex::new(None),
@@ -201,10 +224,16 @@ impl GasOracle {
             }
         };
 
+        // Gauge: latest base fee observed. Emitted on every
+        // successful read regardless of ceiling outcome so dashboards
+        // track base-fee trend even during a sustained skip spell.
+        charon_metrics::set_gas_base_fee_wei(&self.chain, base_fee);
+
         // Priority fee: gwei → wei, checked.
         let priority_fee_wei = u128::from(self.priority_fee_gwei)
             .checked_mul(ONE_GWEI)
             .ok_or(GasError::Overflow)?;
+        charon_metrics::set_gas_priority_fee_wei(&self.chain, priority_fee_wei);
 
         // Canonical EIP-1559 headroom: max_fee = 2 * base + priority.
         let max_fee = base_fee
@@ -217,6 +246,10 @@ impl GasOracle {
         // `max_fee` into U256 is lossless.
         let max_fee_u256 = U256::from(max_fee);
         let decision = if max_fee_u256 > self.max_gas_wei {
+            charon_metrics::record_gas_ceiling_skip(
+                &self.chain,
+                charon_metrics::gas_skip_reason::CEILING,
+            );
             warn!(
                 max_fee_wei = %max_fee_u256,
                 ceiling_wei = %self.max_gas_wei,
@@ -231,6 +264,11 @@ impl GasOracle {
                 max_fee_per_gas: max_fee,
                 max_priority_fee_per_gas: priority_fee_wei,
             };
+            // Gauge: the resolved maxFeePerGas actually used when a
+            // tx goes out. Only emitted on the Proceed branch so the
+            // "last max_fee_wei before a ceiling skip" reading stays
+            // stable across the skip window.
+            charon_metrics::set_gas_max_fee_wei(&self.chain, max_fee);
             debug!(
                 base_fee_gwei = base_fee / ONE_GWEI,
                 max_fee_gwei = params.max_fee_per_gas / ONE_GWEI,

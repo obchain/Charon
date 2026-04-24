@@ -4,6 +4,7 @@ members = [
     "crates/charon-core",
     "crates/charon-executor",
     "crates/charon-flashloan",
+    "crates/charon-metrics",
     "crates/charon-protocols",
     "crates/charon-scanner",
     "crates/charon-cli",
@@ -61,6 +62,12 @@ rand = "0.8"
 # Prometheus-style metrics recorder facade
 metrics = "0.24"
 
+# Prometheus HTTP exporter — feat/22 #222 wires this into charon-metrics
+# and the supervised CLI task. `default-features = false` drops the
+# built-in tokio runtime hint so the workspace stays on our chosen
+# tokio version; `http-listener` is the only feature we need.
+metrics-exporter-prometheus = { version = "0.16", default-features = false, features = ["http-listener"] }
+
 # CLI
 clap = { version = "4", features = ["derive", "env"] }
 
@@ -71,6 +78,7 @@ dotenvy = "0.15"
 charon-core = { path = "crates/charon-core" }
 charon-executor = { path = "crates/charon-executor" }
 charon-flashloan = { path = "crates/charon-flashloan" }
+charon-metrics = { path = "crates/charon-metrics" }
 charon-protocols = { path = "crates/charon-protocols" }
 charon-scanner = { path = "crates/charon-scanner" }
 

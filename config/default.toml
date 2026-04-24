@@ -66,6 +66,27 @@ data_provider = "0x41393e5e337606dc3821075Af65AeE84D7688CBD"
 # Populated once CharonLiquidator.sol is deployed on BSC mainnet. Do not
 # add a zero-address placeholder — config validation rejects it.
 
+# ── Prometheus metrics exporter ───────────────────────────────────────────
+# Exposes `/metrics` in Prometheus text format for Grafana / Grafana
+# Cloud scraping. Port 9091 avoids the Prometheus-server default (9090).
+#
+# Binds to loopback by default so the endpoint is unreachable from the
+# public internet on a bare VPS (Hetzner CX22 firewall is permissive on
+# inbound). Remote scraping must go through a reverse proxy (nginx,
+# caddy, Traefik) that terminates bearer-token or mTLS auth — or a
+# compose-internal network, a WireGuard tunnel, etc.
+#
+# If you must bind to a non-loopback address (e.g. 0.0.0.0), set
+# `auth_token` to a non-empty shared secret; config validation rejects
+# a public bind without a token configured. The token is compared
+# byte-for-byte against the `Authorization: Bearer <token>` header by
+# the reverse proxy — the exporter itself does not yet terminate auth.
+[metrics]
+enabled    = true
+bind       = "127.0.0.1:9091"
+# Uncomment and export CHARON_METRICS_AUTH_TOKEN only if bind is non-loopback:
+# auth_token = "${CHARON_METRICS_AUTH_TOKEN}"
+
 # ── Chainlink price feeds (per chain, per asset symbol) ───────────────────
 # Only feeds listed here are polled by the PriceCache. Add more as new
 # Venus markets become relevant. Feed addresses from docs.chain.link.
