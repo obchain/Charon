@@ -437,11 +437,16 @@ contract CharonLiquidator is IFlashLoanSimpleReceiver {
         // quirks (fee-on-transfer, rebasing, etc.).
         uint256 profit = finalBal - totalOwed;
         if (profit > 0) {
-            // transfer return value not checked: COLD_WALLET is a trusted address
-            // set at construction; a failure here reverts the whole tx (excess
-            // funds stay in the contract until rescued). Standard ERC-20s revert
-            // on failure.
-            IERC20(p.debtToken).transfer(COLD_WALLET, profit);
+            // Return value MUST be checked. Standard ERC-20s revert on failure,
+            // but BEP-20 tokens and some legacy implementations return `false`
+            // without reverting. Without this check a silent `false` would leave
+            // profit stranded in this contract while emitting a success log, and
+            // the subsequent Aave approval/repayment would still settle — the
+            // operator would think the liquidation netted the full profit while
+            // the cold wallet received nothing. Reverting here keeps the sweep
+            // and the event log in lockstep.
+            bool ok = IERC20(p.debtToken).transfer(COLD_WALLET, profit);
+            require(ok, "profit: transfer failed");
         }
 
         // ── Step 8: emit before the final approval so logs reflect the full state ─
