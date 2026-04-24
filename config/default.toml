@@ -12,6 +12,14 @@ min_profit_usd_1e6 = 5000000
 max_gas_wei = "3000000000"
 # Polling cadence for protocols without push events (ms).
 scan_interval_ms = 1000
+# Health-factor band (bps of 1e18): liquidatable ≤ 10_000, near-liq window
+# up to `near_liq_threshold_bps`. Omitted keys fall back to serde defaults:
+#   liquidatable_threshold_bps = 10000  (HF = 1.00)
+#   near_liq_threshold_bps     = 10500  (HF = 1.05)
+# Scan cadences per bucket (blocks): defaults hot=1 / warm=10 / cold=100.
+#   hot_scan_blocks  = 1
+#   warm_scan_blocks = 10
+#   cold_scan_blocks = 100
 
 # ── Chains ────────────────────────────────────────────────────────────────
 [chain.bnb]

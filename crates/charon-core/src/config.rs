@@ -96,6 +96,41 @@ pub struct BotConfig {
     pub max_gas_wei: U256,
     /// Polling interval for protocols that don't push events.
     pub scan_interval_ms: u64,
+    /// Health factor at or below which a position becomes liquidatable,
+    /// in basis points of 1e18 (10_000 = 1.0). Integer bps over f64 so
+    /// the boundary has no ULP-level drift (1.05 as f64 truncates to
+    /// 1_049_999_999_999_999_872 in 1e18 scale and silently leaks
+    /// positions out of the NearLiquidation bucket).
+    #[serde(default = "default_liquidatable_threshold_bps")]
+    pub liquidatable_threshold_bps: u32,
+    /// Upper bound of the near-liquidation watch band, same bps space.
+    #[serde(default = "default_near_liq_threshold_bps")]
+    pub near_liq_threshold_bps: u32,
+    /// HOT (Liquidatable) bucket scan cadence, in blocks. Default 1.
+    #[serde(default = "default_hot_scan_blocks")]
+    pub hot_scan_blocks: u64,
+    /// WARM (NearLiquidation) bucket scan cadence. Default every 10 blocks.
+    #[serde(default = "default_warm_scan_blocks")]
+    pub warm_scan_blocks: u64,
+    /// COLD (Healthy) bucket scan cadence. Default every 100 blocks.
+    #[serde(default = "default_cold_scan_blocks")]
+    pub cold_scan_blocks: u64,
+}
+
+fn default_liquidatable_threshold_bps() -> u32 {
+    10_000 // 1.0000
+}
+fn default_near_liq_threshold_bps() -> u32 {
+    10_500 // 1.0500
+}
+fn default_hot_scan_blocks() -> u64 {
+    1
+}
+fn default_warm_scan_blocks() -> u64 {
+    10
+}
+fn default_cold_scan_blocks() -> u64 {
+    100
 }
 
 /// RPC endpoints for a single chain. **The URLs typically embed API keys;
@@ -171,10 +206,25 @@ impl Config {
         Ok(config)
     }
 
-    /// Cross-reference chain keys, reject sentinel zero addresses.
+    /// Cross-reference chain keys, reject sentinel zero addresses, and
+    /// sanity-check scanner bucket thresholds + cadence.
     fn validate(&self) -> Result<()> {
         if self.chain.is_empty() {
             return Err(ConfigError::Validation("no [chain.*] entries".into()));
+        }
+        if self.bot.near_liq_threshold_bps <= self.bot.liquidatable_threshold_bps {
+            return Err(ConfigError::Validation(format!(
+                "near_liq_threshold_bps ({}) must be > liquidatable_threshold_bps ({})",
+                self.bot.near_liq_threshold_bps, self.bot.liquidatable_threshold_bps
+            )));
+        }
+        if self.bot.hot_scan_blocks == 0
+            || self.bot.warm_scan_blocks == 0
+            || self.bot.cold_scan_blocks == 0
+        {
+            return Err(ConfigError::Validation(
+                "hot/warm/cold_scan_blocks must all be > 0".into(),
+            ));
         }
         for (name, p) in &self.protocol {
             if !self.chain.contains_key(&p.chain) {

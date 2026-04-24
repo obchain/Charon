@@ -48,6 +48,9 @@ async-trait = "0.1"
 # Stream adapters (StreamExt for subscription streams)
 futures-util = "0.3"
 
+# Lock-free concurrent hashmap for scanner state
+dashmap = "6"
+
 # Backoff jitter
 rand = "0.8"
 

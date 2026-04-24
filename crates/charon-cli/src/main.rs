@@ -16,7 +16,9 @@ use alloy::providers::{ProviderBuilder, WsConnect};
 use anyhow::{Context, Result};
 use charon_core::{Config, LendingProtocol};
 use charon_protocols::VenusAdapter;
-use charon_scanner::{BlockListener, ChainEvent, ChainProvider};
+use charon_scanner::{
+    BlockListener, ChainEvent, ChainProvider, HealthScanner, PositionBucket, ScanScheduler,
+};
 use clap::{Parser, Subcommand};
 use tokio::sync::mpsc;
 use tracing::{info, warn};
@@ -126,49 +128,74 @@ async fn main() -> Result<()> {
 /// cleanly on SIGINT or SIGTERM so the Docker `stop` → SIGTERM → SIGKILL
 /// sequence never tears mid-operation.
 ///
-/// For every `NewBlock` event on a chain with a `[protocol.venus]` entry,
-/// the Venus adapter scans the supplied borrower list anchored at the
-/// observed block. Chains without a Venus protocol config still flow
-/// through the drain loop but trigger no protocol scans (v0.1 scope).
+/// For every `NewBlock` event on a chain with a `[protocol.venus]` entry
+/// the Venus adapter fetches positions anchored at the observed block,
+/// pushes them through the bucketed [`HealthScanner`], and limits fetches
+/// to buckets whose cadence fires this block via [`ScanScheduler`].
+/// Chains without a Venus protocol config still flow through the drain
+/// loop but trigger no protocol scans (v0.1 scope).
+///
+/// Backfill blocks (synthesised during WebSocket reconnect) are logged
+/// but not scanned — the state they would produce is superseded by the
+/// next real head and a fresh scan is cheaper than retroactive bucket
+/// transitions.
 async fn run_listen(config: &Config, borrowers: Vec<Address>) -> Result<()> {
     if config.chain.is_empty() {
         anyhow::bail!("no chains configured — nothing to listen to");
     }
 
-    // Venus adapter is currently single-chain (BNB) per config scope.
-    // Build it only if `[protocol.venus]` exists and its target chain is
-    // configured; otherwise run the listener pipeline without a scanner.
-    let venus_adapter: Option<(String, Arc<VenusAdapter>)> = match config.protocol.get("venus") {
-        Some(venus_cfg) => {
-            let chain_name = &venus_cfg.chain;
-            let chain_cfg = config.chain.get(chain_name).with_context(|| {
-                format!(
-                    "protocol 'venus' references chain '{chain_name}' which is not in [chain.*]"
-                )
-            })?;
-            let adapter_ws = ProviderBuilder::new()
-                .on_ws(WsConnect::new(&chain_cfg.ws_url))
-                .await
-                .context("venus adapter: failed to connect over ws")?;
-            let adapter =
-                Arc::new(VenusAdapter::connect(Arc::new(adapter_ws), venus_cfg.comptroller).await?);
-            info!(
-                chain = %chain_name,
-                borrower_count = borrowers.len(),
-                market_count = adapter.markets().await.len(),
-                "venus adapter ready"
-            );
-            Some((chain_name.clone(), adapter))
-        }
-        None => {
-            info!("no [protocol.venus] configured — listener will drain events without scanning");
-            None
-        }
-    };
+    // Venus adapter + bucketed scanner + cadence scheduler are currently
+    // single-chain (BNB) per config scope. Build them only if
+    // `[protocol.venus]` exists and its target chain is configured;
+    // otherwise run the listener pipeline without a scanner.
+    let venus_adapter: Option<(String, Arc<VenusAdapter>, Arc<HealthScanner>, ScanScheduler)> =
+        match config.protocol.get("venus") {
+            Some(venus_cfg) => {
+                let chain_name = &venus_cfg.chain;
+                let chain_cfg = config.chain.get(chain_name).with_context(|| {
+                    format!(
+                        "protocol 'venus' references chain '{chain_name}' which is not in [chain.*]"
+                    )
+                })?;
+                let adapter_ws = ProviderBuilder::new()
+                    .on_ws(WsConnect::new(&chain_cfg.ws_url))
+                    .await
+                    .context("venus adapter: failed to connect over ws")?;
+                let adapter = Arc::new(
+                    VenusAdapter::connect(Arc::new(adapter_ws), venus_cfg.comptroller).await?,
+                );
+                let scanner = Arc::new(HealthScanner::new(
+                    config.bot.liquidatable_threshold_bps,
+                    config.bot.near_liq_threshold_bps,
+                )?);
+                let sched = ScanScheduler::new(
+                    config.bot.hot_scan_blocks,
+                    config.bot.warm_scan_blocks,
+                    config.bot.cold_scan_blocks,
+                );
+                info!(
+                    chain = %chain_name,
+                    borrower_count = borrowers.len(),
+                    market_count = adapter.markets().await.len(),
+                    liquidatable_bps = config.bot.liquidatable_threshold_bps,
+                    near_liq_bps = config.bot.near_liq_threshold_bps,
+                    hot_blocks = sched.hot,
+                    warm_blocks = sched.warm,
+                    cold_blocks = sched.cold,
+                    "venus adapter + scanner ready"
+                );
+                Some((chain_name.clone(), adapter, scanner, sched))
+            }
+            None => {
+                info!(
+                    "no [protocol.venus] configured — listener will drain events without scanning"
+                );
+                None
+            }
+        };
 
     let (tx, mut rx) = mpsc::channel::<ChainEvent>(CHAIN_EVENT_CHANNEL);
-    let mut listeners: tokio::task::JoinSet<(String, Result<()>)> =
-        tokio::task::JoinSet::new();
+    let mut listeners: tokio::task::JoinSet<(String, Result<()>)> = tokio::task::JoinSet::new();
 
     // `ChainConfig: Clone` — we only borrow `config`, so each listener task
     // gets its own owned copy.
@@ -183,6 +210,11 @@ async fn run_listen(config: &Config, borrowers: Vec<Address>) -> Result<()> {
 
     info!("listen: draining chain events (Ctrl-C or SIGTERM to stop)");
 
+    // The first real (non-backfill) block on the Venus chain seeds the
+    // scanner with the operator-supplied borrower list. Subsequent scans
+    // pull from the scheduler-selected bucket membership so we don't
+    // burn RPC re-fetching COLD positions every block.
+    let mut seeded = false;
     tokio::select! {
         _ = async {
             while let Some(event) = rx.recv().await {
@@ -195,32 +227,67 @@ async fn run_listen(config: &Config, borrowers: Vec<Address>) -> Result<()> {
                             backfill,
                             "cli drained event"
                         );
-                        // Route to Venus scan only when this event is for
-                        // the chain the Venus adapter was configured on.
-                        if let Some((venus_chain, adapter)) = venus_adapter.as_ref() {
-                            if venus_chain == &chain {
-                                let start = std::time::Instant::now();
-                                let block_tag = BlockNumberOrTag::Number(number);
-                                match adapter.fetch_positions(&borrowers, block_tag).await {
-                                    Ok(positions) => {
-                                        info!(
-                                            chain = %chain,
-                                            block = number,
-                                            timestamp,
-                                            backfill,
-                                            tracked = borrowers.len(),
-                                            returned = positions.len(),
-                                            scan_ms = start.elapsed().as_millis() as u64,
-                                            "venus scan"
-                                        );
+                        if backfill {
+                            // Skip backfill — the next real head will
+                            // snapshot the final state of the missed range.
+                            continue;
+                        }
+                        if let Some((venus_chain, adapter, scanner, sched)) =
+                            venus_adapter.as_ref()
+                        {
+                            if venus_chain != &chain {
+                                continue;
+                            }
+                            let start = std::time::Instant::now();
+                            let scan_set: Vec<Address> = if !seeded {
+                                seeded = true;
+                                borrowers.clone()
+                            } else {
+                                let mut v = Vec::new();
+                                for b in [
+                                    PositionBucket::Liquidatable,
+                                    PositionBucket::NearLiquidation,
+                                    PositionBucket::Healthy,
+                                ] {
+                                    if sched.should_scan(b, number) {
+                                        v.extend(scanner.borrowers_in_bucket(b));
                                     }
-                                    Err(err) => warn!(
+                                }
+                                v
+                            };
+                            if scan_set.is_empty() {
+                                continue;
+                            }
+                            let block_tag = BlockNumberOrTag::Number(number);
+                            match adapter.fetch_positions(&scan_set, block_tag).await {
+                                Ok(positions) => {
+                                    let returned = positions.len();
+                                    scanner.upsert(positions.clone());
+                                    scanner.prune(&positions);
+                                    let counts = scanner.bucket_counts();
+                                    metrics::histogram!(
+                                        "charon_scanner_scan_duration_seconds"
+                                    )
+                                    .record(start.elapsed().as_secs_f64());
+                                    info!(
                                         chain = %chain,
                                         block = number,
-                                        error = ?err,
-                                        "venus scan failed"
-                                    ),
+                                        timestamp,
+                                        tracked = scan_set.len(),
+                                        returned,
+                                        healthy = counts.healthy,
+                                        near_liq = counts.near_liquidation,
+                                        liquidatable = counts.liquidatable,
+                                        scan_ms = start.elapsed().as_millis() as u64,
+                                        "venus scan"
+                                    );
                                 }
+                                Err(err) => warn!(
+                                    chain = %chain,
+                                    block = number,
+                                    error = ?err,
+                                    "venus scan failed"
+                                ),
                             }
                         }
                     }
@@ -248,9 +315,7 @@ async fn run_listen(config: &Config, borrowers: Vec<Address>) -> Result<()> {
 
 /// Drain a `JoinSet` of listener tasks and surface panics / errors per chain.
 /// Returns when every listener has exited so the caller can shut down.
-async fn supervise(
-    listeners: &mut tokio::task::JoinSet<(String, Result<()>)>,
-) {
+async fn supervise(listeners: &mut tokio::task::JoinSet<(String, Result<()>)>) {
     while let Some(joined) = listeners.join_next().await {
         match joined {
             Ok((name, Ok(()))) => {
