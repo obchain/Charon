@@ -14,9 +14,9 @@ pub mod gas;
 pub mod nonce;
 pub mod simulation;
 
-pub use builder::{ICharonLiquidator, TxBuilder};
+pub use builder::{BuilderError, ICharonLiquidator, TxBuilder};
 pub use gas::{
     CHAINLINK_DECIMALS, GasDecision, GasError, GasOracle, GasParams, gas_cost_usd_cents,
 };
 pub use nonce::{NonceError, NonceManager};
-pub use simulation::Simulator;
+pub use simulation::{SimulationError, Simulator};

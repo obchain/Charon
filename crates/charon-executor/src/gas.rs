@@ -9,7 +9,7 @@
 //!    flaky RPC that drops the field), fall back to
 //!    `eth_gasPrice` so the oracle still returns a usable quote.
 //! 2. **Ceiling enforcement** — refuse to emit gas params if the
-//!    proposed `maxFeePerGas` exceeds `bot.max_gas_gwei`. Returned as
+//!    proposed `maxFeePerGas` exceeds `bot.max_gas_wei`. Returned as
 //!    a typed [`GasDecision::SkipCeilingExceeded`] variant so callers
 //!    can branch without pattern-matching on `Option`.
 //! 3. **Cost estimation in USD cents** — converts `gas_units × maxFee`
@@ -19,11 +19,12 @@
 //!
 //! ### Unit conventions
 //!
-//! Internally every fee is kept in **wei** (`u128` for ergonomics,
-//! `U256` only where arithmetic might overflow). Gwei is used at the
-//! boundary (config input, log lines, [`GasDecision`] payload). The
-//! ceiling check converts `bot.max_gas_gwei` → wei before comparing —
-//! mixing the two units silently under-filters at 1e9×.
+//! Internally every fee is kept in **wei**. The ceiling
+//! (`bot.max_gas_wei`) is already wei and is stored as `U256` so
+//! sub-gwei tips and absurdly-high-priced chains remain representable
+//! without truncation. The per-chain `priority_fee_gwei` is the only
+//! gwei-denominated input; it is scaled to wei on construction and
+//! never compared against `U256` values in the raw gwei domain.
 
 use std::sync::Mutex;
 
@@ -87,13 +88,11 @@ pub struct GasParams {
 pub enum GasDecision {
     /// Fee is below ceiling, safe to build the tx.
     Proceed(GasParams),
-    /// `maxFeePerGas` would exceed `bot.max_gas_gwei`. Caller drops
-    /// the opportunity and logs — both values are gwei for operator
-    /// readability.
-    SkipCeilingExceeded {
-        max_fee_gwei: u64,
-        ceiling_gwei: u64,
-    },
+    /// `maxFeePerGas` would exceed `bot.max_gas_wei`. Caller drops
+    /// the opportunity and logs — both values are wei, mirroring the
+    /// config surface, so there is never a gwei/wei mix-up at the
+    /// log line.
+    SkipCeilingExceeded { max_fee_wei: U256, ceiling_wei: U256 },
 }
 
 /// Per-block cache entry so repeated `fetch_params(block_n)` calls
@@ -105,11 +104,23 @@ struct CacheEntry {
 }
 
 /// Per-chain gas oracle. Construct once per chain at startup.
+///
+/// The ceiling (`max_gas_wei`) comes from [`BotConfig::max_gas_wei`]
+/// and is already wei; the priority fee (`priority_fee_gwei`) comes
+/// from [`ChainConfig::priority_fee_gwei`] and is scaled to wei on
+/// every `fetch_params` call. Keeping the two storage types distinct
+/// preserves the config surface (ceiling is `U256` because a sub-gwei
+/// L2 fee or a pathological spike is still representable exactly,
+/// tips are `u64` gwei because no operator writes sub-gwei tips by
+/// hand).
+///
+/// [`BotConfig::max_gas_wei`]: charon_core::config::BotConfig::max_gas_wei
+/// [`ChainConfig::priority_fee_gwei`]: charon_core::config::ChainConfig::priority_fee_gwei
 #[derive(Debug)]
 pub struct GasOracle {
-    /// Drop the tx if `max_fee_per_gas` exceeds this (gwei).
-    max_gas_gwei: u64,
-    /// EIP-1559 priority fee, gwei. Converted to wei on every call.
+    /// Drop the tx if `max_fee_per_gas` exceeds this (wei).
+    max_gas_wei: U256,
+    /// EIP-1559 priority fee (gwei). Scaled to wei on every call.
     priority_fee_gwei: u64,
     /// Last `(block_number, decision)` observed. `Mutex<Option<_>>`
     /// — contention here is negligible (one lookup per tx build,
@@ -118,9 +129,17 @@ pub struct GasOracle {
 }
 
 impl GasOracle {
-    pub fn new(max_gas_gwei: u64, priority_fee_gwei: u64) -> Self {
+    /// Construct a new oracle. `max_gas_wei` is the hard fee ceiling
+    /// (already wei, sourced from [`BotConfig::max_gas_wei`]);
+    /// `priority_fee_gwei` is the per-chain tip (sourced from
+    /// [`ChainConfig::priority_fee_gwei`]) and gets converted to wei
+    /// inside `fetch_params`.
+    ///
+    /// [`BotConfig::max_gas_wei`]: charon_core::config::BotConfig::max_gas_wei
+    /// [`ChainConfig::priority_fee_gwei`]: charon_core::config::ChainConfig::priority_fee_gwei
+    pub fn new(max_gas_wei: U256, priority_fee_gwei: u64) -> Self {
         Self {
-            max_gas_gwei,
+            max_gas_wei,
             priority_fee_gwei,
             cache: Mutex::new(None),
         }
@@ -143,12 +162,16 @@ impl GasOracle {
     {
         // Cache hit: same block we already priced, return the cached
         // decision. Using a scoped lock — never held across await.
-        if let Some(block_n) = current_block
-            && let Some(entry) = *self.cache.lock().expect("gas cache mutex poisoned")
-            && entry.block == block_n
-        {
-            debug!(block = block_n, "gas params cache hit");
-            return Ok(entry.decision);
+        // Written as nested `if let` rather than an `if let` chain so
+        // the MSRV stays at 1.85 (chains stabilised in 1.88).
+        if let Some(block_n) = current_block {
+            let cached = *self.cache.lock().expect("gas cache mutex poisoned");
+            if let Some(entry) = cached {
+                if entry.block == block_n {
+                    debug!(block = block_n, "gas params cache hit");
+                    return Ok(entry.decision);
+                }
+            }
         }
 
         let block = provider
@@ -189,21 +212,19 @@ impl GasOracle {
             .and_then(|v| v.checked_add(priority_fee_wei))
             .ok_or(GasError::Overflow)?;
 
-        // Ceiling check in wei to avoid a 1e9 unit mismatch.
-        let max_gas_wei = u128::from(self.max_gas_gwei)
-            .checked_mul(ONE_GWEI)
-            .ok_or(GasError::Overflow)?;
-
-        let decision = if max_fee > max_gas_wei {
-            let max_fee_gwei = u64::try_from(max_fee / ONE_GWEI).unwrap_or(u64::MAX);
+        // Ceiling check is done in U256 since the ceiling is sourced
+        // as `U256` from `BotConfig::max_gas_wei`. Promoting the u128
+        // `max_fee` into U256 is lossless.
+        let max_fee_u256 = U256::from(max_fee);
+        let decision = if max_fee_u256 > self.max_gas_wei {
             warn!(
-                max_fee_gwei,
-                ceiling_gwei = self.max_gas_gwei,
+                max_fee_wei = %max_fee_u256,
+                ceiling_wei = %self.max_gas_wei,
                 "gas exceeds configured ceiling — skipping tx"
             );
             GasDecision::SkipCeilingExceeded {
-                max_fee_gwei,
-                ceiling_gwei: self.max_gas_gwei,
+                max_fee_wei: max_fee_u256,
+                ceiling_wei: self.max_gas_wei,
             }
         } else {
             let params = GasParams {
@@ -318,32 +339,34 @@ mod tests {
     fn priority_fee_wei_conversion_one_gwei() {
         // Sanity: priority_fee_gwei = 1 must resolve to 1e9 wei on
         // the GasParams boundary.
-        let oracle = GasOracle::new(100, 1);
+        let oracle = GasOracle::new(U256::from(100u128) * U256::from(ONE_GWEI), 1);
         // Direct field access via constructor — can't call fetch
         // without a provider, so we reproduce the arithmetic path
         // that fetch_params uses.
         let wei = u128::from(oracle.priority_fee_gwei)
             .checked_mul(ONE_GWEI)
-            .unwrap();
+            .expect("priority fee conversion must not overflow in test");
         assert_eq!(wei, 1_000_000_000u128);
     }
 
     #[test]
     fn priority_fee_wei_conversion_five_gwei() {
-        let wei = 5u128.checked_mul(ONE_GWEI).unwrap();
+        let wei = 5u128
+            .checked_mul(ONE_GWEI)
+            .expect("5 gwei must fit in u128");
         assert_eq!(wei, 5_000_000_000u128);
     }
 
     #[test]
     fn max_fee_uses_two_x_headroom() {
         // base = 3 gwei, priority = 1 gwei → max_fee = 7 gwei.
-        let base_wei = 3u128 * ONE_GWEI;
+        let base_wei = 3u128.checked_mul(ONE_GWEI).expect("3 gwei fits");
         let priority_wei = ONE_GWEI;
         let max_fee = base_wei
             .checked_mul(BASE_FEE_HEADROOM_MULT)
             .and_then(|v| v.checked_add(priority_wei))
-            .unwrap();
-        assert_eq!(max_fee, 7u128 * ONE_GWEI);
+            .expect("max_fee fits in u128");
+        assert_eq!(max_fee, 7u128.checked_mul(ONE_GWEI).expect("7 gwei fits"));
     }
 
     #[test]
@@ -357,8 +380,8 @@ mod tests {
     fn ceiling_in_wei_rejects_over_limit() {
         // Ceiling 10 gwei in wei = 1e10. A max_fee of 11 gwei must
         // trip the ceiling. Sanity-checks the unit fix for #179.
-        let ceiling_wei = 10u128 * ONE_GWEI;
-        let max_fee = 11u128 * ONE_GWEI;
+        let ceiling_wei = U256::from(10u128.checked_mul(ONE_GWEI).expect("10 gwei fits"));
+        let max_fee = U256::from(11u128.checked_mul(ONE_GWEI).expect("11 gwei fits"));
         assert!(max_fee > ceiling_wei);
     }
 
@@ -370,7 +393,11 @@ mod tests {
         use alloy::providers::ProviderBuilder;
         let url = std::env::var("BNB_HTTP_URL").expect("BNB_HTTP_URL not set");
         let provider = ProviderBuilder::new().on_http(url.parse().expect("valid http url"));
-        let oracle = GasOracle::new(100, 1);
+        // 100 gwei ceiling expressed in wei.
+        let ceiling = U256::from(100u128)
+            .checked_mul(U256::from(ONE_GWEI))
+            .expect("ceiling fits in U256");
+        let oracle = GasOracle::new(ceiling, 1);
         let decision = oracle
             .fetch_params(&provider, None)
             .await

@@ -3,6 +3,11 @@ src = "src"
 out = "out"
 libs = ["lib"]
 solc_version = "0.8.24"
+# BNB Chain's EVM is still at the Paris hard fork — it has not enabled the
+# Shanghai PUSH0 opcode. Without `evm_version = "paris"` the compiler emits
+# PUSH0 bytecode (default for solc >= 0.8.20) and deployed contracts revert
+# on first touch. This setting is load-bearing for v0.1 BSC-only scope.
+evm_version = "paris"
 optimizer = true
 optimizer_runs = 1_000_000
 via_ir = false
