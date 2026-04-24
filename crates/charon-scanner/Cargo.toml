@@ -12,6 +12,9 @@ anyhow = { workspace = true }
 async-trait = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
+futures-util = { workspace = true }
+rand = { workspace = true }
+metrics = { workspace = true }
 
 [lints]
 workspace = true

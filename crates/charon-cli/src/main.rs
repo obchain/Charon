@@ -10,10 +10,16 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use charon_core::Config;
-use charon_scanner::ChainProvider;
+use charon_scanner::{BlockListener, ChainEvent, ChainProvider};
 use clap::{Parser, Subcommand};
-use tracing::info;
+use tokio::sync::mpsc;
+use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
+
+/// Size of the fan-in channel from listeners to the scanner pipeline.
+/// One slot per ~5 blocks across all chains covers short stalls without
+/// back-pressuring the listener task.
+const CHAIN_EVENT_CHANNEL: usize = 1024;
 
 /// Charon — multi-chain flash-loan liquidation bot.
 #[derive(Parser, Debug)]
@@ -34,8 +40,10 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Command {
-    /// Listen to chain events and track positions.
-    /// (Scanner wiring lands across multiple M1 issues — currently a stub.)
+    /// Spawn one block listener per configured chain and drain chain events.
+    ///
+    /// Downstream pipeline (scanner → profit calc → executor) consumes
+    /// the same channel once those layers land.
     Listen,
 
     /// Connect to a configured chain and print its latest block number.
@@ -98,21 +106,88 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-/// Long-running listener entry point. Exits cleanly on SIGINT or SIGTERM so
-/// the Docker `stop` → SIGTERM → SIGKILL sequence never tears mid-operation.
-async fn run_listen(_config: &Config) -> Result<()> {
-    info!("listen: not wired up yet — scanner arrives in Day 2");
+/// Long-running listener entry point. Spawns one `BlockListener` per
+/// configured chain, drains the shared `ChainEvent` channel, and exits
+/// cleanly on SIGINT or SIGTERM so the Docker `stop` → SIGTERM → SIGKILL
+/// sequence never tears mid-operation.
+async fn run_listen(config: &Config) -> Result<()> {
+    if config.chain.is_empty() {
+        anyhow::bail!("no chains configured — nothing to listen to");
+    }
+
+    let (tx, mut rx) = mpsc::channel::<ChainEvent>(CHAIN_EVENT_CHANNEL);
+    let mut listeners: tokio::task::JoinSet<(String, Result<()>)> =
+        tokio::task::JoinSet::new();
+
+    // `ChainConfig: Clone` — we only borrow `config`, so each listener task
+    // gets its own owned copy.
+    for (name, chain_cfg) in &config.chain {
+        let name = name.clone();
+        let chain_cfg = chain_cfg.clone();
+        let listener = BlockListener::new(name.clone(), chain_cfg, tx.clone());
+        listeners.spawn(async move { (name, listener.run().await) });
+    }
+    // Drop our sender so the channel closes when every listener exits.
+    drop(tx);
+
+    info!("listen: draining chain events (Ctrl-C or SIGTERM to stop)");
 
     tokio::select! {
+        _ = async {
+            while let Some(event) = rx.recv().await {
+                match event {
+                    ChainEvent::NewBlock { chain, number, timestamp, backfill } => {
+                        tracing::debug!(
+                            chain = %chain,
+                            block = number,
+                            timestamp = timestamp,
+                            backfill,
+                            "cli drained event"
+                        );
+                    }
+                    _ => {}
+                }
+            }
+        } => {
+            info!("all listeners exited");
+        }
+        _ = supervise(&mut listeners) => {
+            info!("all listener tasks terminated");
+        }
         _ = tokio::signal::ctrl_c() => {
             info!("received SIGINT, shutting down");
+            listeners.shutdown().await;
         }
         _ = wait_sigterm() => {
             info!("received SIGTERM, shutting down");
+            listeners.shutdown().await;
         }
     }
 
     Ok(())
+}
+
+/// Drain a `JoinSet` of listener tasks and surface panics / errors per chain.
+/// Returns when every listener has exited so the caller can shut down.
+async fn supervise(
+    listeners: &mut tokio::task::JoinSet<(String, Result<()>)>,
+) {
+    while let Some(joined) = listeners.join_next().await {
+        match joined {
+            Ok((name, Ok(()))) => {
+                info!(chain = %name, "listener exited cleanly");
+            }
+            Ok((name, Err(err))) => {
+                warn!(chain = %name, error = ?err, "listener terminated with error");
+            }
+            Err(err) if err.is_panic() => {
+                warn!(error = ?err, "listener panicked");
+            }
+            Err(err) => {
+                warn!(error = ?err, "listener join error");
+            }
+        }
+    }
 }
 
 #[cfg(unix)]
