@@ -222,7 +222,7 @@ impl TxBuilder {
     // TODO(#43): replace the direct `eth_getTransactionCount` read
     // with the upcoming `NonceManager` once PR #43 lands, so bursty
     // submission windows don't have to re-RPC for every tx.
-    pub async fn build_tx<P>(
+    pub async fn build_tx<P, T>(
         &self,
         provider: &P,
         calldata: Bytes,
@@ -231,7 +231,8 @@ impl TxBuilder {
         gas_limit: u64,
     ) -> Result<TransactionRequest, BuilderError>
     where
-        P: Provider,
+        P: Provider<T>,
+        T: alloy::transports::Transport + Clone,
     {
         if max_priority_fee_per_gas > max_fee_per_gas {
             return Err(BuilderError::InvalidFees(

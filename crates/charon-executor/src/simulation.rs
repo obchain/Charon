@@ -102,14 +102,15 @@ impl Simulator {
     /// will use — a simulation that fits in less gas than the
     /// broadcast can pass here and still revert on-chain as
     /// out-of-gas.
-    pub async fn simulate<P>(
+    pub async fn simulate<P, T>(
         &self,
         provider: &P,
         calldata: Bytes,
         gas_limit: u64,
     ) -> Result<(), SimulationError>
     where
-        P: Provider,
+        P: Provider<T>,
+        T: alloy::transports::Transport + Clone,
     {
         let req = TransactionRequest::default()
             .with_from(self.sender)

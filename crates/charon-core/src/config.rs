@@ -9,6 +9,7 @@
 //! ```
 
 use alloy::primitives::{Address, U256};
+use secrecy::SecretString;
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::fmt;
@@ -87,7 +88,16 @@ impl fmt::Debug for ChainCount {
 /// Bot-level knobs — thresholds and intervals.
 ///
 /// Money values are stored as integers to avoid f64 precision and NaN hazards.
-#[derive(Debug, Clone, Deserialize)]
+///
+/// `signer_key` is the only field whose *value* is a secret. It is stored
+/// in a [`SecretString`] so the raw hex is never materialised in `Debug`
+/// output; the raw bytes are exposed only at the signing site, via
+/// `expose_secret()`. A hand-written `Debug` impl is provided below so the
+/// field is rendered as `<redacted>` / `<unset>` instead of relying on
+/// `secrecy`'s default `Secret(...)` rendering — any future change that
+/// would expose the key therefore has to first delete a visible redaction
+/// marker in source.
+#[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BotConfig {
     /// Minimum profit threshold in USD × 1e6 (six decimals of USD).
@@ -120,6 +130,42 @@ pub struct BotConfig {
     /// COLD (Healthy) bucket scan cadence. Default every 100 blocks.
     #[serde(default = "default_cold_scan_blocks")]
     pub cold_scan_blocks: u64,
+    /// Hot-wallet signer key, fed in via `${CHARON_SIGNER_KEY}` env
+    /// substitution in `config/default.toml`. Held in a
+    /// [`SecretString`] so the raw hex never reaches `Debug` output or
+    /// log lines — `expose_secret()` is called only at the signing
+    /// site in the CLI pipeline, never stored back.
+    ///
+    /// An empty or missing value puts the bot in **scan-only** mode:
+    /// the CLI pipeline refuses to build / simulate / enqueue anything
+    /// that would require a signature (the simulation gate is hard —
+    /// no signer → no enqueue, ever). Production runs must supply a
+    /// non-empty value via the env var, never a literal in the file.
+    #[serde(default, deserialize_with = "deser_optional_secret")]
+    pub signer_key: Option<SecretString>,
+}
+
+impl fmt::Debug for BotConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("BotConfig")
+            .field("min_profit_usd_1e6", &self.min_profit_usd_1e6)
+            .field("max_gas_wei", &self.max_gas_wei)
+            .field("scan_interval_ms", &self.scan_interval_ms)
+            .field("liquidatable_threshold_bps", &self.liquidatable_threshold_bps)
+            .field("near_liq_threshold_bps", &self.near_liq_threshold_bps)
+            .field("hot_scan_blocks", &self.hot_scan_blocks)
+            .field("warm_scan_blocks", &self.warm_scan_blocks)
+            .field("cold_scan_blocks", &self.cold_scan_blocks)
+            .field(
+                "signer_key",
+                &if self.signer_key.is_some() {
+                    "<redacted>"
+                } else {
+                    "<unset>"
+                },
+            )
+            .finish()
+    }
 }
 
 fn default_liquidatable_threshold_bps() -> u32 {
@@ -302,6 +348,22 @@ where
         }
         StringOrInt::Int(n) => Ok(U256::from(n)),
     }
+}
+
+/// Treat an empty string as "unset" and return `None`. Non-empty strings
+/// become `Some(SecretString)` so the env substitution form
+/// `${CHARON_SIGNER_KEY:-}` (env-optional secret) flows naturally from
+/// the env-var layer to the typed config without the caller having to
+/// distinguish "missing" from "explicitly empty".
+fn deser_optional_secret<'de, D>(d: D) -> std::result::Result<Option<SecretString>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let s = Option::<String>::deserialize(d)?;
+    Ok(match s {
+        Some(v) if !v.trim().is_empty() => Some(SecretString::from(v)),
+        _ => None,
+    })
 }
 
 /// Replace every `${NAME}` or `${NAME:-default}` in `input` with the value of

@@ -20,6 +20,11 @@ scan_interval_ms = 1000
 #   hot_scan_blocks  = 1
 #   warm_scan_blocks = 10
 #   cold_scan_blocks = 100
+# Hot-wallet signer private key (hex, optional). Sourced from the
+# `${CHARON_SIGNER_KEY}` env var — empty/unset puts the bot in
+# scan-only mode: no tx signing, no simulation, nothing gets enqueued.
+# Never commit a literal key here; see `.env.example` for the env var.
+signer_key = "${CHARON_SIGNER_KEY:-}"
 
 # ── Chains ────────────────────────────────────────────────────────────────
 [chain.bnb]
