@@ -10,7 +10,8 @@
 //! The batcher is a **planner**, not an executor. It returns structured
 //! [`LiquidationBatch`] values; a downstream caller (CLI pipeline, in a
 //! later PR) builds the tx via [`TxBuilder`](crate::TxBuilder) with the
-//! calldata produced here.
+//! calldata produced here and broadcasts it through
+//! [`Submitter`](crate::Submitter).
 //!
 //! v0.1 scope: Venus on BNB Chain only. The planner rejects any input
 //! whose `chain_id` is not [`BSC_CHAIN_ID`]; cross-chain partitioning is
@@ -26,7 +27,7 @@
 //!   "batch" is cheaper as a plain `executeLiquidation` call (skips the
 //!   array length word + loop overhead)
 
-use alloy::primitives::Bytes;
+use alloy::primitives::{Bytes, U256};
 use alloy::providers::Provider;
 use alloy::sol;
 use alloy::sol_types::SolCall;
@@ -58,6 +59,12 @@ pub const BSC_CHAIN_ID: u64 = 56;
 // Solidity source — the selector test pins the canonical keccak256 of
 // the function signature, so any drift in the struct shape or the
 // function name breaks the test before it reaches mainnet.
+//
+// Shape mirrors `CharonLiquidator.sol :: LiquidationParams` including the
+// trailing `uint24 swapPoolFee` field added in the cold-wallet / vBNB
+// port. The selector test below pins the canonical keccak256 so any
+// further drift in field order or count reliably breaks CI before it
+// reaches mainnet.
 sol! {
     /// Solidity-side `LiquidationParams` — same shape as in
     /// [`crate::builder::CharonLiquidationParams`], redeclared here so
@@ -72,6 +79,7 @@ sol! {
         address collateralVToken;
         uint256 repayAmount;
         uint256 minSwapOut;
+        uint24 swapPoolFee;
     }
 
     /// `batchExecute(LiquidationParams[])` entry on `CharonLiquidator`.
@@ -87,6 +95,7 @@ const PROTOCOL_VENUS: u8 = 3;
 /// failure modes and surface them as domain errors rather than opaque
 /// `Result<_, anyhow::Error>` blobs.
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum BatcherError {
     /// Caller supplied a `params` slice whose length does not equal
     /// `batch.opportunities.len()`. Zipping proceeds pairwise, so any
@@ -119,6 +128,49 @@ pub enum BatcherError {
         got: u64,
         /// The only chain id accepted in v0.1.
         expected: u64,
+    },
+
+    /// The corresponding [`LiquidationParams`] variant is not handled
+    /// by this batcher. Mirrors
+    /// [`BuilderError::UnsupportedProtocol`](crate::BuilderError::UnsupportedProtocol)
+    /// — `LiquidationParams` is `#[non_exhaustive]`, so a wildcard arm
+    /// is required even though v0.1 only surfaces `Venus`. Payload is
+    /// the `Debug` rendering so logs can identify which protocol
+    /// adapter is still pending batcher support.
+    #[error("batcher: unsupported liquidation protocol: {0}")]
+    UnsupportedProtocol(String),
+
+    /// The swap route attached to an opportunity lacks a `pool_fee`.
+    /// The on-chain `CharonLiquidator.executeOperation` routes the
+    /// swap through PancakeSwap V3 at a caller-supplied fee tier and
+    /// reverts with `"!swapPoolFee"` if the tier is zero or missing;
+    /// the encoder rejects the calldata earlier rather than burn gas
+    /// for a guaranteed revert.
+    #[error(
+        "batcher: missing pool_fee on swap route for borrower {borrower:#x} \
+         (fee-less routes are not supported by CharonLiquidator)"
+    )]
+    MissingPoolFee {
+        /// Borrower address on the opportunity that lacked a pool fee.
+        borrower: alloy::primitives::Address,
+    },
+
+    /// The supplied `pool_fee` does not fit in the on-chain `uint24`
+    /// slot. The Solidity struct declares `swapPoolFee` as `uint24`
+    /// (PancakeSwap V3's fee-tier domain maxes at 10_000), so any
+    /// value greater than 2^24 - 1 is either a programming error in
+    /// the router or a sign the off-chain type should be tightened.
+    #[error(
+        "batcher: pool_fee {got} does not fit in uint24 (on-chain limit {limit}) \
+         for borrower {borrower:#x}"
+    )]
+    PoolFeeOutOfRange {
+        /// Borrower address on the offending opportunity.
+        borrower: alloy::primitives::Address,
+        /// Fee that overflowed the `uint24` slot.
+        got: u32,
+        /// Largest value representable as `uint24` (2^24 - 1).
+        limit: u32,
     },
 
     /// `SolCall::abi_encode` returned an error. Wrapped so the caller
@@ -219,9 +271,12 @@ pub struct LiquidationBatch {
     pub chain_id: u64,
     /// Opportunities in profit-desc order, length in `[2, MAX_BATCH_SIZE]`.
     pub opportunities: Vec<LiquidationOpportunity>,
-    /// Sum of `net_profit_usd_cents` across the batch — used by the
-    /// caller to rank batches against single-opportunity txs.
-    pub total_net_usd_cents: u64,
+    /// Sum of `net_profit_wei` across the batch — used by the caller
+    /// to rank batches against single-opportunity txs. Kept in wei
+    /// (the same domain as [`LiquidationOpportunity::net_profit_wei`])
+    /// so ranking never crosses a USD-cent boundary where rounding
+    /// could flip the comparison.
+    pub total_net_profit_wei: U256,
 }
 
 /// Stateless planner — construct once per process.
@@ -274,14 +329,14 @@ impl Batcher {
             if chunk.len() < 2 {
                 continue;
             }
-            let total_net_usd_cents = chunk
+            let total_net_profit_wei = chunk
                 .iter()
-                .map(|o| o.net_profit_usd_cents)
-                .fold(0u64, u64::saturating_add);
+                .map(|o| o.net_profit_wei)
+                .fold(U256::ZERO, U256::saturating_add);
             out.push(LiquidationBatch {
                 chain_id: BSC_CHAIN_ID,
                 opportunities: chunk.to_vec(),
-                total_net_usd_cents,
+                total_net_profit_wei,
             });
         }
         debug!(batch_count = out.len(), "batcher planned");
@@ -333,14 +388,57 @@ impl Batcher {
             });
         }
 
+        // Largest value representable as `uint24`: 2^24 - 1. Any
+        // larger fee lands outside the on-chain slot and would either
+        // truncate silently (our Rust domain is `u32`) or revert on
+        // ABI-encode. Keep the constant local so the error message
+        // and the guard never drift.
+        const UINT24_MAX: u32 = (1u32 << 24) - 1;
+
         let mut items = Vec::with_capacity(opps);
         for (opp, params) in batch.opportunities.iter().zip(params.iter()) {
-            let LiquidationParams::Venus {
-                borrower,
-                collateral_vtoken,
-                debt_vtoken,
-                repay_amount,
-            } = params;
+            // Exhaustive match with a wildcard arm. `LiquidationParams`
+            // is `#[non_exhaustive]` at the enum level, so a refutable
+            // `let LiquidationParams::Venus { .. } = params;` outside
+            // the defining crate would fail to compile. Mirrors the
+            // same discipline as `TxBuilder::encode_calldata` so the
+            // two encoders behave identically when a new variant
+            // (AaveV3, Compound, Morpho…) lands in `charon-core` and
+            // reaches the batcher before batch support has been
+            // taught to emit its calldata.
+            let (borrower, collateral_vtoken, debt_vtoken, repay_amount) = match params {
+                LiquidationParams::Venus {
+                    borrower,
+                    collateral_vtoken,
+                    debt_vtoken,
+                    repay_amount,
+                } => (borrower, collateral_vtoken, debt_vtoken, repay_amount),
+                other => {
+                    return Err(BatcherError::UnsupportedProtocol(format!("{other:?}")));
+                }
+            };
+
+            // PancakeSwap V3 fee tier. `None` means a fee-less route
+            // (Curve stable pool, Balancer V2, …) which the on-chain
+            // `CharonLiquidator` does not support: it calls
+            // `ISwapRouter.exactInputSingle` unconditionally and
+            // requires `swapPoolFee > 0` inside `_initiateFlashLoan`.
+            // Refuse the calldata here rather than emit a tx that
+            // would revert with `"!swapPoolFee"` on-chain.
+            let fee_u32 = opp.swap_route.pool_fee.ok_or(BatcherError::MissingPoolFee {
+                borrower: *borrower,
+            })?;
+            if fee_u32 > UINT24_MAX {
+                return Err(BatcherError::PoolFeeOutOfRange {
+                    borrower: *borrower,
+                    got: fee_u32,
+                    limit: UINT24_MAX,
+                });
+            }
+            // `alloy::primitives::aliases::U24` is the sol! target
+            // type; it accepts `u32` via `from` on values that fit.
+            let swap_pool_fee = alloy::primitives::aliases::U24::from(fee_u32);
+
             items.push(BatchParams {
                 protocolId: PROTOCOL_VENUS,
                 borrower: *borrower,
@@ -350,6 +448,7 @@ impl Batcher {
                 collateralVToken: *collateral_vtoken,
                 repayAmount: *repay_amount,
                 minSwapOut: opp.swap_route.min_amount_out,
+                swapPoolFee: swap_pool_fee,
             });
         }
 
@@ -380,18 +479,28 @@ impl Batcher {
     /// already built by the submitter wiring. The `provider` is the
     /// same alloy `Provider` used by the scanner/executor — no
     /// bespoke transport plumbing.
+    ///
+    /// `gas_limit` must match (or exceed) what the real broadcast
+    /// will use. Main's [`Simulator::simulate`] takes this explicitly
+    /// so the simulation cannot under-provision gas relative to the
+    /// broadcast and pass here only to revert on-chain as
+    /// out-of-gas. A batch call uses roughly
+    /// `single_liq_gas * n + calldata_overhead`; the caller is
+    /// expected to size it using [`GasOracle::estimate_gas_units`]
+    /// on the same calldata.
     pub async fn simulate<P, T>(
         &self,
         provider: &P,
         simulator: &Simulator,
         calldata: UnsimulatedBatchCalldata,
+        gas_limit: u64,
     ) -> Result<SimulatedBatchCalldata, BatcherError>
     where
         P: Provider<T>,
         T: alloy::transports::Transport + Clone,
     {
         simulator
-            .simulate(provider, calldata.as_bytes().clone())
+            .simulate(provider, calldata.as_bytes().clone(), gas_limit)
             .await
             .map_err(|err| BatcherError::SimulationFailed(format!("{err:#}")))?;
         Ok(SimulatedBatchCalldata(calldata.0))
@@ -410,7 +519,7 @@ mod tests {
     use alloy::primitives::{Address, U256, address, keccak256};
     use charon_core::{FlashLoanSource, Position, ProtocolId, SwapRoute};
 
-    fn mk_opp(chain_id: u64, net_cents: u64, borrower_byte: u8) -> LiquidationOpportunity {
+    fn mk_opp(chain_id: u64, net_wei: u64, borrower_byte: u8) -> LiquidationOpportunity {
         let mut bytes = [0u8; 20];
         bytes[19] = borrower_byte;
         LiquidationOpportunity {
@@ -433,9 +542,9 @@ mod tests {
                 token_out: address!("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
                 amount_in: U256::from(275u64),
                 min_amount_out: U256::from(260u64),
-                pool_fee: 3_000,
+                pool_fee: Some(3_000),
             },
-            net_profit_usd_cents: net_cents,
+            net_profit_wei: U256::from(net_wei),
         }
     }
 
@@ -470,7 +579,7 @@ mod tests {
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].chain_id, 56);
         assert_eq!(out[0].opportunities.len(), 3);
-        assert_eq!(out[0].total_net_usd_cents, 600);
+        assert_eq!(out[0].total_net_profit_wei, U256::from(600u64));
     }
 
     /// v0.1 is BSC-only. A non-BSC opportunity is a programming error,
@@ -530,18 +639,19 @@ mod tests {
     /// selector. If either the function name or the struct shape drifts
     /// from `CharonLiquidator.sol`, this test fails before any tx is
     /// ever built. The signature must exactly mirror the Solidity
-    /// declaration — v0.1 has eight tuple fields and no `swapPoolFee`.
+    /// declaration — nine tuple fields including the trailing
+    /// `uint24 swapPoolFee` that backs the per-opportunity fee-tier
+    /// routing in `executeOperation`.
     #[test]
     fn encode_calldata_has_batch_execute_selector() {
-        const CANONICAL_SIG: &str =
-            "batchExecute((uint8,address,address,address,address,address,uint256,uint256)[])";
+        const CANONICAL_SIG: &str = "batchExecute((uint8,address,address,address,address,address,uint256,uint256,uint24)[])";
         let digest = keccak256(CANONICAL_SIG.as_bytes());
         let expected: [u8; 4] = [digest[0], digest[1], digest[2], digest[3]];
 
         let batch = LiquidationBatch {
             chain_id: 56,
             opportunities: vec![mk_opp(56, 100, 1), mk_opp(56, 200, 2)],
-            total_net_usd_cents: 300,
+            total_net_profit_wei: U256::from(300u64),
         };
         let params = vec![mk_params(1), mk_params(2)];
         let wrapped = Batcher::with_default_size()
@@ -564,7 +674,7 @@ mod tests {
         let batch = LiquidationBatch {
             chain_id: 56,
             opportunities: vec![mk_opp(56, 100, 1), mk_opp(56, 200, 2)],
-            total_net_usd_cents: 300,
+            total_net_profit_wei: U256::from(300u64),
         };
         let params = vec![mk_params(1)]; // only one
         let err = Batcher::with_default_size()
@@ -594,7 +704,7 @@ mod tests {
         let params: Vec<_> = (1u8..=over).map(mk_params).collect();
         let batch = LiquidationBatch {
             chain_id: 56,
-            total_net_usd_cents: 0,
+            total_net_profit_wei: U256::ZERO,
             opportunities: opps,
         };
         let err = Batcher::with_default_size()
@@ -604,6 +714,54 @@ mod tests {
             BatcherError::BatchTooLarge { len, limit } => {
                 assert_eq!(len, SOLIDITY_MAX_BATCH_SIZE + 1);
                 assert_eq!(limit, SOLIDITY_MAX_BATCH_SIZE);
+            }
+            other => panic!("wrong error variant: {other:?}"),
+        }
+    }
+
+    /// A fee-less swap route is a programming error for the Venus /
+    /// PancakeSwap V3 pipeline: the on-chain executor requires a
+    /// non-zero `swapPoolFee`. Reject at encode time.
+    #[test]
+    fn encode_calldata_rejects_missing_pool_fee() {
+        let mut opp1 = mk_opp(56, 100, 1);
+        let opp2 = mk_opp(56, 200, 2);
+        opp1.swap_route.pool_fee = None;
+        let batch = LiquidationBatch {
+            chain_id: 56,
+            total_net_profit_wei: U256::from(300u64),
+            opportunities: vec![opp1, opp2],
+        };
+        let params = vec![mk_params(1), mk_params(2)];
+        let err = Batcher::with_default_size()
+            .encode_calldata(&batch, &params)
+            .expect_err("None pool_fee must error");
+        match err {
+            BatcherError::MissingPoolFee { borrower: _ } => {}
+            other => panic!("wrong error variant: {other:?}"),
+        }
+    }
+
+    /// `swapPoolFee` is `uint24` on-chain; a `u32` that overflows
+    /// that slot must be caught here and not silently truncate.
+    #[test]
+    fn encode_calldata_rejects_pool_fee_out_of_range() {
+        let mut opp1 = mk_opp(56, 100, 1);
+        let opp2 = mk_opp(56, 200, 2);
+        opp1.swap_route.pool_fee = Some(1u32 << 24); // 2^24, one past uint24 max
+        let batch = LiquidationBatch {
+            chain_id: 56,
+            total_net_profit_wei: U256::from(300u64),
+            opportunities: vec![opp1, opp2],
+        };
+        let params = vec![mk_params(1), mk_params(2)];
+        let err = Batcher::with_default_size()
+            .encode_calldata(&batch, &params)
+            .expect_err("overflow pool_fee must error");
+        match err {
+            BatcherError::PoolFeeOutOfRange { got, limit, .. } => {
+                assert_eq!(got, 1u32 << 24);
+                assert_eq!(limit, (1u32 << 24) - 1);
             }
             other => panic!("wrong error variant: {other:?}"),
         }

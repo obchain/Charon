@@ -22,3 +22,10 @@ anyhow = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 dotenvy = { workspace = true }
+secrecy = { workspace = true }
+async-trait = { workspace = true }
+futures-util = { workspace = true }
+metrics = { workspace = true }
+
+[lints]
+workspace = true

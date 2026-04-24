@@ -9,6 +9,7 @@ description = "Flash-loan source adapters and router for Charon"
 charon-core = { workspace = true }
 alloy = { workspace = true }
 anyhow = { workspace = true }
+thiserror = { workspace = true }
 async-trait = { workspace = true }
 tracing = { workspace = true }
 
