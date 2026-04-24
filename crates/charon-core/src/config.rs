@@ -9,7 +9,7 @@
 //! ```
 
 use alloy::primitives::{Address, U256};
-use secrecy::SecretString;
+use secrecy::{ExposeSecret, SecretString};
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::fmt;
@@ -475,9 +475,52 @@ impl Config {
     /// Parse an already-loaded TOML string (used by tests and embedded configs).
     pub fn from_str(raw: &str) -> Result<Self> {
         let substituted = substitute_env_vars(raw)?;
-        let config: Config = toml::from_str(&substituted)?;
+        let mut config: Config = toml::from_str(&substituted)?;
+        // Collapse any `Some(SecretString(""))` to `None` BEFORE
+        // validation. The serde path already maps empty-string TOML
+        // literals to `None` via `deser_optional_secret`, but a caller
+        // that constructs `Config` programmatically (tests, future
+        // builders, overrides) can still plant a `Some("")` past the
+        // serde layer. Running the normalizer here is defense in depth
+        // so `validate()`'s `is_none()` gates fire on any empty secret
+        // regardless of how it got into the struct.
+        config.normalize_empty_secrets();
         config.validate()?;
         Ok(config)
+    }
+
+    /// Collapse every empty `Option<SecretString>` value to `None`.
+    ///
+    /// `substitute_env_vars` replaces a `${VAR}` placeholder with the
+    /// literal env-var value. When an operator leaves, e.g.,
+    /// `CHARON_BSC_PRIVATE_RPC_AUTH=` blank in `.env`, the substituted
+    /// TOML field becomes `""`. The custom `deser_optional_secret`
+    /// hook already maps that to `None` at the serde layer, but any
+    /// programmatic construction of the struct (tests, CLI overrides,
+    /// future builder APIs) can still hand us a `Some(SecretString(""))`.
+    /// Without this pass, `Config::validate`'s `is_none()` gate on
+    /// `private_rpc_url` would misfire and the bot would start with
+    /// either no private RPC or a blank `Authorization: Bearer` header.
+    ///
+    /// The check peeks at the raw bytes via `ExposeSecret` only long
+    /// enough to run `is_empty()`; the exposed string is never logged,
+    /// stored, or compared to anything else.
+    fn normalize_empty_secrets(&mut self) {
+        fn is_empty(s: &SecretString) -> bool {
+            s.expose_secret().is_empty()
+        }
+
+        if self.bot.signer_key.as_ref().is_some_and(is_empty) {
+            self.bot.signer_key = None;
+        }
+        for chain_cfg in self.chain.values_mut() {
+            if chain_cfg.private_rpc_url.as_ref().is_some_and(is_empty) {
+                chain_cfg.private_rpc_url = None;
+            }
+            if chain_cfg.private_rpc_auth.as_ref().is_some_and(is_empty) {
+                chain_cfg.private_rpc_auth = None;
+            }
+        }
     }
 
     /// Cross-reference chain keys, reject sentinel zero addresses, and
@@ -939,6 +982,134 @@ mod private_rpc_tests {
         let c: ChainConfig = toml::from_str(toml_src).expect("parse");
         let url = c.private_rpc_url.expect("url present");
         assert_eq!(url.expose_secret(), "https://priv.example/rpc");
+    }
+
+    // ---------------------------------------------------------------------
+    // normalize_empty_secrets tests
+    //
+    // These lock in the defense-in-depth pass that collapses every
+    // `Some(SecretString(""))` planted past the serde layer to `None`
+    // before `Config::validate` runs. The failure mode they protect
+    // against: a caller (tests, CLI override, programmatic builder)
+    // constructs a `Config` with an empty `SecretString`, bypassing
+    // `deser_optional_secret`, and `validate()`'s `is_none()` gate on
+    // `private_rpc_url` silently passes — starting the bot with no
+    // private RPC or a blank `Authorization: Bearer` header.
+
+    #[test]
+    fn normalize_empty_signer_key_collapses_to_none() {
+        let mut cfg = base(chain_cfg(Some("https://priv.example"), false));
+        cfg.bot.signer_key = Some(SecretString::from(String::new()));
+        cfg.normalize_empty_secrets();
+        assert!(
+            cfg.bot.signer_key.is_none(),
+            "empty signer_key must collapse to None"
+        );
+    }
+
+    #[test]
+    fn normalize_empty_private_rpc_url_triggers_private_rpc_required() {
+        // Planting `Some(SecretString(""))` past the serde layer and
+        // then running `from_str`'s normalize + validate pipeline must
+        // leave `private_rpc_url = None` and fire `PrivateRpcRequired`.
+        let mut c = chain_cfg(None, false);
+        c.private_rpc_url = Some(SecretString::from(String::new()));
+        let mut cfg = base(c);
+        cfg.normalize_empty_secrets();
+        let chain = cfg.chain.get("bnb").expect("chain present");
+        assert!(
+            chain.private_rpc_url.is_none(),
+            "empty private_rpc_url must collapse to None"
+        );
+        let err = cfg
+            .validate()
+            .expect_err("empty-substituted url must fail validate()");
+        match err {
+            ConfigError::PrivateRpcRequired { chain } => assert_eq!(chain, "bnb"),
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn normalize_empty_private_rpc_auth_collapses_to_none() {
+        let mut c = chain_cfg(Some("https://priv.example"), false);
+        c.private_rpc_auth = Some(SecretString::from(String::new()));
+        let mut cfg = base(c);
+        cfg.normalize_empty_secrets();
+        let chain = cfg.chain.get("bnb").expect("chain present");
+        assert!(
+            chain.private_rpc_auth.is_none(),
+            "empty private_rpc_auth must collapse to None"
+        );
+    }
+
+    #[test]
+    fn normalize_preserves_non_empty_secrets() {
+        let mut c = chain_cfg(Some("https://priv.example"), false);
+        c.private_rpc_auth = Some(SecretString::from("token".to_string()));
+        let mut cfg = base(c);
+        cfg.bot.signer_key = Some(SecretString::from("0xdeadbeef".to_string()));
+        cfg.normalize_empty_secrets();
+        assert_eq!(
+            cfg.bot
+                .signer_key
+                .as_ref()
+                .expect("signer preserved")
+                .expose_secret(),
+            "0xdeadbeef"
+        );
+        let chain = cfg.chain.get("bnb").expect("chain present");
+        assert_eq!(
+            chain
+                .private_rpc_url
+                .as_ref()
+                .expect("url preserved")
+                .expose_secret(),
+            "https://priv.example"
+        );
+        assert_eq!(
+            chain
+                .private_rpc_auth
+                .as_ref()
+                .expect("auth preserved")
+                .expose_secret(),
+            "token"
+        );
+    }
+
+    #[test]
+    fn normalize_walks_every_chain_independently() {
+        // One chain carries an empty url + empty auth; another carries
+        // a real url + real auth. The normalizer must collapse per
+        // field per chain without cross-contamination.
+        let mut empty = chain_cfg(None, true);
+        empty.private_rpc_url = Some(SecretString::from(String::new()));
+        empty.private_rpc_auth = Some(SecretString::from(String::new()));
+        let mut set = chain_cfg(Some("https://priv.example"), false);
+        set.private_rpc_auth = Some(SecretString::from("token".to_string()));
+
+        let mut cfg = base(empty);
+        cfg.chain.insert("l2".to_string(), set);
+        cfg.normalize_empty_secrets();
+
+        let bnb = cfg.chain.get("bnb").expect("bnb present");
+        assert!(bnb.private_rpc_url.is_none(), "empty url collapsed");
+        assert!(bnb.private_rpc_auth.is_none(), "empty auth collapsed");
+        let l2 = cfg.chain.get("l2").expect("l2 present");
+        assert_eq!(
+            l2.private_rpc_url
+                .as_ref()
+                .expect("url preserved")
+                .expose_secret(),
+            "https://priv.example"
+        );
+        assert_eq!(
+            l2.private_rpc_auth
+                .as_ref()
+                .expect("auth preserved")
+                .expose_secret(),
+            "token"
+        );
     }
 }
 
