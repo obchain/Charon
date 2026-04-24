@@ -255,6 +255,20 @@ impl VenusAdapter {
     pub async fn markets(&self) -> Vec<Address> {
         self.snapshot.read().await.markets.clone()
     }
+    /// Underlying ERC-20 addresses currently known to the adapter.
+    /// Used by `TokenMetaCache::build` to discover the set of tokens
+    /// the profit gate will need metadata for. The returned vector
+    /// is a point-in-time snapshot; callers should rebuild if they
+    /// run past a `refresh()` boundary.
+    pub async fn underlying_tokens(&self) -> Vec<Address> {
+        self.snapshot
+            .read()
+            .await
+            .underlying_to_vtoken
+            .keys()
+            .copied()
+            .collect()
+    }
     pub async fn oracle(&self) -> Address {
         self.snapshot.read().await.oracle
     }

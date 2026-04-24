@@ -70,6 +70,7 @@ use charon_protocols::VenusAdapter;
 use charon_scanner::{
     BlockListener, ChainEvent, ChainProvider, DEFAULT_MAX_AGE, HealthScanner, MempoolMonitor,
     OracleUpdate, PendingCache, PositionBucket, PriceCache, ScanScheduler, SimulationVerdict,
+    TokenMetaCache,
 };
 use clap::{Parser, Subcommand};
 use secrecy::ExposeSecret;
@@ -102,10 +103,20 @@ const CHAIN_EVENT_CHANNEL: usize = 1024;
 /// per-route config once the router produces live quotes.
 const DEFAULT_SLIPPAGE_BPS: u16 = 50;
 
-/// Placeholder gas estimate per liquidation tx, in debt-token wei.
-/// Replaced by live `eth_estimateGas × effective_gas_price × native /
-/// debt_price` once the gas oracle (#148) lands.
-const PLACEHOLDER_GAS_COST_DEBT_WEI: u128 = 3_000_000_000_000_000_000;
+/// Pre-broadcast gas-units estimate used by the profit gate. Venus
+/// liquidation path through the Aave flash-loan callback empirically
+/// lands in ~1.1-1.6M gas; we use 1.5M to avoid gating out profitable
+/// txs that would comfortably fit under the real `eth_estimateGas`
+/// result fetched at broadcast time. The actual gas limit sent on
+/// the wire is still `estimate_gas × 1.3` at broadcast time.
+const PROFIT_GATE_ROUGH_GAS_UNITS: u64 = 1_500_000;
+
+/// Native-asset Chainlink feed symbol on BSC. Used to price the gas
+/// cost estimate (gas_units × max_fee_per_gas in native wei) into
+/// debt-token wei via the ratio `native_price / debt_price`. If this
+/// feed is missing from the `PriceCache` the bot refuses to start —
+/// a missing BNB feed means the profit gate cannot be trusted.
+const NATIVE_FEED_SYMBOL: &str = "BNB";
 
 /// Gas limit supplied to `Simulator::simulate` until a real gas
 /// estimate is wired up. Sized to comfortably cover a Venus
@@ -126,16 +137,6 @@ const STATIC_GAS_FLOOR_DEBT_WEI: u128 = 3_000_000_000_000_000_000;
 /// slip past the on-chain backstop. Replaced by a configured value
 /// once USD → token pricing lands (#148).
 const MIN_PROFIT_FLOOR_DEBT_WEI: u128 = 1_000_000_000_000_000_000;
-
-/// Placeholder debt-token price (Chainlink 1e8 — 1 USD per token,
-/// appropriate for stablecoin debt). Overridden by the PriceCache
-/// feed per symbol once the price-cache → profit-calc bridge lands.
-const PLACEHOLDER_DEBT_PRICE_USD_1E8: u64 = 100_000_000;
-
-/// Placeholder debt-token decimals. Venus stablecoin debt on BSC is
-/// 18 (USDT/BUSD) so this is a safe fallback for v0.1. A real
-/// per-token decimals lookup lands alongside the price bridge.
-const PLACEHOLDER_DEBT_DECIMALS: u8 = 18;
 
 /// Wall-clock deadline for one per-block pipeline pass. If the
 /// adapter, router, or simulator stalls beyond this we abandon the
@@ -232,6 +233,21 @@ struct VenusPipeline {
     scanner: Arc<HealthScanner>,
     scheduler: ScanScheduler,
     prices: Arc<PriceCache>,
+    /// `(symbol, decimals)` for every Venus underlying the adapter
+    /// discovered at startup. Used by the profit gate to convert a
+    /// raw `repay_amount` into USD cents via `PriceCache` by symbol.
+    /// Missing metadata (RPC failure on `symbol()` or `decimals()`)
+    /// is treated the same as a missing price — the opportunity is
+    /// dropped, never priced with a guess.
+    token_meta: Arc<TokenMetaCache>,
+    /// Per-chain EIP-1559 fee source used by the profit gate. Separate
+    /// from `ExecHarness::gas_oracle` (which serves broadcast under
+    /// `--execute`) so the profit path is always able to price gas,
+    /// even in scan-only mode. Honours `bot.max_gas_wei` as the
+    /// ceiling and the chain's `priority_fee_gwei` as the tip; has its
+    /// own per-block cache so a tick with N liquidatable positions
+    /// still issues a single `get_block` call.
+    gas_oracle: Arc<GasOracle>,
     router: Arc<FlashLoanRouter>,
     liquidator: Address,
     provider: Arc<RootProvider<PubSubFrontend>>,
@@ -501,6 +517,55 @@ async fn run_listen(config: &Config, borrowers: Vec<Address>, execute: bool) -> 
                 }
             }
 
+            // Native-feed preflight. The profit gate converts gas
+            // cost (priced in native wei) into debt-token wei via the
+            // ratio `native_price / debt_price`. Without the native
+            // feed we would be guessing. Refuse to start rather than
+            // silently drop every opportunity.
+            if prices.get(NATIVE_FEED_SYMBOL).is_none() {
+                bail!(
+                    "chainlink feed for '{NATIVE_FEED_SYMBOL}' missing or stale on chain \
+                     '{chain_name}' — gas cost cannot be priced"
+                );
+            }
+
+            // Token metadata (symbol + decimals) for every Venus
+            // underlying. Queried once at startup; the profit gate
+            // needs both fields to convert a raw repay amount into
+            // USD cents via the price cache. A token whose meta
+            // calls fail is silently skipped by `TokenMetaCache` and
+            // will be seen as "unknown meta" by the profit gate (→
+            // opportunity dropped, not mispriced).
+            let underlyings = adapter.underlying_tokens().await;
+            let token_meta = Arc::new(
+                TokenMetaCache::build(provider.as_ref(), underlyings.iter().copied()).await,
+            );
+            info!(
+                chain = %chain_name,
+                tokens_cached = token_meta.len(),
+                "token metadata cache built"
+            );
+            if token_meta.is_empty() {
+                bail!(
+                    "token metadata cache is empty on chain '{chain_name}' — no Venus \
+                     underlying resolved its symbol/decimals; profit gate would drop every \
+                     opportunity. Check RPC and adapter wiring."
+                );
+            }
+
+            // Gas oracle wired into the profit gate so every
+            // opportunity is priced against the live base-fee
+            // observed on-chain, not a static debt-wei constant.
+            // ExecHarness builds its own oracle for broadcast; the
+            // per-block cache on each instance means both paths
+            // converge on one RPC call per tick even without
+            // sharing state.
+            let profit_gas_oracle = Arc::new(GasOracle::new_for_chain(
+                chain_name.clone(),
+                config.bot.max_gas_wei,
+                chain_cfg.priority_fee_gwei,
+            ));
+
             // Flash-loan router — Aave V3 on BSC for v0.1. Requires a
             // liquidator address (receiver) from [liquidator.<chain>]
             // so `executeOperation` can be dispatched back to our
@@ -635,6 +700,8 @@ async fn run_listen(config: &Config, borrowers: Vec<Address>, execute: bool) -> 
                         scanner,
                         scheduler,
                         prices,
+                        token_meta,
+                        gas_oracle: profit_gas_oracle,
                         router,
                         liquidator,
                         provider,
@@ -1197,22 +1264,146 @@ async fn process_opportunity(
         return Ok(false);
     };
 
-    // c. Profit calc — wei-native NetProfit breakdown. Until the
-    //    per-token USD pricing layer lands (#148), the debt price is
-    //    a stablecoin placeholder; the CLI is configured BSC-Venus
-    //    v0.1 with stablecoin debt so the figure is accurate for the
-    //    current deployment target.
-    let debt_price =
-        Price::new(PLACEHOLDER_DEBT_PRICE_USD_1E8).context("profit: invalid placeholder price")?;
+    // c. Profit calc — wei-native NetProfit breakdown with real
+    //    per-token pricing (#148 follow-up / #306). Every missing
+    //    piece of price/meta/gas data is a hard drop: the profit
+    //    gate is the last line of defence against broadcasting an
+    //    unprofitable tx, so a "maybe profitable" signal is never
+    //    produced against fallback values.
+    let Some(debt_meta) = pipeline.token_meta.get(&pos.debt_token) else {
+        charon_metrics::record_opportunity_dropped(chain, drop_stage::PROFIT);
+        debug!(
+            borrower = %pos.borrower,
+            debt_token = %pos.debt_token,
+            "no token metadata — dropped"
+        );
+        return Ok(false);
+    };
+    let Some(debt_cached) = pipeline.prices.get(&debt_meta.symbol) else {
+        charon_metrics::record_opportunity_dropped(chain, drop_stage::PROFIT);
+        debug!(
+            borrower = %pos.borrower,
+            symbol = %debt_meta.symbol,
+            "no chainlink price (or stale) — dropped"
+        );
+        return Ok(false);
+    };
+    let Some(native_cached) = pipeline.prices.get(NATIVE_FEED_SYMBOL) else {
+        charon_metrics::record_opportunity_dropped(chain, drop_stage::PROFIT);
+        debug!(
+            borrower = %pos.borrower,
+            "no native/USD price (or stale) — dropped"
+        );
+        return Ok(false);
+    };
+
+    // Chainlink answers arrive with the feed's native decimals
+    // (`decimals` is typically 8 on BSC but is read per-feed); the
+    // `Price` wire-format used by `ProfitInputs` is strictly 1e8.
+    // `scaled_to(8)` normalises both without relying on a constant.
+    let debt_price_1e8 = match u64::try_from(debt_cached.scaled_to(8)) {
+        Ok(v) if v > 0 => v,
+        _ => {
+            charon_metrics::record_opportunity_dropped(chain, drop_stage::PROFIT);
+            debug!(
+                borrower = %pos.borrower,
+                symbol = %debt_meta.symbol,
+                "debt price out of u64 range or zero — dropped"
+            );
+            return Ok(false);
+        }
+    };
+    let native_price_1e8 = match u64::try_from(native_cached.scaled_to(8)) {
+        Ok(v) if v > 0 => v,
+        _ => {
+            charon_metrics::record_opportunity_dropped(chain, drop_stage::PROFIT);
+            debug!(
+                borrower = %pos.borrower,
+                "native price out of u64 range or zero — dropped"
+            );
+            return Ok(false);
+        }
+    };
+    let debt_price = match Price::new(debt_price_1e8) {
+        Ok(p) => p,
+        Err(err) => {
+            charon_metrics::record_opportunity_dropped(chain, drop_stage::PROFIT);
+            debug!(borrower = %pos.borrower, error = ?err, "debt Price rejected");
+            return Ok(false);
+        }
+    };
+
+    // Gas cost in debt-token wei:
+    //
+    //   native_wei  = gas_units * max_fee_per_gas
+    //   debt_wei    = native_wei * native_price_1e8 / debt_price_1e8
+    //               * 10^debt_decimals / 10^native_decimals
+    //
+    // BSC native (BNB) is 18 decimals. We assume 18 here — the same
+    // assumption baked into `STATIC_GAS_FLOOR_DEBT_WEI` / previous
+    // placeholder pricing. A per-chain native-decimals lookup is a
+    // follow-up if non-EVM or non-18-dec native chains enter scope.
+    const NATIVE_DECIMALS: u8 = 18;
+    let gas_decision = match pipeline
+        .gas_oracle
+        .fetch_params(pipeline.provider.as_ref(), Some(block))
+        .await
+    {
+        Ok(d) => d,
+        Err(err) => {
+            charon_metrics::record_opportunity_dropped(chain, drop_stage::PROFIT);
+            debug!(
+                borrower = %pos.borrower,
+                error = ?err,
+                "gas oracle fetch failed — dropped"
+            );
+            return Ok(false);
+        }
+    };
+    let gas_params = match gas_decision {
+        GasDecision::Proceed(p) => p,
+        GasDecision::SkipCeilingExceeded {
+            max_fee_wei,
+            ceiling_wei,
+        } => {
+            charon_metrics::record_opportunity_dropped(chain, drop_stage::PROFIT);
+            debug!(
+                borrower = %pos.borrower,
+                %max_fee_wei,
+                %ceiling_wei,
+                "gas ceiling exceeded — dropped"
+            );
+            return Ok(false);
+        }
+        // `GasDecision` is `#[non_exhaustive]` — any future skip
+        // variant must fail closed rather than silently proceed.
+        _ => {
+            charon_metrics::record_opportunity_dropped(chain, drop_stage::PROFIT);
+            debug!(
+                borrower = %pos.borrower,
+                "unrecognised GasDecision variant — dropped"
+            );
+            return Ok(false);
+        }
+    };
+    let gas_cost_debt_wei = gas_cost_in_debt_wei(
+        PROFIT_GATE_ROUGH_GAS_UNITS,
+        gas_params.max_fee_per_gas,
+        native_price_1e8,
+        debt_price_1e8,
+        NATIVE_DECIMALS,
+        debt_meta.decimals,
+    );
+
     let opp_preview = preview_opportunity(pos, &quote, repay);
     let inputs = match ProfitInputs::from_opportunity(
         &opp_preview,
         opp_preview.expected_collateral_out,
         quote.fee,
-        U256::from(PLACEHOLDER_GAS_COST_DEBT_WEI),
+        gas_cost_debt_wei,
         DEFAULT_SLIPPAGE_BPS,
         debt_price,
-        PLACEHOLDER_DEBT_DECIMALS,
+        debt_meta.decimals,
     ) {
         Ok(i) => i,
         Err(err) => {
@@ -1495,6 +1686,107 @@ fn wei_to_usd_cents(wei: U256) -> u64 {
     let scale = U256::from(10u64).pow(U256::from(16u64));
     let cents = wei / scale;
     u64::try_from(cents).unwrap_or(u64::MAX)
+}
+
+/// Convert a gas cost originally denominated in the chain's native
+/// token (BNB on BSC) into the debt-token's wei, using Chainlink
+/// prices normalised to 1e8 and the two tokens' decimals.
+///
+/// ```text
+/// native_wei = gas_units * max_fee_per_gas
+/// debt_wei   = native_wei
+///            * native_price_1e8 / debt_price_1e8
+///            * 10^debt_decimals / 10^native_decimals
+/// ```
+///
+/// All math is `U256` with `saturating_mul`; a zero or pathological
+/// `debt_price_1e8` is caller-gated (see `process_opportunity`) so
+/// the divisor here is never zero in practice. `decimals > 18` is
+/// already rejected inside `ProfitInputs::from_opportunity`.
+fn gas_cost_in_debt_wei(
+    gas_units: u64,
+    max_fee_per_gas: u128,
+    native_price_1e8: u64,
+    debt_price_1e8: u64,
+    native_decimals: u8,
+    debt_decimals: u8,
+) -> U256 {
+    if debt_price_1e8 == 0 {
+        return U256::ZERO;
+    }
+    let native_wei =
+        U256::from(gas_units).saturating_mul(U256::from(max_fee_per_gas));
+    let usd_numerator = native_wei.saturating_mul(U256::from(native_price_1e8));
+    // Apply the decimal delta between native and debt. Two separate
+    // branches avoid `pow(0)` path-noise and keep the intent obvious.
+    let usd_scaled = match debt_decimals.cmp(&native_decimals) {
+        std::cmp::Ordering::Equal => usd_numerator,
+        std::cmp::Ordering::Greater => {
+            let diff = debt_decimals - native_decimals;
+            usd_numerator.saturating_mul(U256::from(10u64).pow(U256::from(diff)))
+        }
+        std::cmp::Ordering::Less => {
+            let diff = native_decimals - debt_decimals;
+            usd_numerator / U256::from(10u64).pow(U256::from(diff))
+        }
+    };
+    usd_scaled / U256::from(debt_price_1e8)
+}
+
+#[cfg(test)]
+mod gas_cost_in_debt_wei_tests {
+    use super::*;
+
+    #[test]
+    fn identical_tokens_and_prices_are_a_passthrough() {
+        // 100k gas * 10 gwei = 1e15 native wei. Same token, same
+        // price → same number of debt-wei.
+        let got = gas_cost_in_debt_wei(
+            100_000,
+            10_000_000_000u128, // 10 gwei
+            100_000_000,        // $1 @ 1e8
+            100_000_000,        // $1 @ 1e8
+            18,
+            18,
+        );
+        assert_eq!(got, U256::from(1_000_000_000_000_000u128));
+    }
+
+    #[test]
+    fn native_at_600_usd_debt_at_1_usd_scales_by_600() {
+        // 100k gas * 10 gwei = 1e15 native wei.
+        // BNB @ $600, USDT @ $1 → 6e17 USDT-wei (18 decimals each).
+        let got = gas_cost_in_debt_wei(
+            100_000,
+            10_000_000_000u128,
+            60_000_000_000u64, // $600 × 1e8
+            100_000_000,
+            18,
+            18,
+        );
+        assert_eq!(got, U256::from(600_000_000_000_000_000u128));
+    }
+
+    #[test]
+    fn debt_with_6_decimals_shrinks_by_1e12() {
+        // 100k gas * 10 gwei = 1e15 native wei.
+        // BNB @ $600, USDT @ $1, USDT is 6-dec → 6e5 USDT-wei.
+        let got = gas_cost_in_debt_wei(
+            100_000,
+            10_000_000_000u128,
+            60_000_000_000u64,
+            100_000_000,
+            18,
+            6,
+        );
+        assert_eq!(got, U256::from(600_000u64));
+    }
+
+    #[test]
+    fn zero_debt_price_returns_zero_not_panic() {
+        let got = gas_cost_in_debt_wei(100_000, 10_000_000_000u128, 60_000_000_000u64, 0, 18, 18);
+        assert_eq!(got, U256::ZERO);
+    }
 }
 
 /// Build the preview [`LiquidationOpportunity`] used as input to
