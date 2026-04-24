@@ -11,3 +11,6 @@ workspace = true
 [dependencies]
 alloy = { workspace = true }
 serde = { workspace = true }
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+thiserror = { workspace = true }

@@ -77,6 +77,30 @@ pub struct SwapRoute {
     pub pool_fee: Option<u32>,
 }
 
+/// Protocol-specific parameters needed to build a liquidation call.
+///
+/// Every lending protocol has its own quirks (Aave allows partial liquidation,
+/// Compound absorbs 100%, Venus uses vToken addresses, etc.). Each variant
+/// captures exactly the fields its protocol needs — no shared bag of options.
+///
+/// Marked `#[non_exhaustive]` at both enum and variant level so adding new
+/// variants (AaveV3, Compound, …) or new fields on existing variants is not
+/// a semver-breaking change for downstream exhaustive matches.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
+pub enum LiquidationParams {
+    #[non_exhaustive]
+    Venus {
+        borrower: Address,
+        /// vToken of the collateral asset (the token seized).
+        collateral_vtoken: Address,
+        /// vToken of the debt asset (the token repaid).
+        debt_vtoken: Address,
+        /// Amount of debt to repay, in underlying-debt-token units (not vToken units).
+        repay_amount: U256,
+    },
+}
+
 /// A profitable liquidation that has passed all off-chain gates and is
 /// ready to be built into a transaction.
 #[derive(Debug, Clone, Serialize, Deserialize)]

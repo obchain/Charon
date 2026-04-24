@@ -1138,7 +1138,10 @@ name = "charon-core"
 version = "0.1.0"
 dependencies = [
  "alloy",
+ "anyhow",
+ "async-trait",
  "serde",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
