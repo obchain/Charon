@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.24;
 
-import { Test } from "forge-std/Test.sol";
+import { Test, Vm } from "forge-std/Test.sol";
 import { CharonLiquidator } from "../src/CharonLiquidator.sol";
 import { IVToken } from "../src/interfaces/IVToken.sol";
 import { IWETH } from "../src/interfaces/IWETH.sol";
@@ -437,5 +437,176 @@ contract CharonLiquidatorForkTest is Test {
 
         vm.expectRevert(bytes("!swapPoolFee"));
         liquidator.executeLiquidation(p);
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // F. batchExecute — access control, bounds, and atomicity
+    // ─────────────────────────────────────────────────────────────────────────
+    //
+    // These tests do not require live fork state (onlyOwner / empty-array /
+    // ceiling / validation all revert before any external call), but the
+    // `liquidator` instance is only deployed inside setUp when a BSC RPC URL
+    // is provided. Each test therefore calls `_skipIfNoRpc()` so CI without
+    // `BNB_RPC_URL` skips cleanly rather than dereferencing the zero address.
+
+    /// @dev Builds a fully-valid `LiquidationParams` tuple used across the
+    ///      batchExecute tests below. All addresses point at the mock
+    ///      sentinels from the top of the file so the struct passes
+    ///      `_initiateFlashLoan`'s eight require guards; individual tests
+    ///      mutate a single field to trigger the specific revert path.
+    function _validParams() internal pure returns (CharonLiquidator.LiquidationParams memory) {
+        return CharonLiquidator.LiquidationParams({
+            protocolId: 3,
+            borrower: MOCK_BORROWER,
+            debtToken: MOCK_DEBT_TOKEN,
+            collateralToken: MOCK_COLL_TOKEN,
+            debtVToken: MOCK_DEBT_VTOKEN,
+            collateralVToken: MOCK_COLL_VTOKEN,
+            repayAmount: 1 ether,
+            minSwapOut: 1 ether,
+            swapPoolFee: 3000
+        });
+    }
+
+    /// @dev Non-owner calling batchExecute must revert with "!owner".
+    ///      No pool mock needed — onlyOwner fires before any other logic.
+    function test_batchExecute_revertsWhenNotOwner() public {
+        _skipIfNoRpc();
+
+        CharonLiquidator.LiquidationParams[] memory items =
+            new CharonLiquidator.LiquidationParams[](1);
+        items[0] = _validParams();
+
+        vm.prank(address(0xA11CE));
+        vm.expectRevert(bytes("!owner"));
+        liquidator.batchExecute(items);
+    }
+
+    /// @dev An empty array must revert with "!items".
+    ///      The owner calls with zero-length items; the bound check fires immediately.
+    function test_batchExecute_revertsOnEmptyItems() public {
+        _skipIfNoRpc();
+
+        CharonLiquidator.LiquidationParams[] memory items =
+            new CharonLiquidator.LiquidationParams[](0);
+
+        vm.expectRevert(bytes("!items"));
+        liquidator.batchExecute(items);
+    }
+
+    /// @dev An array of length 11 (> MAX_BATCH_SIZE = 10) must revert with "batch too large".
+    ///      All items are valid; the ceiling check fires before the loop.
+    function test_batchExecute_revertsWhenTooLarge() public {
+        _skipIfNoRpc();
+
+        // Build 11 valid items — the batch size ceiling fires before any iteration.
+        CharonLiquidator.LiquidationParams[] memory items =
+            new CharonLiquidator.LiquidationParams[](11);
+        for (uint256 i = 0; i < 11; i++) {
+            items[i] = _validParams();
+        }
+
+        vm.expectRevert(bytes("batch too large"));
+        liquidator.batchExecute(items);
+    }
+
+    /// @dev A two-item batch where item[0] has a zero borrower must revert with "!borrower".
+    ///      The entire batch reverts atomically — item[1] is never processed.
+    ///
+    ///      item[1] is valid and would reach flashLoanSimple if item[0] passed.
+    ///      We mock AAVE_V3_POOL_BSC.flashLoanSimple to be a no-op so that if the
+    ///      validation logic were ever incorrectly skipped and the call reached the pool,
+    ///      the test would not revert for the wrong reason. The expected revert is
+    ///      "!borrower" from _initiateFlashLoan's validation of item[0].
+    function test_batchExecute_revertsOnFirstItemValidation() public {
+        _skipIfNoRpc();
+
+        CharonLiquidator.LiquidationParams[] memory items =
+            new CharonLiquidator.LiquidationParams[](2);
+
+        // item[0]: invalid — zero borrower triggers "!borrower" inside _initiateFlashLoan.
+        items[0] = _validParams();
+        items[0].borrower = address(0);
+
+        // item[1]: fully valid — would reach flashLoanSimple if iteration 0 were skipped.
+        items[1] = _validParams();
+
+        // Stub the real Aave V3 Pool address (the constructor-bound AAVE_POOL)
+        // so item[1]'s flashLoanSimple would succeed silently in case validation
+        // is incorrectly bypassed. The real assertion is the revert below.
+        bytes memory flashLoanSig = abi.encodeWithSignature(
+            "flashLoanSimple(address,address,uint256,bytes,uint16)",
+            address(liquidator),
+            items[1].debtToken,
+            items[1].repayAmount,
+            abi.encode(items[1]),
+            uint16(0)
+        );
+        vm.mockCall(AAVE_V3_POOL_BSC, flashLoanSig, abi.encode());
+
+        // Expect the batch to revert with "!borrower" from item[0]'s validation.
+        // No state from item[1] survives — the revert is atomic.
+        vm.expectRevert(bytes("!borrower"));
+        liquidator.batchExecute(items);
+    }
+
+    /// @dev Mid-batch atomicity: item[0] is fully valid (flashLoanSimple stubbed to
+    ///      no-op so the loop can advance), item[1].borrower == address(0). The
+    ///      inner require on item[1] must revert with "!borrower" and, because the
+    ///      revert is atomic, no state from item[0] — including a BatchExecuted
+    ///      emission — must survive.
+    ///
+    ///      This locks in the NatSpec guarantee that BatchExecuted is emitted only
+    ///      on full-batch success: a 2-item batch that reverts on item[1] must not
+    ///      emit it. `vm.recordLogs` captures every event emitted during the call;
+    ///      after the revert the VM keeps the recorder state, and a scan over the
+    ///      captured topics confirms the BatchExecuted signature never appeared.
+    function test_batchExecute_revertsOnSecondItemValidation() public {
+        _skipIfNoRpc();
+
+        CharonLiquidator.LiquidationParams[] memory items =
+            new CharonLiquidator.LiquidationParams[](2);
+
+        // item[0]: fully valid — would reach flashLoanSimple if the loop runs.
+        items[0] = _validParams();
+
+        // item[1]: invalid — zero borrower triggers "!borrower" on iteration 1.
+        items[1] = _validParams();
+        items[1].borrower = address(0);
+
+        // Stub AAVE_V3_POOL_BSC.flashLoanSimple so item[0]'s _initiateFlashLoan
+        // succeeds silently and the loop actually advances to item[1]. Without
+        // this stub the pool call could revert for an unrelated reason and we
+        // could not distinguish "loop never advanced" from "validation on
+        // item[1] caught it".
+        bytes memory flashLoanSig = abi.encodeWithSignature(
+            "flashLoanSimple(address,address,uint256,bytes,uint16)",
+            address(liquidator),
+            items[0].debtToken,
+            items[0].repayAmount,
+            abi.encode(items[0]),
+            uint16(0)
+        );
+        vm.mockCall(AAVE_V3_POOL_BSC, flashLoanSig, abi.encode());
+
+        // Start event recording before the call. vm.recordLogs captures all logs
+        // emitted during the tx even if it ultimately reverts; combined with the
+        // expectRevert this lets us assert both "reverted with the right reason"
+        // and "no BatchExecuted snuck out before the revert point".
+        vm.recordLogs();
+
+        vm.expectRevert(bytes("!borrower"));
+        liquidator.batchExecute(items);
+
+        Vm.Log[] memory entries = vm.getRecordedLogs();
+        bytes32 batchExecutedSig = keccak256("BatchExecuted(uint256)");
+        for (uint256 i = 0; i < entries.length; i++) {
+            if (entries[i].topics.length > 0) {
+                assertTrue(
+                    entries[i].topics[0] != batchExecutedSig,
+                    "BatchExecuted must NOT be emitted on mid-batch revert"
+                );
+            }
+        }
     }
 }

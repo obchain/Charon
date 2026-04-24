@@ -12,8 +12,10 @@ import { IWETH } from "./interfaces/IWETH.sol";
 // CharonLiquidator — multi-chain flash-loan liquidation engine, v0.1
 //
 // Scope (v0.1): Venus Protocol on BNB Chain.
-//   1. Bot calls executeLiquidation() with repayment parameters.
-//   2. Contract requests a flash loan from Aave V3 (flashLoanSimple).
+//   1. Bot calls executeLiquidation() — single item — or batchExecute() — up
+//      to MAX_BATCH_SIZE items — with repayment parameters.
+//   2. Contract requests a flash loan from Aave V3 (flashLoanSimple) for each
+//      item (the batch path loops over _initiateFlashLoan).
 //   3. Aave calls back executeOperation(); inside we:
 //        a. Approve Venus vToken to spend the debt asset.
 //        b. Call vToken.liquidateBorrow() — repay debt, seize collateral vTokens.
@@ -29,10 +31,18 @@ import { IWETH } from "./interfaces/IWETH.sol";
 //   - executeOperation is only callable by the Aave Pool.
 //   - initiator must equal address(this) — prevents a malicious pool from
 //     invoking our callback with forged parameters.
-//   - Reentrancy guard on executeLiquidation (nonReentrant).
+//   - Reentrancy guard on executeLiquidation AND batchExecute (nonReentrant).
+//     The guard is held for the full duration of the batch loop; Aave re-enters
+//     executeOperation within the _entered == 2 window, which is the expected
+//     path. A malicious pool attempting to re-enter batchExecute or
+//     executeLiquidation mid-loop hits the guard and reverts.
 //   - executeOperation NOT guarded with nonReentrant: it is called by Aave mid-
-//     flash-loan, re-entering executeLiquidation's guard frame. The msg.sender
+//     flash-loan, re-entering the entry-point's guard frame. The msg.sender
 //     == AAVE_POOL gate is the equivalent protection for the callback.
+//   - batchExecute is EVM-atomic: any revert in any item reverts the whole
+//     batch. No partial state change survives. BatchExecuted is emitted only
+//     on full-batch success and observers must NOT treat its absence as
+//     partial progress.
 //   - Lingering approvals zeroed after each consume point (vToken, SwapRouter).
 //   - Profit is swept to the immutable COLD_WALLET, never to the hot wallet.
 //     This enforces the CLAUDE.md safety invariant: "hot wallet holds gas only".
@@ -44,8 +54,9 @@ import { IWETH } from "./interfaces/IWETH.sol";
 /// @notice On-chain executor for flash-loan-backed liquidations across DeFi protocols.
 ///         v0.1 supports Venus Protocol on BNB Chain.
 /// @dev Implements IFlashLoanSimpleReceiver for the Aave V3 flash-loan callback.
-///      The bot (hot wallet = owner) is the sole authorized caller of executeLiquidation.
-///      All profit is routed to the immutable cold wallet set at construction.
+///      The bot (hot wallet = owner) is the sole authorized caller of
+///      executeLiquidation and batchExecute. All profit is routed to the
+///      immutable cold wallet set at construction.
 contract CharonLiquidator is IFlashLoanSimpleReceiver {
     // ─────────────────────────────────────────────────────────────────────────
     // Protocol ID constants — must mirror the Rust `ProtocolId` enum order.
@@ -53,6 +64,12 @@ contract CharonLiquidator is IFlashLoanSimpleReceiver {
 
     /// @dev ProtocolId::Venus = 3 in the Rust enum (0-indexed: Aave=0, Compound=1, ...).
     uint8 internal constant PROTOCOL_VENUS = 3;
+
+    /// @dev Absolute ceiling on the number of liquidations in a single batchExecute call.
+    ///      The Rust batcher (`Batcher::MAX_BATCH_SIZE`) defaults to 3; 10 gives
+    ///      headroom for future tuning. Prevents a compromised owner key from
+    ///      burning unbounded gas in one tx.
+    uint256 internal constant MAX_BATCH_SIZE = 10;
 
     // ─────────────────────────────────────────────────────────────────────────
     // BNB Chain canonical addresses — hard-coded for the v0.1 BSC-only scope.
@@ -83,8 +100,9 @@ contract CharonLiquidator is IFlashLoanSimpleReceiver {
     // Immutable configuration — set once at construction, never changed.
     // ─────────────────────────────────────────────────────────────────────────
 
-    /// @notice The bot's hot wallet. Only address authorised to call executeLiquidation
-    ///         and rescue. By policy it holds gas only — profit is never routed here.
+    /// @notice The bot's hot wallet. Only address authorised to call
+    ///         executeLiquidation, batchExecute, and rescue. By policy it holds
+    ///         gas only — profit is never routed here.
     address public immutable owner;
 
     /// @notice Aave V3 Pool proxy on BNB Chain.
@@ -110,8 +128,9 @@ contract CharonLiquidator is IFlashLoanSimpleReceiver {
     ///      argument so executeOperation can decode them without extra storage.
     ///      Field layout must remain stable — the Rust side abi-encodes this struct.
     ///      NOTE: the companion Rust `LiquidationParams` builder lives in the
-    ///      charon-executor crate (landing in a later PR). When that crate is added
-    ///      it must mirror this layout exactly, including `swapPoolFee`.
+    ///      charon-executor crate. Its `BatchParams` (for `batchExecute`) and the
+    ///      `CharonLiquidationParams` (for `executeLiquidation`) must mirror this
+    ///      layout exactly, including `swapPoolFee`.
     struct LiquidationParams {
         /// @dev Protocol identifier. Must equal PROTOCOL_VENUS (3) for v0.1.
         uint8 protocolId;
@@ -166,6 +185,14 @@ contract CharonLiquidator is IFlashLoanSimpleReceiver {
     /// @param amount The amount transferred.
     event Rescued(address indexed token, address indexed to, uint256 amount);
 
+    /// @notice Emitted at the end of a successful batchExecute call.
+    /// @dev Emitted only on full-batch success. If any item in the batch reverts,
+    ///      the entire transaction reverts atomically and this event is NOT emitted.
+    ///      Observers can therefore treat a BatchExecuted emission as proof that all
+    ///      `count` flash loans initiated by this call completed successfully.
+    /// @param count The number of liquidations initiated in the batch.
+    event BatchExecuted(uint256 count);
+
     // ─────────────────────────────────────────────────────────────────────────
     // Modifiers
     // ─────────────────────────────────────────────────────────────────────────
@@ -176,11 +203,13 @@ contract CharonLiquidator is IFlashLoanSimpleReceiver {
         _;
     }
 
-    /// @dev Prevents reentrant calls into executeLiquidation.
+    /// @dev Prevents reentrant calls into executeLiquidation and batchExecute.
     ///      Uses 1/2 rather than 0/1 to avoid cold-write SSTORE costs on every call.
     ///      NOT applied to executeOperation — that function is called by Aave mid-
     ///      flash-loan and is already protected by the msg.sender == AAVE_POOL gate.
     ///      Applying nonReentrant to executeOperation would deadlock the flash loan.
+    ///      NOT applied to _initiateFlashLoan — it is an internal helper called with
+    ///      the guard already held by the outer entry point.
     modifier nonReentrant() {
         require(_entered == 1, "reentrant");
         _entered = 2;
@@ -212,16 +241,15 @@ contract CharonLiquidator is IFlashLoanSimpleReceiver {
     }
 
     // ─────────────────────────────────────────────────────────────────────────
-    // External — owner entry point
+    // External — owner entry points
     // ─────────────────────────────────────────────────────────────────────────
 
     /// @notice Initiates a flash-loan-backed liquidation of a Venus borrower.
-    /// @dev Called exclusively by the off-chain bot (owner). Encodes `params` and
-    ///      requests a flash loan from Aave V3; the actual liquidation logic executes
-    ///      atomically inside the executeOperation() callback.
+    /// @dev Called exclusively by the off-chain bot (owner). Delegates to
+    ///      _initiateFlashLoan after acquiring the reentrancy lock.
     ///
     ///      Flow:
-    ///        1. Validate inputs.
+    ///        1. Validate inputs (inside _initiateFlashLoan).
     ///        2. ABI-encode params to bytes.
     ///        3. Call IAaveV3Pool.flashLoanSimple — Aave transfers debtToken to this
     ///           contract then immediately calls executeOperation().
@@ -231,38 +259,41 @@ contract CharonLiquidator is IFlashLoanSimpleReceiver {
     ///
     /// @param params All parameters describing the Venus liquidation opportunity.
     function executeLiquidation(LiquidationParams calldata params) external onlyOwner nonReentrant {
-        // ── Input validation ──────────────────────────────────────────────────
-        require(params.protocolId == PROTOCOL_VENUS, "!protocolId");
-        require(params.borrower != address(0), "!borrower");
-        require(params.debtToken != address(0), "!debtToken");
-        require(params.collateralToken != address(0), "!collateralToken");
-        require(params.debtVToken != address(0), "!debtVToken");
-        require(params.collateralVToken != address(0), "!collateralVToken");
-        require(params.repayAmount > 0, "!repayAmount");
-        require(params.swapPoolFee > 0, "!swapPoolFee");
-        // On the vBNB path the underlying returned by Venus is native BNB, which
-        // the contract wraps into WBNB before swapping. Enforce that the caller
-        // declared WBNB as collateralToken so the swap leg routes through a real
-        // pool and post-swap balance checks read the correct token.
-        if (params.collateralVToken == VBNB) {
-            require(params.collateralToken == WBNB, "vBNB requires WBNB");
+        _initiateFlashLoan(params);
+    }
+
+    /// @notice Initiates multiple flash-loan-backed liquidations in a single transaction.
+    /// @dev Called exclusively by the off-chain bot (owner). Iterates over `items`
+    ///      and calls _initiateFlashLoan for each. A revert in any iteration reverts
+    ///      the entire batch atomically — there is no partial execution.
+    ///
+    ///      **Atomicity contract.** Execution is EVM-atomic. If any item reverts — on
+    ///      input validation inside _initiateFlashLoan, on the Aave flashLoanSimple
+    ///      call, inside executeOperation's Venus / PancakeSwap path, or on the final
+    ///      Aave repayment pull — all prior items in the same batch are also reverted
+    ///      and no state change from this call survives. Profits already swept to
+    ///      COLD_WALLET by earlier items are rolled back together with the rest of
+    ///      the state on revert. BatchExecuted is emitted only on full-batch success;
+    ///      observers must NOT treat the absence of a revert event as partial progress.
+    ///
+    ///      The nonReentrant guard is held for the full duration of the loop. Each
+    ///      _initiateFlashLoan invocation calls Aave's flashLoanSimple, which re-enters
+    ///      executeOperation within the _entered == 2 window; that is the expected and
+    ///      safe path. A malicious pool attempting to re-enter batchExecute mid-loop
+    ///      would hit the nonReentrant guard and revert.
+    ///
+    /// @param items Array of LiquidationParams, one per borrower to liquidate.
+    ///              Must be non-empty and no longer than MAX_BATCH_SIZE.
+    function batchExecute(LiquidationParams[] calldata items) external onlyOwner nonReentrant {
+        uint256 n = items.length;
+        require(n > 0, "!items");
+        require(n <= MAX_BATCH_SIZE, "batch too large");
+
+        for (uint256 i = 0; i < n; i++) {
+            _initiateFlashLoan(items[i]);
         }
 
-        // ── Encode params and request the flash loan ──────────────────────────
-        // Aave forwards `encoded` verbatim to executeOperation as the `data`
-        // argument; we decode it there to recover the liquidation parameters.
-        bytes memory encoded = abi.encode(params);
-
-        IAaveV3Pool(AAVE_POOL)
-            .flashLoanSimple(
-                address(this), // receiver — this contract implements the callback
-                params.debtToken, // asset   — the token we need to repay Venus with
-                params.repayAmount, // amount  — exact principal to borrow
-                encoded, // params  — forwarded to executeOperation
-                0 // referralCode — no referral
-            );
-        // Aave has pulled amount + premium via the allowance set in executeOperation.
-        // Nothing further to do in this frame.
+        emit BatchExecuted(n);
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -292,15 +323,15 @@ contract CharonLiquidator is IFlashLoanSimpleReceiver {
     ///        l. Return true.
     ///
     ///      NOTE: nonReentrant is intentionally NOT applied here. Applying it would
-    ///      deadlock the flash loan because executeLiquidation already holds the lock
-    ///      (_entered == 2) when Aave re-enters this callback within the same tx.
-    ///      The msg.sender == AAVE_POOL gate is the equivalent protection.
+    ///      deadlock the flash loan because executeLiquidation / batchExecute already
+    ///      holds the lock (_entered == 2) when Aave re-enters this callback within
+    ///      the same tx. The msg.sender == AAVE_POOL gate is the equivalent protection.
     ///
     /// @param asset     The flash-loaned ERC-20 token (must equal p.debtToken).
     /// @param amount    The flash-loan principal (must equal p.repayAmount).
     /// @param premium   The Aave fee owed on top of `amount`.
     /// @param initiator The address that initiated the flash loan (must be address(this)).
-    /// @param data      ABI-encoded LiquidationParams forwarded from executeLiquidation.
+    /// @param data      ABI-encoded LiquidationParams forwarded from _initiateFlashLoan.
     /// @return True on success; Aave reverts the entire tx if false is returned.
     function executeOperation(
         address asset,
@@ -476,18 +507,75 @@ contract CharonLiquidator is IFlashLoanSimpleReceiver {
     }
 
     // ─────────────────────────────────────────────────────────────────────────
+    // Internal — shared flash-loan initiator
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// @notice Validates `p`, encodes it, and requests a flashLoanSimple from Aave.
+    /// @dev Called by both executeLiquidation and batchExecute. Must NOT be decorated
+    ///      with nonReentrant — the caller already holds the lock. Adding nonReentrant
+    ///      here would deadlock the flash loan because Aave re-enters executeOperation
+    ///      (which runs inside _entered == 2) before this function returns.
+    ///
+    ///      The eight require guards here (including the vBNB→WBNB pairing check)
+    ///      are the single canonical validation point for any liquidation initiated
+    ///      by this contract. Keep input validation here; do not duplicate it in
+    ///      executeOperation, where the params arrive through abi.decode(data) and
+    ///      are re-checked only for asset/amount consistency with the flash-loan
+    ///      terms.
+    ///
+    /// @param p The fully-populated LiquidationParams for one liquidation.
+    function _initiateFlashLoan(LiquidationParams memory p) internal {
+        // ── Input validation ──────────────────────────────────────────────────
+        require(p.protocolId == PROTOCOL_VENUS, "!protocolId");
+        require(p.borrower != address(0), "!borrower");
+        require(p.debtToken != address(0), "!debtToken");
+        require(p.collateralToken != address(0), "!collateralToken");
+        require(p.debtVToken != address(0), "!debtVToken");
+        require(p.collateralVToken != address(0), "!collateralVToken");
+        require(p.repayAmount > 0, "!repayAmount");
+        require(p.swapPoolFee > 0, "!swapPoolFee");
+        // On the vBNB path the underlying returned by Venus is native BNB, which
+        // the contract wraps into WBNB before swapping. Enforce that the caller
+        // declared WBNB as collateralToken so the swap leg routes through a real
+        // pool and post-swap balance checks read the correct token.
+        if (p.collateralVToken == VBNB) {
+            require(p.collateralToken == WBNB, "vBNB requires WBNB");
+        }
+
+        // ── Encode params and request the flash loan ──────────────────────────
+        // Aave forwards `encoded` verbatim to executeOperation as the `data`
+        // argument; we decode it there to recover the liquidation parameters.
+        bytes memory encoded = abi.encode(p);
+
+        IAaveV3Pool(AAVE_POOL)
+            .flashLoanSimple(
+                address(this), // receiver — this contract implements the callback
+                p.debtToken, // asset   — the token we need to repay Venus with
+                p.repayAmount, // amount  — exact principal to borrow
+                encoded, // params  — forwarded to executeOperation
+                0 // referralCode — no referral
+            );
+        // Aave has pulled amount + premium via the allowance set in executeOperation.
+        // Nothing further to do in this frame.
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
     // Receive — native BNB is intentionally rejected
     // ─────────────────────────────────────────────────────────────────────────
     //
     // No `receive()` or `fallback()` is defined. Plain BNB transfers to this
     // contract revert. Rationale:
-    //   - v0.1 does not liquidate the vBNB native-BNB market; all supported
-    //     Venus markets settle collateral in ERC-20 (WBNB, BUSD, USDT, ...).
+    //   - v0.1 does not liquidate the vBNB native-BNB market at the protocol
+    //     level: the vBNB branch above would only fire if Venus `redeem()` on
+    //     vBNB could credit this contract with native BNB. Venus's current
+    //     vBNB implementation forwards native BNB via `.call{value:...}("")`,
+    //     which requires a `receive()` on the recipient; absent one, the
+    //     redeem reverts and the vBNB branch is unreachable end-to-end.
     //   - An open `receive()` would silently accumulate BNB from any sender,
     //     making misrouted funds hard to notice and providing free storage
     //     for griefers / mixers.
-    //   - If the vBNB market is added later, reintroduce a gated `receive()`
-    //     that requires `msg.sender == vBNB_MARKET` so only the Venus
+    //   - When the vBNB market is activated operationally, reintroduce a gated
+    //     `receive()` that requires `msg.sender == VBNB` so only the Venus
     //     contract can push native BNB into this contract during redeem.
     //
     // If BNB is ever trapped here (e.g. as a SELFDESTRUCT beneficiary), the

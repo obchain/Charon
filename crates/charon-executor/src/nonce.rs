@@ -212,7 +212,7 @@ mod tests {
 
         let mut all = Vec::with_capacity(THREADS * PER);
         for h in handles {
-            all.extend(h.join().unwrap());
+            all.extend(h.join().expect("test thread panicked"));
         }
         all.sort_unstable();
         all.dedup();
