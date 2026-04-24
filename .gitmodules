@@ -1,0 +1,13 @@
+; Submodule declarations for the Charon workspace.
+;
+; forge-std is pinned by gitlink to an exact commit — we deliberately do NOT
+; set a `branch = ...` line. Omitting `branch` means `git submodule update`
+; (without `--remote`) always checks out the commit recorded in the parent
+; repo's index, which is reproducible across machines and CI runs.
+;
+; Current pin: 2999b6563e1f07971a09d48b82f3fac910d72a05  (v1.15.0 + 15)
+; Bumping the pin requires a commit that updates the gitlink; do not run
+; `git submodule update --remote` in CI.
+[submodule "contracts/lib/forge-std"]
+	path = contracts/lib/forge-std
+	url = https://github.com/foundry-rs/forge-std

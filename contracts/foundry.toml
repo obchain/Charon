@@ -1,0 +1,30 @@
+[profile.default]
+src = "src"
+out = "out"
+libs = ["lib"]
+solc_version = "0.8.24"
+# BNB Chain's EVM is still at the Paris hard fork — it has not enabled the
+# Shanghai PUSH0 opcode. Without `evm_version = "paris"` the compiler emits
+# PUSH0 bytecode (default for solc >= 0.8.20) and deployed contracts revert
+# on first touch. This setting is load-bearing for v0.1 BSC-only scope.
+evm_version = "paris"
+optimizer = true
+optimizer_runs = 1_000_000
+via_ir = false
+remappings = [
+    "forge-std/=lib/forge-std/src/",
+]
+
+# Forge fmt — 100-char width, 4-space indent — matches the Rust side.
+[fmt]
+line_length = 100
+tab_width = 4
+bracket_spacing = true
+
+# Fork-test endpoint for BSC mainnet — `BNB_HTTP_URL` from the repo
+# `.env`. Aliased here so test scripts can pass `--fork-url bnb`.
+[rpc_endpoints]
+bnb = "${BNB_HTTP_URL}"
+
+[etherscan]
+bnb = { key = "${BSCSCAN_API_KEY}", chain = 56 }
