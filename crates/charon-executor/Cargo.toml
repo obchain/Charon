@@ -1,0 +1,20 @@
+[package]
+name = "charon-executor"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Transaction builder, simulator, and broadcaster for Charon"
+
+[dependencies]
+charon-core = { workspace = true }
+alloy = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tokio = { workspace = true }
+
+[dev-dependencies]
+dotenvy = { workspace = true }
+
+[lints]
+workspace = true

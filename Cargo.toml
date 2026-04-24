@@ -2,20 +2,12 @@
 resolver = "3"
 members = [
     "crates/charon-core",
+    "crates/charon-executor",
     "crates/charon-flashloan",
     "crates/charon-protocols",
     "crates/charon-scanner",
     "crates/charon-cli",
 ]
-
-[workspace.lints.rust]
-unsafe_code = "forbid"
-
-[workspace.lints.clippy]
-all = "warn"
-arithmetic_side_effects = "deny"
-cast_possible_truncation = "deny"
-unwrap_used = "deny"
 
 [workspace.package]
 version = "0.1.0"
@@ -66,6 +58,25 @@ dotenvy = "0.15"
 
 # Internal crates
 charon-core = { path = "crates/charon-core" }
+charon-executor = { path = "crates/charon-executor" }
 charon-flashloan = { path = "crates/charon-flashloan" }
 charon-protocols = { path = "crates/charon-protocols" }
 charon-scanner = { path = "crates/charon-scanner" }
+
+# Workspace-wide lints. Applied to any crate that opts in with
+# `[lints] workspace = true` in its own Cargo.toml.
+#
+# Safety invariants in CLAUDE.md (onlyOwner execute, sim gate, hot
+# wallet = gas only, flash-loan atomicity) assume the bot's off-chain
+# code does not silently panic on arithmetic edge cases or swallow
+# errors. `unsafe_code` is forbidden outright — nothing the bot does
+# needs it, and any new unsafe block should force a conscious
+# exception in the owning crate.
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+all = "warn"
+arithmetic_side_effects = "deny"
+cast_possible_truncation = "deny"
+unwrap_used = "deny"
