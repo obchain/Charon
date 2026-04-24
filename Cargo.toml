@@ -1,5 +1,5 @@
 [workspace]
-resolver = "2"
+resolver = "3"
 members = [
     "crates/charon-core",
     "crates/charon-executor",
@@ -34,6 +34,18 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # Error handling
 anyhow = "1"
+thiserror = "2"
+
+# Secret-holding wrapper (zeroes memory on drop, redacts from Debug).
+# `serde` feature lets `ChainConfig::private_rpc_*` deserialize directly
+# into `SecretString` via the TOML env-substitution layer.
+secrecy = { version = "0.10", features = ["serde"] }
+
+# URL parsing (scheme validation in the submitter)
+url = "2"
+
+# HTTP client (custom headers on private-RPC transport)
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 
 # Async trait objects
 async-trait = "0.1"
@@ -44,8 +56,20 @@ futures-util = "0.3"
 # Lock-free concurrent hashmap for scanner state
 dashmap = "6"
 
+# Backoff jitter
+rand = "0.8"
+
+# Prometheus-style metrics recorder facade
+metrics = "0.24"
+
+# Prometheus HTTP exporter — feat/22 #222 wires this into charon-metrics
+# and the supervised CLI task. `default-features = false` drops the
+# built-in tokio runtime hint so the workspace stays on our chosen
+# tokio version; `http-listener` is the only feature we need.
+metrics-exporter-prometheus = { version = "0.16", default-features = false, features = ["http-listener"] }
+
 # CLI
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4", features = ["derive", "env"] }
 
 # .env loader
 dotenvy = "0.15"
@@ -57,3 +81,21 @@ charon-flashloan = { path = "crates/charon-flashloan" }
 charon-metrics = { path = "crates/charon-metrics" }
 charon-protocols = { path = "crates/charon-protocols" }
 charon-scanner = { path = "crates/charon-scanner" }
+
+# Workspace-wide lints. Applied to any crate that opts in with
+# `[lints] workspace = true` in its own Cargo.toml.
+#
+# Safety invariants in CLAUDE.md (onlyOwner execute, sim gate, hot
+# wallet = gas only, flash-loan atomicity) assume the bot's off-chain
+# code does not silently panic on arithmetic edge cases or swallow
+# errors. `unsafe_code` is forbidden outright — nothing the bot does
+# needs it, and any new unsafe block should force a conscious
+# exception in the owning crate.
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+all = "warn"
+arithmetic_side_effects = "deny"
+cast_possible_truncation = "deny"
+unwrap_used = "deny"
