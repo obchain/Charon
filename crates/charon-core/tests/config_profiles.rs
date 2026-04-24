@@ -84,6 +84,14 @@ fn default_profile_parses() {
     assert_eq!(cfg.chain["bnb"].chain_id, 56);
     assert!(cfg.flashloan.contains_key("aave_v3_bsc"));
     assert!(cfg.metrics.enabled);
+    // Default profile is untagged — fork-branch relaxations must not
+    // trigger. Pair this with `fork_profile_parses_*` below so a
+    // future edit that accidentally tags default.toml as "fork" fails
+    // at least one test.
+    assert!(
+        cfg.bot.profile_tag.is_none(),
+        "default profile must NOT carry profile_tag — that marker is reserved for fork.toml"
+    );
 }
 
 #[test]
@@ -110,5 +118,91 @@ fn testnet_profile_parses_and_omits_flashloan() {
     assert!(
         cfg.chain["bnb"].allow_public_mempool,
         "testnet profile must opt in to public mempool — no private RPC on Chapel"
+    );
+    assert!(
+        cfg.bot.profile_tag.is_none(),
+        "testnet profile must NOT carry profile_tag=\"fork\" — that's reserved for fork.toml"
+    );
+}
+
+#[test]
+fn fork_profile_parses_and_targets_localhost() {
+    // `config/fork.toml` env substitution: only `CHARON_ANVIL_PORT`
+    // is referenced and it carries its own `:-8545` default, so no
+    // stubs are strictly required. We still pass an empty pairs list
+    // so the fixture helper panics loudly if a future edit adds a
+    // new `${VAR}` without a default — forcing the test to be
+    // updated alongside the TOML.
+    let fork_path = workspace_root().join("config/fork.toml");
+    let raw = load_with_stubbed_env(&fork_path, &[]);
+    let cfg = Config::from_str(&raw).expect("fork.toml should parse and validate");
+
+    assert_eq!(cfg.chain["bnb"].chain_id, 56);
+    assert!(
+        cfg.chain["bnb"].ws_url.starts_with("ws://127.0.0.1"),
+        "fork profile must point ws_url at the local anvil instance, got {}",
+        cfg.chain["bnb"].ws_url
+    );
+    assert!(
+        cfg.chain["bnb"].http_url.starts_with("http://127.0.0.1"),
+        "fork profile must point http_url at the local anvil instance, got {}",
+        cfg.chain["bnb"].http_url
+    );
+    assert!(
+        cfg.flashloan.contains_key("aave_v3_bsc"),
+        "fork profile keeps Aave V3 — mainnet state inherited by the fork"
+    );
+
+    // profile_tag guards the loopback-only invariant at startup (#254).
+    assert_eq!(
+        cfg.bot.profile_tag.as_deref(),
+        Some("fork"),
+        "fork profile must carry profile_tag=\"fork\" so Config::validate can lock down non-loopback RPCs"
+    );
+
+    // The `/metrics` exporter is authless — binding to 0.0.0.0 on a
+    // local demo laptop silently leaks scanner/wallet/gas state to
+    // LAN peers. Lock loopback-only for the fork profile explicitly.
+    assert!(
+        cfg.metrics.bind.ip().is_loopback(),
+        "fork profile metrics.bind must be a loopback address, got {}",
+        cfg.metrics.bind
+    );
+
+    // Lowered profit gate is the entire point of the fork profile —
+    // if a future edit accidentally raises it to match default.toml
+    // (or higher), demos silently stop firing on small staged
+    // positions and this assert catches it. Compare in 1e6 USD
+    // fixed-point (the post-feat/19 schema); f64 comparisons are not
+    // a thing any more.
+    let default_pairs = [
+        ("BNB_WS_URL", "wss://example/bnb"),
+        ("BNB_HTTP_URL", "https://example/bnb"),
+        ("CHARON_BSC_PRIVATE_RPC_URL", "https://example/bnb-private"),
+        ("CHARON_BSC_PRIVATE_RPC_AUTH", ""),
+        ("CHARON_SIGNER_KEY", ""),
+        ("CHARON_METRICS_AUTH_TOKEN", ""),
+    ];
+    let default_raw = load_with_stubbed_env(
+        &workspace_root().join("config/default.toml"),
+        &default_pairs,
+    );
+    let default_cfg = Config::from_str(&default_raw).expect("default.toml parses");
+    assert!(
+        cfg.bot.min_profit_usd_1e6 < default_cfg.bot.min_profit_usd_1e6,
+        "fork profile min_profit_usd_1e6 ({}) must be strictly lower than default profile ({}) — \
+         the fork is a demo-staging surface",
+        cfg.bot.min_profit_usd_1e6,
+        default_cfg.bot.min_profit_usd_1e6
+    );
+
+    // `[liquidator.bnb]` placeholder was dropped on feat/24 (commit
+    // 4969bb7) because its address(0) tripped TxBuilder encoding the
+    // moment the executor tried to build calldata (#252). Lock that
+    // in so a future refactor doesn't re-introduce a zero-address row.
+    assert!(
+        cfg.liquidator.is_empty(),
+        "fork profile must not ship a liquidator placeholder — deploy via forge and add \
+         [liquidator.bnb] post-fact"
     );
 }

@@ -51,6 +51,26 @@ pub enum ConfigError {
         /// Chain key (matches a `[chain.<name>]` section).
         chain: String,
     },
+    /// A `profile_tag = "fork"` profile has a chain whose `ws_url` /
+    /// `http_url` does not resolve to a loopback host. The fork
+    /// profile ships an intentionally lowered profit gate tuned for
+    /// local demo staging; pointing it at a non-loopback endpoint
+    /// (mainnet, testnet, or a remote RPC) would fire liquidations
+    /// against real state at that gate. Refused at load time —
+    /// operator must either flip back to `config/default.toml` or
+    /// point the fork profile at the local anvil it was built for.
+    #[error(
+        "profile_tag=\"fork\" is a local-only profile and must point every chain's ws_url/http_url at loopback; got chain.{chain}.{field}={url}. Refusing to start with a lowered profit gate against non-loopback RPC."
+    )]
+    ForkProfileNonLoopbackRpc {
+        /// Chain key (matches a `[chain.<name>]` section).
+        chain: String,
+        /// Which URL field failed the loopback check — `ws_url` or `http_url`.
+        field: &'static str,
+        /// The offending URL (post env-substitution) so the operator
+        /// sees exactly what to fix in the TOML.
+        url: String,
+    },
 }
 
 /// Shorthand `Result`.
@@ -260,6 +280,23 @@ pub struct BotConfig {
     /// non-empty value via the env var, never a literal in the file.
     #[serde(default, deserialize_with = "deser_optional_secret")]
     pub signer_key: Option<SecretString>,
+    /// Optional profile marker used by [`Config::validate`] to enforce
+    /// profile-specific invariants at startup. Known tags:
+    ///
+    /// - `Some("fork")` — marks `config/fork.toml`, a local-only
+    ///   profile that must target loopback RPCs because its profit
+    ///   gate is intentionally lowered for demo staging. Any chain
+    ///   with a non-loopback `ws_url` / `http_url` is rejected at
+    ///   load time ([`ConfigError::ForkProfileNonLoopbackRpc`]).
+    /// - `None` / `Some("mainnet")` / `Some("testnet")` — production
+    ///   profiles; no additional relaxations or invariants.
+    ///
+    /// Unknown tags parse without error (forward-compat) but carry no
+    /// semantics until a new match arm is wired into `validate()`. The
+    /// tag is not a secret — operators see it in `Debug` output so a
+    /// misconfigured profile is obvious at a glance.
+    #[serde(default)]
+    pub profile_tag: Option<String>,
 }
 
 impl fmt::Debug for BotConfig {
@@ -281,6 +318,7 @@ impl fmt::Debug for BotConfig {
                     "<unset>"
                 },
             )
+            .field("profile_tag", &self.profile_tag)
             .finish()
     }
 }
@@ -454,17 +492,43 @@ impl Config {
         if self.chain.is_empty() {
             return Err(ConfigError::Validation("no [chain.*] entries".into()));
         }
+        let is_fork = self.is_fork_profile();
+        // Fork-profile loopback gate runs BEFORE the mainnet-oriented
+        // private-mempool gate: pointing a lowered-profit fork profile
+        // at a remote RPC is a bigger footgun than a missing private
+        // RPC, and the error copy is more actionable.
+        if is_fork {
+            for (name, c) in &self.chain {
+                for (field, url) in [
+                    ("ws_url", c.ws_url.as_str()),
+                    ("http_url", c.http_url.as_str()),
+                ] {
+                    if !is_loopback_url(url) {
+                        return Err(ConfigError::ForkProfileNonLoopbackRpc {
+                            chain: name.clone(),
+                            field,
+                            url: url.to_string(),
+                        });
+                    }
+                }
+            }
+        }
         // Private-mempool gate: every configured chain must either carry
         // a `private_rpc_url` or explicitly opt in to the public mempool
         // via `allow_public_mempool = true`. Applying the check per
         // chain (rather than only per deployed liquidator) means a
         // misconfigured chain can never fall back to public broadcast
-        // later in the pipeline.
-        for (name, c) in &self.chain {
-            if c.private_rpc_url.is_none() && !c.allow_public_mempool {
-                return Err(ConfigError::PrivateRpcRequired {
-                    chain: name.clone(),
-                });
+        // later in the pipeline. The fork profile bypasses this gate
+        // entirely: the loopback invariant above already confines
+        // submission to the local anvil, and there is no public
+        // mempool on a local fork to front-run into.
+        if !is_fork {
+            for (name, c) in &self.chain {
+                if c.private_rpc_url.is_none() && !c.allow_public_mempool {
+                    return Err(ConfigError::PrivateRpcRequired {
+                        chain: name.clone(),
+                    });
+                }
             }
         }
         if self.bot.near_liq_threshold_bps <= self.bot.liquidatable_threshold_bps {
@@ -527,6 +591,65 @@ impl Config {
         self.metrics.validate()?;
         Ok(())
     }
+
+    /// Return `true` when this config represents the local anvil fork
+    /// profile (`config/fork.toml`). The check is intentionally narrow
+    /// — only the literal `"fork"` tag flips the relaxations in
+    /// [`Config::validate`]. Production profiles (`None`,
+    /// `Some("mainnet")`, `Some("testnet")`) never trigger the fork
+    /// branches.
+    fn is_fork_profile(&self) -> bool {
+        matches!(self.bot.profile_tag.as_deref(), Some("fork"))
+    }
+}
+
+/// Return `true` iff `url`'s host component is a loopback address.
+///
+/// Accepts `127.0.0.0/8`, `::1`, and the `localhost` hostname (case
+/// insensitive). Works against `http://`, `https://`, `ws://`, and
+/// `wss://` URLs; any scheme that uses the `scheme://host[:port]/…`
+/// shape is handled.
+///
+/// This is a string-level check, not a DNS resolve — the fork profile
+/// only needs to reject obviously-non-local URLs at config-load time.
+/// DNS-based `localhost` aliases that resolve off-loopback are
+/// sufficiently rare that we accept them here and rely on the operator
+/// not to shoot themselves in the foot with a pathological /etc/hosts.
+fn is_loopback_url(url: &str) -> bool {
+    let Some(after_scheme) = url.split_once("://").map(|(_, rest)| rest) else {
+        return false;
+    };
+    // Strip off userinfo if present ("user:pass@host").
+    let after_userinfo = after_scheme.rsplit_once('@').map_or(after_scheme, |(_, h)| h);
+    // Host ends at the first '/', '?', '#', or end-of-string.
+    let host_and_port = after_userinfo
+        .find(['/', '?', '#'])
+        .map_or(after_userinfo, |i| &after_userinfo[..i]);
+
+    // IPv6 literal: "[::1]:8545" → pull out "::1".
+    let host = if let Some(rest) = host_and_port.strip_prefix('[') {
+        match rest.find(']') {
+            Some(end) => &rest[..end],
+            None => return false,
+        }
+    } else {
+        // IPv4 / hostname: split off ":port" by rfind so hostnames with
+        // colons (none expected here) aren't mis-parsed.
+        host_and_port
+            .rsplit_once(':')
+            .map_or(host_and_port, |(h, _)| h)
+    };
+
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    if let Ok(v4) = host.parse::<std::net::Ipv4Addr>() {
+        return v4.is_loopback();
+    }
+    if let Ok(v6) = host.parse::<std::net::Ipv6Addr>() {
+        return v6.is_loopback();
+    }
+    false
 }
 
 fn deser_u256_string<'de, D>(d: D) -> std::result::Result<U256, D::Error>
@@ -736,6 +859,7 @@ mod private_rpc_tests {
                 warm_scan_blocks: 10,
                 cold_scan_blocks: 100,
                 signer_key: None,
+                profile_tag: None,
             },
             chain: chains,
             protocol: HashMap::new(),
@@ -815,5 +939,162 @@ mod private_rpc_tests {
         let c: ChainConfig = toml::from_str(toml_src).expect("parse");
         let url = c.private_rpc_url.expect("url present");
         assert_eq!(url.expose_secret(), "https://priv.example/rpc");
+    }
+}
+
+#[cfg(test)]
+mod fork_profile_tests {
+    //! Tests for the `profile_tag = "fork"` branch of
+    //! [`Config::validate`]. Exercise both directions:
+    //! - loopback URLs pass and bypass the private-RPC gate (so
+    //!   `fork.toml` can omit `allow_public_mempool` and
+    //!   `private_rpc_url`);
+    //! - non-loopback URLs fail with
+    //!   [`ConfigError::ForkProfileNonLoopbackRpc`] naming the
+    //!   offending chain + field.
+    //!
+    //! A parallel `url` helper block covers [`is_loopback_url`] across
+    //! every common RPC-URL shape the loader sees in practice.
+
+    use super::*;
+
+    fn fork_chain(ws: &str, http: &str) -> ChainConfig {
+        ChainConfig {
+            chain_id: 56,
+            ws_url: ws.into(),
+            http_url: http.into(),
+            priority_fee_gwei: 1,
+            private_rpc_url: None,
+            private_rpc_auth: None,
+            allow_public_mempool: false,
+        }
+    }
+
+    fn fork_cfg(chain: ChainConfig) -> Config {
+        let mut chains = HashMap::new();
+        chains.insert("bnb".to_string(), chain);
+        Config {
+            bot: BotConfig {
+                min_profit_usd_1e6: 10_000, // $0.01 — lowered for fork
+                max_gas_wei: U256::from(20_000_000_000u64),
+                scan_interval_ms: 1000,
+                liquidatable_threshold_bps: 10_000,
+                near_liq_threshold_bps: 10_500,
+                hot_scan_blocks: 1,
+                warm_scan_blocks: 10,
+                cold_scan_blocks: 100,
+                signer_key: None,
+                profile_tag: Some("fork".into()),
+            },
+            chain: chains,
+            protocol: HashMap::new(),
+            flashloan: HashMap::new(),
+            liquidator: HashMap::new(),
+            chainlink: HashMap::new(),
+            metrics: MetricsConfig::default(),
+        }
+    }
+
+    #[test]
+    fn fork_profile_allows_loopback_without_private_rpc() {
+        // Mirrors the shape shipped in `config/fork.toml`: loopback
+        // URLs, no `private_rpc_url`, no `allow_public_mempool` opt-in.
+        // The fork-profile branch in validate() must bypass the
+        // PrivateRpcRequired gate entirely.
+        let cfg = fork_cfg(fork_chain("ws://127.0.0.1:8545", "http://127.0.0.1:8545"));
+        cfg.validate()
+            .expect("fork profile + loopback URLs must validate");
+    }
+
+    #[test]
+    fn fork_profile_rejects_non_loopback_ws() {
+        let cfg = fork_cfg(fork_chain(
+            "wss://bsc-rpc.publicnode.com",
+            "http://127.0.0.1:8545",
+        ));
+        let err = cfg
+            .validate()
+            .expect_err("fork profile with public ws_url must fail");
+        match err {
+            ConfigError::ForkProfileNonLoopbackRpc { chain, field, url } => {
+                assert_eq!(chain, "bnb");
+                assert_eq!(field, "ws_url");
+                assert_eq!(url, "wss://bsc-rpc.publicnode.com");
+            }
+            other => panic!("unexpected error variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fork_profile_rejects_non_loopback_http() {
+        let cfg = fork_cfg(fork_chain(
+            "ws://127.0.0.1:8545",
+            "https://bsc.drpc.org",
+        ));
+        let err = cfg
+            .validate()
+            .expect_err("fork profile with public http_url must fail");
+        match err {
+            ConfigError::ForkProfileNonLoopbackRpc { chain, field, .. } => {
+                assert_eq!(chain, "bnb");
+                assert_eq!(field, "http_url");
+            }
+            other => panic!("unexpected error variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn non_fork_profile_skips_loopback_gate() {
+        // A mainnet/testnet profile with a non-loopback RPC must NOT
+        // trip the fork loopback gate — that gate only applies when
+        // `profile_tag == Some("fork")`. This test locks in that the
+        // fork branch is strictly additive and never alters the
+        // behaviour of production profiles.
+        let mut chain = fork_chain("wss://remote.example", "https://remote.example");
+        chain.private_rpc_url = Some(SecretString::from("https://priv.example".to_string()));
+        let mut cfg = fork_cfg(chain);
+        cfg.bot.profile_tag = None;
+        cfg.validate()
+            .expect("non-fork profile with remote RPC + private_rpc must validate");
+    }
+
+    #[test]
+    fn unknown_profile_tag_does_not_relax_any_gate() {
+        // Forward-compat: a profile tag the code doesn't recognise
+        // (e.g. a typo like "froke") must fall through to mainnet-
+        // invariant behaviour. Pair a missing private_rpc_url with
+        // no allow_public_mempool and the PrivateRpcRequired gate
+        // must fire — same as an untagged mainnet profile.
+        let mut cfg = fork_cfg(fork_chain(
+            "wss://remote.example",
+            "https://remote.example",
+        ));
+        cfg.bot.profile_tag = Some("froke".into());
+        let err = cfg
+            .validate()
+            .expect_err("unknown tag must not bypass mainnet gates");
+        assert!(
+            matches!(err, ConfigError::PrivateRpcRequired { .. }),
+            "expected PrivateRpcRequired, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn loopback_url_matches_common_forms() {
+        assert!(is_loopback_url("http://127.0.0.1:8545"));
+        assert!(is_loopback_url("ws://127.0.0.1"));
+        assert!(is_loopback_url("http://localhost:9091"));
+        assert!(is_loopback_url("https://LocalHost/"));
+        assert!(is_loopback_url("ws://[::1]:8545"));
+        assert!(is_loopback_url("http://127.255.255.254"));
+    }
+
+    #[test]
+    fn loopback_url_rejects_public_hosts() {
+        assert!(!is_loopback_url("wss://bsc-rpc.publicnode.com"));
+        assert!(!is_loopback_url("https://bsc.drpc.org"));
+        assert!(!is_loopback_url("http://10.0.0.1:8545"));
+        assert!(!is_loopback_url("http://192.168.1.1"));
+        assert!(!is_loopback_url("not-a-url"));
     }
 }

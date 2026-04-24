@@ -194,6 +194,38 @@ Environment variables expected by the default config:
 | `BNB_WS_URL` | BNB Chain WebSocket RPC endpoint |
 | `BNB_HTTP_URL` | BNB Chain HTTPS RPC endpoint (for multicall) |
 
+### Run profiles
+
+Three TOML profiles ship in [`config/`](config/). Pick one with `--config`.
+
+| Profile | File | When to use |
+|---|---|---|
+| Mainnet | `config/default.toml` | Production runs against BSC mainnet (real capital). |
+| Testnet | `config/testnet.toml` | Venus on BSC testnet (Chapel, chainId 97) — no Aave V3 on Chapel, runs read-only. |
+| Local anvil fork | `config/fork.toml` | Full end-to-end against a local anvil fork of BSC mainnet. Zero capital risk. |
+
+#### Local anvil fork (full end-to-end, no capital)
+
+Fork BSC mainnet locally. Real Venus state, real Aave V3, real PancakeSwap — liquidate real positions against a private chain.
+
+Terminal A — boot the fork:
+
+```sh
+./scripts/anvil_fork.sh                         # forks latest block via dRPC, falls back to PublicNode
+FORK_BLOCK=41000000 ./scripts/anvil_fork.sh     # pin a specific block
+CHARON_ANVIL_PORT=8546 ./scripts/anvil_fork.sh  # run on a non-default port
+```
+
+Terminal B — run Charon against it:
+
+```sh
+cargo run -- --config config/fork.toml listen
+```
+
+The fork profile carries `profile_tag = "fork"`; `Config::validate` rejects it at startup if any chain's `ws_url` / `http_url` resolves to a non-loopback host. This keeps the intentionally lowered profit gate from ever pointing at mainnet by accident.
+
+The fork profile omits `[liquidator.bnb]` by default — after `forge create` against the local anvil, add a `[liquidator.bnb]` section pointing at the deployed address to exercise the full liquidation path. Until then the CLI runs in read-only mode (scanner + metrics only).
+
 ---
 
 ## Project structure
