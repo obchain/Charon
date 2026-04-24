@@ -29,6 +29,16 @@ interface IVToken {
     /// @return 0 on success, non-zero error code on failure.
     function redeemUnderlying(uint256 redeemAmount) external returns (uint256);
 
+    /// @notice Redeems exactly `redeemTokens` vTokens for the corresponding underlying asset.
+    /// @dev Compound V2 / Venus API. Transfers the caller's vTokens back to the protocol and
+    ///      returns the proportional underlying. Returns an error code (0 = success).
+    ///      CharonLiquidator uses this variant to drain the full seized vToken balance in one
+    ///      call after liquidateBorrow(), avoiding any rounding that redeemUnderlying would
+    ///      introduce when converting an inexact underlying amount to vTokens.
+    /// @param redeemTokens The number of vTokens to burn.
+    /// @return 0 on success, non-zero error code on failure.
+    function redeem(uint256 redeemTokens) external returns (uint256);
+
     /// @notice Returns the vToken balance of `account`.
     /// @dev Used by rescue() to validate amounts before pulling vTokens out of the contract.
     /// @param account The address to query.
