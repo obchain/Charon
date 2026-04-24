@@ -8,6 +8,7 @@
 
 use std::time::Duration;
 
+use alloy::primitives::B256;
 use alloy::providers::Provider;
 use anyhow::{Context, Result};
 use charon_core::config::ChainConfig;
@@ -36,6 +37,11 @@ pub enum ChainEvent {
         number: u64,
         /// Unix timestamp from the block header.
         timestamp: u64,
+        /// Canonical block hash of the new head. Required by the
+        /// mempool pre-sign drain so it can correlate its log with the
+        /// block that triggered the drain and to let consumers fetch
+        /// the block's confirmed tx-hash set in a follow-up call.
+        block_hash: B256,
         /// `true` if the block was synthesised via reconnect backfill.
         backfill: bool,
     },
@@ -133,8 +139,10 @@ impl BlockListener {
                         .with_context(|| {
                             format!("chain '{}': get_block_by_number({number}) failed", self.name)
                         })?;
-                    let ts = header.map(|b| b.header.timestamp).unwrap_or_default();
-                    self.publish(number, ts, true);
+                    let (ts, hash) = header
+                        .map(|b| (b.header.timestamp, b.header.hash))
+                        .unwrap_or_default();
+                    self.publish(number, ts, hash, true);
                 }
             }
         }
@@ -148,7 +156,7 @@ impl BlockListener {
 
         let mut stream = sub.into_stream();
         while let Some(header) = stream.next().await {
-            self.publish(header.number, header.timestamp, false);
+            self.publish(header.number, header.timestamp, header.hash, false);
         }
 
         anyhow::bail!("chain '{}': subscription stream ended", self.name)
@@ -157,13 +165,14 @@ impl BlockListener {
     /// Emit a `ChainEvent::NewBlock` into the channel. Non-blocking so a
     /// stalled consumer cannot stall the WebSocket drain loop; full channel
     /// drops the event with a warning (back-pressure visible to ops).
-    fn publish(&mut self, number: u64, timestamp: u64, backfill: bool) {
+    fn publish(&mut self, number: u64, timestamp: u64, block_hash: B256, backfill: bool) {
         metrics::counter!("charon_blocks_received_total", "chain" => self.name.clone())
             .increment(1);
         debug!(
             chain = %self.name,
             block = number,
             timestamp,
+            %block_hash,
             backfill,
             "new block"
         );
@@ -175,6 +184,7 @@ impl BlockListener {
             chain: self.name.clone(),
             number,
             timestamp,
+            block_hash,
             backfill,
         };
         match self.tx.try_send(event) {
