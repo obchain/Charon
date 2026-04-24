@@ -1,0 +1,26 @@
+[package]
+name = "charon-executor"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Transaction builder, simulator, and broadcaster for Charon"
+
+[dependencies]
+charon-core = { workspace = true }
+charon-metrics = { workspace = true }
+alloy = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tokio = { workspace = true }
+secrecy = { workspace = true }
+url = { workspace = true }
+reqwest = { workspace = true }
+
+[dev-dependencies]
+dotenvy = { workspace = true }
+httpmock = "0.7"
+tokio = { workspace = true, features = ["test-util"] }
+
+[lints]
+workspace = true
