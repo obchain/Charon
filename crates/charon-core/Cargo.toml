@@ -5,9 +5,13 @@ edition.workspace = true
 license.workspace = true
 description = "Shared types, traits, and config for Charon"
 
+[lints]
+workspace = true
+
 [dependencies]
 alloy = { workspace = true }
 serde = { workspace = true }
 anyhow = { workspace = true }
 async-trait = { workspace = true }
 toml = { workspace = true }
+thiserror = { workspace = true }
