@@ -17,7 +17,8 @@ use anyhow::{Context, Result};
 use charon_core::{Config, LendingProtocol};
 use charon_protocols::VenusAdapter;
 use charon_scanner::{
-    BlockListener, ChainEvent, ChainProvider, HealthScanner, PositionBucket, ScanScheduler,
+    BlockListener, ChainEvent, ChainProvider, DEFAULT_MAX_AGE, HealthScanner, PositionBucket,
+    PriceCache, ScanScheduler,
 };
 use clap::{Parser, Subcommand};
 use tokio::sync::mpsc;
@@ -131,7 +132,11 @@ async fn main() -> Result<()> {
 /// For every `NewBlock` event on a chain with a `[protocol.venus]` entry
 /// the Venus adapter fetches positions anchored at the observed block,
 /// pushes them through the bucketed [`HealthScanner`], and limits fetches
-/// to buckets whose cadence fires this block via [`ScanScheduler`].
+/// to buckets whose cadence fires this block via [`ScanScheduler`]. A
+/// per-chain [`PriceCache`] is also refreshed on each scan tick so
+/// downstream profit-ranking has a fresh Chainlink view; consumers are
+/// wired up in a follow-up task (positions are opportunities only, no
+/// profit calc yet).
 /// Chains without a Venus protocol config still flow through the drain
 /// loop but trigger no protocol scans (v0.1 scope).
 ///
@@ -144,55 +149,84 @@ async fn run_listen(config: &Config, borrowers: Vec<Address>) -> Result<()> {
         anyhow::bail!("no chains configured — nothing to listen to");
     }
 
-    // Venus adapter + bucketed scanner + cadence scheduler are currently
-    // single-chain (BNB) per config scope. Build them only if
-    // `[protocol.venus]` exists and its target chain is configured;
-    // otherwise run the listener pipeline without a scanner.
-    let venus_adapter: Option<(String, Arc<VenusAdapter>, Arc<HealthScanner>, ScanScheduler)> =
-        match config.protocol.get("venus") {
-            Some(venus_cfg) => {
-                let chain_name = &venus_cfg.chain;
-                let chain_cfg = config.chain.get(chain_name).with_context(|| {
-                    format!(
-                        "protocol 'venus' references chain '{chain_name}' which is not in [chain.*]"
-                    )
-                })?;
-                let adapter_ws = ProviderBuilder::new()
-                    .on_ws(WsConnect::new(&chain_cfg.ws_url))
-                    .await
-                    .context("venus adapter: failed to connect over ws")?;
-                let adapter = Arc::new(
-                    VenusAdapter::connect(Arc::new(adapter_ws), venus_cfg.comptroller).await?,
-                );
-                let scanner = Arc::new(HealthScanner::new(
-                    config.bot.liquidatable_threshold_bps,
-                    config.bot.near_liq_threshold_bps,
-                )?);
-                let sched = ScanScheduler::new(
-                    config.bot.hot_scan_blocks,
-                    config.bot.warm_scan_blocks,
-                    config.bot.cold_scan_blocks,
-                );
-                info!(
-                    chain = %chain_name,
-                    borrower_count = borrowers.len(),
-                    market_count = adapter.markets().await.len(),
-                    liquidatable_bps = config.bot.liquidatable_threshold_bps,
-                    near_liq_bps = config.bot.near_liq_threshold_bps,
-                    hot_blocks = sched.hot,
-                    warm_blocks = sched.warm,
-                    cold_blocks = sched.cold,
-                    "venus adapter + scanner ready"
-                );
-                Some((chain_name.clone(), adapter, scanner, sched))
+    // Venus adapter + bucketed scanner + cadence scheduler + Chainlink
+    // price cache are currently single-chain (BNB) per config scope.
+    // Build them only if `[protocol.venus]` exists and its target chain
+    // is configured; otherwise run the listener pipeline without a
+    // scanner.
+    let venus_adapter: Option<(
+        String,
+        Arc<VenusAdapter>,
+        Arc<HealthScanner>,
+        ScanScheduler,
+        Arc<PriceCache>,
+    )> = match config.protocol.get("venus") {
+        Some(venus_cfg) => {
+            let chain_name = &venus_cfg.chain;
+            let chain_cfg = config.chain.get(chain_name).with_context(|| {
+                format!(
+                    "protocol 'venus' references chain '{chain_name}' which is not in [chain.*]"
+                )
+            })?;
+            let adapter_ws = ProviderBuilder::new()
+                .on_ws(WsConnect::new(&chain_cfg.ws_url))
+                .await
+                .context("venus adapter: failed to connect over ws")?;
+            let adapter_ws = Arc::new(adapter_ws);
+            let adapter =
+                Arc::new(VenusAdapter::connect(adapter_ws.clone(), venus_cfg.comptroller).await?);
+            let scanner = Arc::new(HealthScanner::new(
+                config.bot.liquidatable_threshold_bps,
+                config.bot.near_liq_threshold_bps,
+            )?);
+            let sched = ScanScheduler::new(
+                config.bot.hot_scan_blocks,
+                config.bot.warm_scan_blocks,
+                config.bot.cold_scan_blocks,
+            );
+
+            // Chainlink price cache — feeds are configured per chain under
+            // `[chainlink.<chain>]`. Empty map = no feeds configured, cache
+            // stays idle and downstream stages fall back to protocol oracle.
+            // Reuses the Venus adapter's WS provider to avoid a second
+            // upstream connection; lifetime is tied to the scan task via Arc.
+            let price_feeds = config.chainlink.get(chain_name).cloned().unwrap_or_default();
+            let prices = Arc::new(PriceCache::new(adapter_ws, price_feeds, DEFAULT_MAX_AGE));
+            // Best-effort warm-up — individual feed failures are logged
+            // inside `refresh_all` so startup never hard-fails on a
+            // transient Chainlink blip.
+            prices.refresh_all().await;
+            let fresh_feeds: Vec<String> = prices.symbols().map(str::to_string).collect();
+            for sym in &fresh_feeds {
+                if let Some(p) = prices.get(sym) {
+                    info!(
+                        symbol = %sym,
+                        price = %p.price,
+                        decimals = p.decimals,
+                        "chainlink feed"
+                    );
+                }
             }
-            None => {
-                info!(
-                    "no [protocol.venus] configured — listener will drain events without scanning"
-                );
-                None
-            }
-        };
+
+            info!(
+                chain = %chain_name,
+                borrower_count = borrowers.len(),
+                market_count = adapter.markets().await.len(),
+                feed_count = fresh_feeds.len(),
+                liquidatable_bps = config.bot.liquidatable_threshold_bps,
+                near_liq_bps = config.bot.near_liq_threshold_bps,
+                hot_blocks = sched.hot,
+                warm_blocks = sched.warm,
+                cold_blocks = sched.cold,
+                "venus adapter + scanner + price cache ready"
+            );
+            Some((chain_name.clone(), adapter, scanner, sched, prices))
+        }
+        None => {
+            info!("no [protocol.venus] configured — listener will drain events without scanning");
+            None
+        }
+    };
 
     let (tx, mut rx) = mpsc::channel::<ChainEvent>(CHAIN_EVENT_CHANNEL);
     let mut listeners: tokio::task::JoinSet<(String, Result<()>)> = tokio::task::JoinSet::new();
@@ -232,7 +266,7 @@ async fn run_listen(config: &Config, borrowers: Vec<Address>) -> Result<()> {
                             // snapshot the final state of the missed range.
                             continue;
                         }
-                        if let Some((venus_chain, adapter, scanner, sched)) =
+                        if let Some((venus_chain, adapter, scanner, sched, prices)) =
                             venus_adapter.as_ref()
                         {
                             if venus_chain != &chain {
@@ -258,6 +292,12 @@ async fn run_listen(config: &Config, borrowers: Vec<Address>) -> Result<()> {
                             if scan_set.is_empty() {
                                 continue;
                             }
+                            // Refresh Chainlink prices on every real scan
+                            // tick so downstream profit-ranking (wired in a
+                            // follow-up task) reads sub-heartbeat feeds.
+                            // Individual feed failures are logged inside
+                            // `refresh_all` and do not abort the scan.
+                            prices.refresh_all().await;
                             let block_tag = BlockNumberOrTag::Number(number);
                             match adapter.fetch_positions(&scan_set, block_tag).await {
                                 Ok(positions) => {

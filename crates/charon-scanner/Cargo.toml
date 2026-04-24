@@ -17,5 +17,8 @@ dashmap = { workspace = true }
 rand = { workspace = true }
 metrics = { workspace = true }
 
+[dev-dependencies]
+dotenvy = { workspace = true }
+
 [lints]
 workspace = true
