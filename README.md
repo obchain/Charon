@@ -264,6 +264,26 @@ Alert rules in `deploy/grafana/alerts.yaml` can be loaded by Prometheus via `rul
 
 ---
 
+## Deploy (single host, e.g. Hetzner CX22)
+
+A minimal `docker compose` stack ships in [`deploy/compose/`](deploy/compose/). It runs two services:
+
+1. `charon` — built from the repo-root [`Dockerfile`](Dockerfile) (multi-stage: `rust:1-slim` builder → `debian:bookworm-slim` runtime, ~150 MB final image)
+2. `alloy` — [Grafana Alloy](https://grafana.com/docs/alloy/latest/) sidecar that scrapes `charon:9091` over the internal compose network and `remote_write`s every series to Grafana Cloud
+
+No local Prometheus or Grafana is deployed — the Grafana Cloud free tier is the visualisation surface, which fits the CX22 resource envelope (2 vCPU / 4 GB RAM) comfortably.
+
+```sh
+cd deploy/compose
+cp .env.example .env            # fill in RPC + Grafana Cloud creds
+docker compose up -d --build
+docker compose logs -f charon
+```
+
+The metrics endpoint is not exposed to the host — Alloy reaches it by DNS name. Import [`deploy/grafana/charon.json`](deploy/grafana/charon.json) into Grafana Cloud and the panels populate automatically once Alloy's first push lands.
+
+---
+
 ## Project structure
 
 ```
