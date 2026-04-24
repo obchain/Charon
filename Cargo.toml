@@ -1,0 +1,48 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/charon-core",
+    "crates/charon-scanner",
+    "crates/charon-cli",
+]
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+all = "warn"
+arithmetic_side_effects = "deny"
+cast_possible_truncation = "deny"
+unwrap_used = "deny"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+authors = ["Charon Contributors"]
+license = "MIT"
+description = "Multi-chain flash-loan liquidation bot"
+
+[workspace.dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# Ethereum / EVM interaction
+alloy = { version = "0.8", features = ["full"] }
+
+# Serialization + config
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Error handling
+anyhow = "1"
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Internal crates
+charon-core = { path = "crates/charon-core" }
+charon-scanner = { path = "crates/charon-scanner" }
