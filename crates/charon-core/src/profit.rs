@@ -1,45 +1,43 @@
 //! Gas-aware profit calculator.
 //!
 //! Sits between the scanner (surfaces a liquidatable [`Position`]) and
-//! the router (picks a flash-loan source): given a candidate liquidation
-//! priced entirely in USD cents plus the configured
-//! `min_profit_usd_1e6` threshold, decide whether it is worth building a
-//! transaction for.
+//! the router (picks a flash-loan source): given a candidate liquidation,
+//! decide whether it clears the configured `min_profit_usd_1e6`
+//! threshold.
 //!
 //! # Unit discipline
 //!
-//! Everything inside the calculator is expressed in **USD cents (`u64`)**.
-//! Integer math throughout so we do not accumulate float error across
-//! the hot path. All wei-scale arithmetic happens exactly once inside
-//! [`ProfitInputs::from_opportunity`], where on-chain token amounts are
-//! folded into cents through a Chainlink-style 1e8 [`Price`].
+//! The calculator is **native-wei first**: every cost is denominated in
+//! the **debt token's base units (wei)**, matching
+//! [`LiquidationOpportunity::net_profit_wei`]. Wei is the canonical
+//! storage unit — it avoids f64 drift, survives chain-native precision,
+//! and never depends on a USD oracle to express a profit figure.
 //!
-//! Cents are chosen (not micro-USD) because they fit comfortably in
-//! `u64` up to roughly `1.8e17` USD — enough for any single liquidation.
-//! The config threshold is stored in **micro-USD (`1e6`)** so the TOML
-//! stays integer-only and round-trips through serde without float
-//! surprises; conversion to cents is `micro / 10_000` and happens in the
-//! executor when it calls [`calculate_profit`].
+//! USD is a reporting / gating concern only. The final [`NetProfit`]
+//! carries both the authoritative `net_profit_wei: U256` and a
+//! derived `net_profit_usd_1e6: u64` convenience field for logging and
+//! the `min_profit_usd_1e6` threshold compare.
 //!
-//! # Profit formula
+//! # Profit formula (all amounts in **debt-token wei**)
 //!
 //! ```text
-//! gross_collateral_cents =
-//!     expected_collateral_out_wei * collateral_price_1e8
-//!         / 10^collateral_decimals / 1e6
-//!
-//! # Per-token USD is derived directly from Chainlink prices; the
-//! # formula is *not* `repay * bonus / 10_000` — that form only holds
-//! # when collateral and debt are the same asset (stable/stable).
-//!
-//! slippage_cents = expected_swap_output_cents * slippage_bps / 10_000
-//! net_cents      = gross_collateral_cents
-//!                 - flash_fee_cents - gas_cost_cents - slippage_cents
+//! gross_debt_wei      = expected_swap_output_wei
+//! slippage_wei        = expected_swap_output_wei * slippage_bps / 10_000
+//! total_cost_wei      = flash_fee_wei + gas_cost_debt_wei + slippage_wei
+//! net_profit_wei      = gross_debt_wei - total_cost_wei   (saturating)
 //! ```
 //!
-//! Slippage is charged against the **DEX swap output** (seized
-//! collateral -> debt token), not the gross bonus — losing 0.5% on a
-//! $10 000 swap is $50, not 0.5% of the $1 000 bonus.
+//! Slippage is charged against the DEX swap output (collateral ->
+//! debt-token) because that is the trade whose execution price the bot
+//! is exposed to — losing 0.5% on a $10 000 swap is $50, not 0.5% of
+//! the $1 000 bonus.
+//!
+//! Gas is passed in already converted to debt-token wei
+//! (`gas_cost_debt_wei`). The conversion `gas_units *
+//! effective_gas_price * native_price / debt_price` is the caller's
+//! responsibility — typically it goes through a PriceCache lookup
+//! against Chainlink feeds for the native asset (BNB) and the debt
+//! token.
 
 use alloy::primitives::U256;
 use serde::{Deserialize, Serialize};
@@ -91,24 +89,24 @@ pub enum ProfitError {
     /// Token decimals exceed the supported range (0..=18).
     #[error("unsupported token decimals {0} (must be <= 18)")]
     UnsupportedDecimals(u8),
-    /// Total cost swallows the gross bonus — liquidation is unprofitable.
+    /// Total cost swallows the gross swap output — liquidation is unprofitable.
     #[error(
-        "unprofitable: gross={gross_cents} cents <= total_cost={total_cost_cents} cents \
-         (flash_fee={flash_fee_cents}, gas={gas_cost_cents}, slippage={slippage_cents})"
+        "unprofitable: gross_wei={gross_wei} <= total_cost_wei={total_cost_wei} \
+         (flash_fee_wei={flash_fee_wei}, gas_cost_wei={gas_cost_wei}, slippage_wei={slippage_wei})"
     )]
     Unprofitable {
-        gross_cents: u64,
-        total_cost_cents: u64,
-        flash_fee_cents: u64,
-        gas_cost_cents: u64,
-        slippage_cents: u64,
+        gross_wei: U256,
+        total_cost_wei: U256,
+        flash_fee_wei: U256,
+        gas_cost_wei: U256,
+        slippage_wei: U256,
     },
     /// Net profit is positive but below the configured threshold.
-    #[error("below threshold: net={net_cents} cents < min={min_cents} cents")]
-    BelowMinThreshold { net_cents: u64, min_cents: u64 },
+    #[error("below threshold: net_usd_1e6={net_usd_1e6} < min_usd_1e6={min_usd_1e6}")]
+    BelowMinThreshold { net_usd_1e6: u64, min_usd_1e6: u64 },
 }
 
-/// Everything the calculator needs, already converted to USD cents.
+/// Everything the calculator needs, already expressed in debt-token wei.
 ///
 /// Construct via [`ProfitInputs::from_opportunity`] whenever possible;
 /// the direct literal form is kept only for tests and callers who have
@@ -116,61 +114,51 @@ pub enum ProfitError {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct ProfitInputs {
-    /// Gross USD value of the **collateral the bot will seize**, after
-    /// applying `liquidation_bonus_bps`. In USD cents.
-    ///
-    /// Example: repaying $1 000 of debt against a 10% bonus on an
-    /// equal-priced collateral => `gross_collateral_cents = 110_000`
-    /// (i.e. $1 100).
-    pub gross_collateral_cents: u64,
-    /// Expected DEX output (collateral -> debt token) in USD cents.
-    ///
-    /// Slippage is charged against **this** value, not the gross
-    /// collateral — the bot only loses slippage on the swap it
-    /// actually performs. Usually very close to
-    /// `gross_collateral_cents`, a hair lower because the DEX quote
-    /// already reflects pool curvature.
-    pub expected_swap_output_cents: u64,
-    /// Absolute flash-loan fee in USD cents.
-    ///
-    /// Converted from the provider quote (`fee_wei * debt_price / 10^decimals`)
-    /// inside [`ProfitInputs::from_opportunity`]. Aave V3 on BSC is
-    /// `fee_bps = 5` (0.05%) — a $1 000 borrow costs 50 cents.
-    pub flash_fee_cents: u64,
-    /// Expected gas cost for the full liquidation tx in USD cents.
-    ///
-    /// Computed off-chain as
-    /// `gas_units * effective_gas_price * native_price / 10^18 / 1e6`.
-    pub gas_cost_cents: u64,
+    /// Expected DEX output (seized collateral -> debt token) in
+    /// debt-token wei. This is the bot's realised revenue before fees
+    /// and slippage, and is the value against which slippage is
+    /// applied.
+    pub expected_swap_output_wei: U256,
+    /// Absolute flash-loan fee in debt-token wei (matches
+    /// `FlashLoanQuote::fee` for an Aave-style loan denominated in the
+    /// debt asset).
+    pub flash_fee_wei: U256,
+    /// Expected gas cost for the full liquidation tx, converted to
+    /// **debt-token wei** by the caller (typical conversion:
+    /// `gas_units * effective_gas_price * native_price / debt_price`).
+    pub gas_cost_debt_wei: U256,
     /// DEX swap slippage to budget for, in basis points applied to
-    /// `expected_swap_output_cents`. `50` = 0.5%.
+    /// `expected_swap_output_wei`. `50` = 0.5%.
     pub slippage_bps: u16,
+    /// USD price of the debt token, Chainlink 1e8 scaled. Used to
+    /// convert `net_profit_wei` into `net_profit_usd_1e6` for the
+    /// threshold compare and for logging — never used inside the
+    /// arithmetic path.
+    pub debt_price: Price,
+    /// Debt-token decimals (0..=18). Drives the final wei->USD_1e6
+    /// conversion.
+    pub debt_decimals: u8,
 }
 
 /// Itemised profit breakdown returned on success.
 ///
-/// All fields are USD cents (`u64`). [`NetProfit::net_usd`] /
-/// [`NetProfit::gross_usd`] are floating-point convenience accessors
-/// for logging only — do not feed them back into the profit path.
+/// `net_profit_wei` is authoritative and is the value copied into
+/// [`LiquidationOpportunity::net_profit_wei`] via
+/// [`LiquidationOpportunity::with_profit`]. All `*_wei` fields are
+/// denominated in **debt-token wei**. `net_profit_usd_1e6` is a
+/// derived convenience figure for the threshold compare and logs; do
+/// **not** feed it back into downstream wei arithmetic.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct NetProfit {
-    pub gross_usd_cents: u64,
-    pub flash_fee_usd_cents: u64,
-    pub gas_cost_usd_cents: u64,
-    pub slippage_usd_cents: u64,
-    pub net_usd_cents: u64,
-}
-
-impl NetProfit {
-    /// Net profit as USD (display-only; precision is still cents).
-    pub fn net_usd(&self) -> f64 {
-        (self.net_usd_cents as f64) / 100.0
-    }
-    /// Gross collateral seized, as USD (display-only).
-    pub fn gross_usd(&self) -> f64 {
-        (self.gross_usd_cents as f64) / 100.0
-    }
+    pub gross_wei: U256,
+    pub flash_fee_wei: U256,
+    pub gas_cost_wei: U256,
+    pub slippage_wei: U256,
+    pub net_profit_wei: U256,
+    /// Derived USD value of `net_profit_wei`, scaled by 1e6.
+    /// Convenience only — for logs and threshold display.
+    pub net_profit_usd_1e6: u64,
 }
 
 /// 10^n for n in 0..=18 — pre-computed so the decimals path never
@@ -198,72 +186,59 @@ const POW10: [u128; 19] = [
 ];
 
 /// Convert `amount_wei` of a token with `decimals` at `price` into USD
-/// cents.
+/// micro-units (1e6).
 ///
 /// ```text
-/// cents = amount_wei * usd_1e8 / 10^decimals / 10^6
+/// usd_1e6 = amount_wei * usd_1e8 / 10^decimals / 10^2
 /// ```
 ///
 /// Performed in `U256` so an 18-decimal BEP-20 at trillion-dollar scale
-/// still cannot overflow. The final cents value is range-checked to fit
-/// `u64` — anything larger is a faulty input and returns
+/// still cannot overflow. The final USD_1e6 value is range-checked to
+/// fit `u64` — anything larger is a faulty input and returns
 /// [`ProfitError::Overflow`].
-fn wei_to_cents(amount_wei: U256, price: Price, decimals: u8) -> Result<u64, ProfitError> {
+fn wei_to_usd_1e6(amount_wei: U256, price: Price, decimals: u8) -> Result<u64, ProfitError> {
     if (decimals as usize) >= POW10.len() {
         return Err(ProfitError::UnsupportedDecimals(decimals));
     }
-    // scale = 10^decimals * 10^6   (divide by 10^decimals to get whole
-    //                               tokens; divide by 10^6 to move from
-    //                               1e8-priced USD down to cents/1e2.)
+    // scale = 10^decimals * 10^2
+    // (divide by 10^decimals to get whole tokens;
+    //  divide by 10^2       to move from 1e8-priced USD down to 1e6.)
     let pow_dec = U256::from(POW10[decimals as usize]);
-    let pow_6 = U256::from(1_000_000u64);
-    let scale = pow_dec.checked_mul(pow_6).ok_or(ProfitError::Overflow)?;
+    let pow_2 = U256::from(100u64);
+    let scale = pow_dec.checked_mul(pow_2).ok_or(ProfitError::Overflow)?;
     let numerator = amount_wei
         .checked_mul(U256::from(price.usd_1e8))
         .ok_or(ProfitError::Overflow)?;
-    // scale >= 1e6 (non-zero) so division cannot panic.
-    let cents_u256 = numerator / scale;
-    let cents: u64 = cents_u256.try_into().map_err(|_| ProfitError::Overflow)?;
-    Ok(cents)
+    // scale >= 100 (non-zero) so division cannot panic.
+    let usd_u256 = numerator / scale;
+    let usd: u64 = usd_u256.try_into().map_err(|_| ProfitError::Overflow)?;
+    Ok(usd)
 }
 
 impl ProfitInputs {
-    /// Construct [`ProfitInputs`] from a fully-priced
-    /// [`LiquidationOpportunity`] plus live feed data.
+    /// Construct [`ProfitInputs`] from a [`LiquidationOpportunity`]
+    /// plus live gas / fee quotes.
     ///
     /// # Inputs
     ///
     /// - `opportunity` — the candidate, in native wei-scale units.
-    /// - `collateral_price` / `debt_price` — Chainlink-style 1e8 prices.
-    /// - `collateral_decimals` / `debt_decimals` — BEP-20 decimals
-    ///   (must be `<= 18`).
     /// - `expected_swap_output_wei` — DEX router quote for the seized
-    ///   collateral -> debt swap, in debt-token wei. Slippage is
+    ///   collateral -> debt-token swap, in debt-token wei. Slippage is
     ///   applied to this.
-    /// - `flash_fee_wei` — absolute flash-loan fee denominated in the
-    ///   debt token's wei (matches `FlashLoanQuote::fee`).
-    /// - `gas_cost_cents` — pre-computed gas budget for the whole tx.
-    /// - `slippage_bps` — DEX slippage budget (applied to swap output).
-    ///
-    /// # Unit path
-    ///
-    /// 1. `collateral_wei * collateral_price -> gross_collateral_cents`
-    /// 2. `swap_output_wei * debt_price      -> expected_swap_output_cents`
-    /// 3. `flash_fee_wei   * debt_price      -> flash_fee_cents`
-    ///
-    /// All three conversions go through [`wei_to_cents`], which stays
-    /// in `U256` until the very last `try_into::<u64>()`.
-    #[allow(clippy::too_many_arguments)]
+    /// - `flash_fee_wei` — absolute flash-loan fee in debt-token wei.
+    /// - `gas_cost_debt_wei` — gas budget converted to debt-token wei.
+    /// - `slippage_bps` — DEX slippage budget.
+    /// - `debt_price` / `debt_decimals` — debt-token Chainlink price
+    ///   and BEP-20 decimals (must be `<= 18`), used downstream to
+    ///   derive `net_profit_usd_1e6`.
     pub fn from_opportunity(
         opportunity: &LiquidationOpportunity,
-        collateral_price: Price,
-        debt_price: Price,
-        collateral_decimals: u8,
-        debt_decimals: u8,
         expected_swap_output_wei: U256,
         flash_fee_wei: U256,
-        gas_cost_cents: u64,
+        gas_cost_debt_wei: U256,
         slippage_bps: u16,
+        debt_price: Price,
+        debt_decimals: u8,
     ) -> Result<Self, ProfitError> {
         if slippage_bps > 10_000 {
             return Err(ProfitError::InvalidBps(slippage_bps));
@@ -273,28 +248,17 @@ impl ProfitInputs {
                 opportunity.position.liquidation_bonus_bps,
             ));
         }
-
-        // Gross collateral seized = expected_collateral_out priced at
-        // the collateral feed. The on-chain liquidation flow already
-        // writes expected_collateral_out = debt_repaid * bonus /
-        // collateral_price; we price it here directly.
-        let gross_collateral_cents = wei_to_cents(
-            opportunity.expected_collateral_out,
-            collateral_price,
-            collateral_decimals,
-        )?;
-
-        let expected_swap_output_cents =
-            wei_to_cents(expected_swap_output_wei, debt_price, debt_decimals)?;
-
-        let flash_fee_cents = wei_to_cents(flash_fee_wei, debt_price, debt_decimals)?;
+        if (debt_decimals as usize) >= POW10.len() {
+            return Err(ProfitError::UnsupportedDecimals(debt_decimals));
+        }
 
         Ok(Self {
-            gross_collateral_cents,
-            expected_swap_output_cents,
-            flash_fee_cents,
-            gas_cost_cents,
+            expected_swap_output_wei,
+            flash_fee_wei,
+            gas_cost_debt_wei,
             slippage_bps,
+            debt_price,
+            debt_decimals,
         })
     }
 }
@@ -302,13 +266,10 @@ impl ProfitInputs {
 /// Compute net profit for a candidate liquidation.
 ///
 /// Returns `Err` whenever the liquidation is unprofitable — either the
-/// total cost (flash fee + gas + slippage) swallows the gross bonus, or
-/// the net falls below `min_profit_usd_1e6`. The caller is expected to
-/// drop the opportunity on `Err`; no partial state is ever emitted.
-///
-/// `min_profit_usd_1e6` is in **micro-USD** to match
-/// [`crate::config::BotConfig::min_profit_usd_1e6`]. It is converted to
-/// cents (`/ 10_000`) internally.
+/// total cost (flash fee + gas + slippage) swallows the gross swap
+/// output, or the net (converted to USD_1e6 via `inputs.debt_price`)
+/// falls below `min_profit_usd_1e6`. The caller is expected to drop
+/// the opportunity on `Err`; no partial state is ever emitted.
 pub fn calculate_profit(
     inputs: &ProfitInputs,
     min_profit_usd_1e6: u64,
@@ -317,57 +278,56 @@ pub fn calculate_profit(
         return Err(ProfitError::InvalidBps(inputs.slippage_bps));
     }
 
-    // Slippage is charged on the DEX swap output, not on gross seized
-    // collateral — the bot only pays slippage on the swap it performs.
+    // Slippage is charged on the DEX swap output — the bot only pays
+    // slippage on the swap it performs.
     let slippage_mul = inputs
-        .expected_swap_output_cents
-        .checked_mul(u64::from(inputs.slippage_bps))
+        .expected_swap_output_wei
+        .checked_mul(U256::from(inputs.slippage_bps))
         .ok_or(ProfitError::Overflow)?;
     // 10_000 is a non-zero constant so the division is infallible.
-    let slippage_cents = slippage_mul / 10_000;
+    let slippage_wei = slippage_mul / U256::from(10_000u64);
 
-    let total_cost_cents = inputs
-        .flash_fee_cents
-        .checked_add(inputs.gas_cost_cents)
-        .and_then(|v| v.checked_add(slippage_cents))
+    let total_cost_wei = inputs
+        .flash_fee_wei
+        .checked_add(inputs.gas_cost_debt_wei)
+        .and_then(|v| v.checked_add(slippage_wei))
         .ok_or(ProfitError::Overflow)?;
 
-    let gross_cents = inputs.gross_collateral_cents;
+    let gross_wei = inputs.expected_swap_output_wei;
 
-    if gross_cents <= total_cost_cents {
+    if gross_wei <= total_cost_wei {
         return Err(ProfitError::Unprofitable {
-            gross_cents,
-            total_cost_cents,
-            flash_fee_cents: inputs.flash_fee_cents,
-            gas_cost_cents: inputs.gas_cost_cents,
-            slippage_cents,
+            gross_wei,
+            total_cost_wei,
+            flash_fee_wei: inputs.flash_fee_wei,
+            gas_cost_wei: inputs.gas_cost_debt_wei,
+            slippage_wei,
         });
     }
 
-    // gross > total_cost (checked above); use checked_sub to keep the
-    // invariant local to the subtraction and satisfy
-    // arithmetic_side_effects lints.
-    let net_cents = gross_cents
-        .checked_sub(total_cost_cents)
+    // gross > total_cost (checked above).
+    let net_profit_wei = gross_wei
+        .checked_sub(total_cost_wei)
         .ok_or(ProfitError::Overflow)?;
 
-    // 1 USD = 1e6 micro-USD = 100 cents => cents = micro / 10_000.
-    // Integer division rounds down, which biases the threshold *up*
-    // slightly (stricter, never looser — correct direction).
-    let min_cents = min_profit_usd_1e6 / 10_000;
-    if net_cents < min_cents {
+    // Convert net_profit_wei to USD_1e6 for threshold compare + logs.
+    let net_profit_usd_1e6 =
+        wei_to_usd_1e6(net_profit_wei, inputs.debt_price, inputs.debt_decimals)?;
+
+    if net_profit_usd_1e6 < min_profit_usd_1e6 {
         return Err(ProfitError::BelowMinThreshold {
-            net_cents,
-            min_cents,
+            net_usd_1e6: net_profit_usd_1e6,
+            min_usd_1e6: min_profit_usd_1e6,
         });
     }
 
     Ok(NetProfit {
-        gross_usd_cents: gross_cents,
-        flash_fee_usd_cents: inputs.flash_fee_cents,
-        gas_cost_usd_cents: inputs.gas_cost_cents,
-        slippage_usd_cents: slippage_cents,
-        net_usd_cents: net_cents,
+        gross_wei,
+        flash_fee_wei: inputs.flash_fee_wei,
+        gas_cost_wei: inputs.gas_cost_debt_wei,
+        slippage_wei,
+        net_profit_wei,
+        net_profit_usd_1e6,
     })
 }
 
@@ -377,42 +337,70 @@ mod tests {
     use crate::types::{FlashLoanSource, LiquidationOpportunity, Position, ProtocolId, SwapRoute};
     use alloy::primitives::{Address, U256, address};
 
+    /// 1 BNB = 1e18 wei.
+    const ONE_BNB: u128 = 1_000_000_000_000_000_000;
+
     fn typical_inputs() -> ProfitInputs {
-        // $1 000 debt, 10% bonus => $1 100 gross collateral.
-        // Swap output ~= $1 090 (pool curvature); 50 bps = $5.45.
+        // $1 000 debt at $600/BNB ~= 1.667 BNB. Keep everything in BNB
+        // wei for readability of the arithmetic.
+        //
+        // Swap output = 1.1 BNB, flash fee = 0.05% of 1 BNB = 0.0005 BNB,
+        // gas = 0.001 BNB, 0.5% slippage budget.
         ProfitInputs {
-            gross_collateral_cents: 110_000,
-            expected_swap_output_cents: 109_000,
-            flash_fee_cents: 50, // $0.50 (Aave V3 0.05% on $1 000)
-            gas_cost_cents: 200, // $2 gas
-            slippage_bps: 50,    // 0.5% of swap output
+            expected_swap_output_wei: U256::from(ONE_BNB)
+                .checked_mul(U256::from(11u64))
+                .expect("const mul")
+                / U256::from(10u64),
+            flash_fee_wei: U256::from(ONE_BNB / 2_000),
+            gas_cost_debt_wei: U256::from(ONE_BNB / 1_000),
+            slippage_bps: 50,
+            debt_price: Price::new(60_000_000_000).expect("valid"), // $600
+            debt_decimals: 18,
         }
     }
 
     #[test]
     fn healthy_liquidation_is_profitable() {
-        let np = calculate_profit(&typical_inputs(), 5_000_000).expect("profitable");
-        assert_eq!(np.gross_usd_cents, 110_000);
-        // slippage = 109_000 * 50 / 10_000 = 545
-        assert_eq!(np.slippage_usd_cents, 545);
-        // net = 110_000 - 50 - 200 - 545 = 109_205
-        assert_eq!(np.net_usd_cents, 109_205);
+        let inputs = typical_inputs();
+        // min = $5.00 (1e6 scale)
+        let np = calculate_profit(&inputs, 5_000_000).expect("profitable");
+
+        // slippage = 1.1 BNB * 50 / 10_000 = 0.0055 BNB
+        let expected_slippage = inputs.expected_swap_output_wei * U256::from(50u64)
+            / U256::from(10_000u64);
+        assert_eq!(np.slippage_wei, expected_slippage);
+
+        // net = 1.1 - 0.0005 - 0.001 - 0.0055 = 1.0930 BNB
+        let expected_net = inputs.expected_swap_output_wei
+            - inputs.flash_fee_wei
+            - inputs.gas_cost_debt_wei
+            - expected_slippage;
+        assert_eq!(np.net_profit_wei, expected_net);
+
+        // 1.0930 BNB * $600 ~= $655.80 -> 655_800_000 in 1e6 scale.
+        // Allow last-digit rounding (floor division).
+        assert!(np.net_profit_usd_1e6 >= 655_000_000);
+        assert!(np.net_profit_usd_1e6 <= 656_000_000);
     }
 
     #[test]
     fn below_threshold_is_rejected() {
-        let err = calculate_profit(&typical_inputs(), 2_000_000_000).expect_err("should reject");
+        // Threshold of $10 000 -> $1 000 000 000 in 1e6 scale. Typical
+        // inputs yield ~$650, nowhere near the bar.
+        let err = calculate_profit(&typical_inputs(), 1_000_000_000_000)
+            .expect_err("should reject below threshold");
         assert!(matches!(err, ProfitError::BelowMinThreshold { .. }));
     }
 
     #[test]
     fn cost_greater_than_gross_is_rejected() {
         let inputs = ProfitInputs {
-            gross_collateral_cents: 10, // $0.10 gross
-            expected_swap_output_cents: 10,
-            flash_fee_cents: 1,
-            gas_cost_cents: 200,
+            expected_swap_output_wei: U256::from(ONE_BNB / 1_000), // tiny trade
+            flash_fee_wei: U256::from(ONE_BNB / 500),
+            gas_cost_debt_wei: U256::from(ONE_BNB / 500),
             slippage_bps: 50,
+            debt_price: Price::new(60_000_000_000).expect("valid"),
+            debt_decimals: 18,
         };
         let err = calculate_profit(&inputs, 0).expect_err("unprofitable");
         assert!(matches!(err, ProfitError::Unprofitable { .. }));
@@ -431,17 +419,12 @@ mod tests {
     #[test]
     fn slippage_bps_boundary_10_000_is_accepted_and_10_001_rejected() {
         let mut inputs = typical_inputs();
-        // 10_000 bps = 100% slippage — numerically valid input; it may
-        // render the trade unprofitable, but the bps check itself must
-        // pass.
+        // 100% slippage consumes the full swap output -> unprofitable,
+        // but the bps check itself must *pass*.
         inputs.slippage_bps = 10_000;
-        // 10_000 bps = 100% of expected_swap_output. With
-        // gross=$1 100 and swap_output=$1 090 that still leaves
-        // $1 100 - $10.90 slippage - $0.50 fee - $2 gas = $7.50 net,
-        // so the calculator accepts it. The point of the boundary
-        // test is that 10_000 is a *valid* bps input (no InvalidBps).
-        let np = calculate_profit(&inputs, 0).expect("10_000 bps is valid input");
-        assert_eq!(np.slippage_usd_cents, inputs.expected_swap_output_cents);
+        let err = calculate_profit(&inputs, 0)
+            .expect_err("100% slippage eats the whole swap");
+        assert!(matches!(err, ProfitError::Unprofitable { .. }));
 
         inputs.slippage_bps = 10_001;
         assert!(matches!(
@@ -453,42 +436,27 @@ mod tests {
     #[test]
     fn min_profit_zero_accepts_any_positive_net() {
         let inputs = ProfitInputs {
-            gross_collateral_cents: 1_000,
-            expected_swap_output_cents: 1_000,
-            flash_fee_cents: 30,
-            gas_cost_cents: 15,
+            expected_swap_output_wei: U256::from(ONE_BNB / 100),
+            flash_fee_wei: U256::from(ONE_BNB / 100_000),
+            gas_cost_debt_wei: U256::from(ONE_BNB / 100_000),
             slippage_bps: 50,
+            debt_price: Price::new(60_000_000_000).expect("valid"),
+            debt_decimals: 18,
         };
         let np = calculate_profit(&inputs, 0).expect("profitable");
-        assert!(np.net_usd_cents > 0);
-    }
-
-    #[test]
-    fn u64_max_gross_does_not_overflow_slippage_path() {
-        // The slippage path multiplies by up to 10_000 before dividing.
-        // u64::MAX * 10_000 *would* wrap — so we expect Overflow, not a
-        // silent truncation.
-        let inputs = ProfitInputs {
-            gross_collateral_cents: u64::MAX,
-            expected_swap_output_cents: u64::MAX,
-            flash_fee_cents: 0,
-            gas_cost_cents: 0,
-            slippage_bps: 50,
-        };
-        assert!(matches!(
-            calculate_profit(&inputs, 0),
-            Err(ProfitError::Overflow)
-        ));
+        assert!(np.net_profit_wei > U256::ZERO);
     }
 
     #[test]
     fn total_cost_addition_overflow_is_reported() {
+        // Force checked_add(flash_fee_wei, gas_cost_debt_wei) to wrap.
         let inputs = ProfitInputs {
-            gross_collateral_cents: u64::MAX,
-            expected_swap_output_cents: 0, // skip the slippage branch
-            flash_fee_cents: u64::MAX,
-            gas_cost_cents: 1, // u64::MAX + 1 -> overflow
+            expected_swap_output_wei: U256::ZERO,
+            flash_fee_wei: U256::MAX,
+            gas_cost_debt_wei: U256::from(1u64),
             slippage_bps: 0,
+            debt_price: Price::new(60_000_000_000).expect("valid"),
+            debt_decimals: 18,
         };
         assert!(matches!(
             calculate_profit(&inputs, 0),
@@ -496,7 +464,7 @@ mod tests {
         ));
     }
 
-    // ── from_opportunity / wei->cents path ──────────────────────────
+    // ── from_opportunity / wei->usd_1e6 path ────────────────────────
 
     fn mk_opp(
         collateral_amount: U256,
@@ -523,45 +491,42 @@ mod tests {
                 token_out: Address::ZERO,
                 amount_in: collateral_amount,
                 min_amount_out: debt_amount,
-                pool_fee: 0,
+                pool_fee: None,
             },
-            net_profit_usd_cents: 0,
+            net_profit_wei: U256::ZERO,
         }
     }
 
     #[test]
     fn bsc_bnb_one_token_at_600_usd_prices_to_600_dollars() {
         // 1 BNB repay, matching-asset collateral, 10% bonus, $600 price
-        let one_bnb = U256::from(1_000_000_000_000_000_000u128);
+        let one_bnb = U256::from(ONE_BNB);
         let one_point_one_bnb = one_bnb * U256::from(11u64) / U256::from(10u64);
         let opp = mk_opp(one_point_one_bnb, one_bnb, 1_000);
         let price = Price::new(60_000_000_000).expect("valid"); // $600
 
-        // Swap output ~= 1.1 BNB worth of debt; flash fee = 0.05% of
-        // 1 BNB = 0.0005 BNB.
+        // Swap output ~= 1.1 BNB; flash fee = 0.05% of 1 BNB = 0.0005 BNB.
         let flash_fee_wei = one_bnb / U256::from(2_000u64);
+        let gas_cost_debt_wei = one_bnb / U256::from(1_000u64);
 
         let inputs = ProfitInputs::from_opportunity(
             &opp,
-            price,
-            price,
-            18,
-            18,
             one_point_one_bnb,
             flash_fee_wei,
-            200,
+            gas_cost_debt_wei,
             50,
+            price,
+            18,
         )
         .expect("valid");
 
-        assert_eq!(inputs.gross_collateral_cents, 66_000); // $660 = 1.1 * $600
-        assert_eq!(inputs.expected_swap_output_cents, 66_000);
-        assert_eq!(inputs.flash_fee_cents, 30); // 0.0005 BNB * $600 = $0.30
+        assert_eq!(inputs.expected_swap_output_wei, one_point_one_bnb);
+        assert_eq!(inputs.flash_fee_wei, flash_fee_wei);
 
         let np = calculate_profit(&inputs, 0).expect("profitable");
-        // slippage = 66_000 * 50 / 10_000 = 330
-        // net = 66_000 - 30 - 200 - 330 = 65_440  (~ $654)
-        assert_eq!(np.net_usd_cents, 65_440);
+        // net = 1.1 - 0.0005 - 0.001 - (1.1*0.005) = 1.0930 BNB ~= $655.80
+        assert!(np.net_profit_usd_1e6 >= 655_000_000);
+        assert!(np.net_profit_usd_1e6 <= 656_000_000);
     }
 
     #[test]
@@ -576,14 +541,12 @@ mod tests {
         assert!(matches!(
             ProfitInputs::from_opportunity(
                 &opp,
-                price,
-                price,
-                19, // invalid
-                18,
                 U256::from(1u64),
                 U256::from(0u64),
+                U256::from(0u64),
                 0,
-                0,
+                price,
+                19, // invalid
             ),
             Err(ProfitError::UnsupportedDecimals(19))
         ));
@@ -596,16 +559,33 @@ mod tests {
         assert!(matches!(
             ProfitInputs::from_opportunity(
                 &opp,
-                price,
-                price,
-                18,
-                18,
                 U256::from(1u64),
                 U256::from(0u64),
+                U256::from(0u64),
                 0,
-                0,
+                price,
+                18,
             ),
             Err(ProfitError::InvalidBps(10_001))
         ));
+    }
+
+    /// `LiquidationOpportunity::net_profit_wei` must equal
+    /// `NetProfit::net_profit_wei` — this is the invariant that
+    /// [`LiquidationOpportunity::with_profit`] enforces.
+    #[test]
+    fn with_profit_copies_net_profit_wei_into_opportunity() {
+        let inputs = typical_inputs();
+        let np = calculate_profit(&inputs, 0).expect("profitable");
+        let opp = mk_opp(U256::from(ONE_BNB), U256::from(ONE_BNB), 1_000);
+        let out = LiquidationOpportunity::with_profit(
+            opp.position.clone(),
+            opp.debt_to_repay,
+            opp.expected_collateral_out,
+            opp.flash_source,
+            opp.swap_route.clone(),
+            np,
+        );
+        assert_eq!(out.net_profit_wei, np.net_profit_wei);
     }
 }
