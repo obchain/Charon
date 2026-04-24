@@ -210,6 +210,9 @@ async fn main() -> Result<()> {
 
     let config = Config::load(&cli.config)
         .with_context(|| format!("failed to load config from {}", cli.config.display()))?;
+    config
+        .validate()
+        .context("config validation failed — refusing to start")?;
 
     // SECURITY: only counts and non-secret scalars here. Never log
     // ws_url, http_url, signer_key, or the full Debug of Config —

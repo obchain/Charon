@@ -13,6 +13,7 @@ pub mod builder;
 pub mod gas;
 pub mod nonce;
 pub mod simulation;
+pub mod submit;
 
 pub use builder::{BuilderError, ICharonLiquidator, TxBuilder};
 pub use gas::{
@@ -20,3 +21,4 @@ pub use gas::{
 };
 pub use nonce::{NonceError, NonceManager};
 pub use simulation::{SimulationError, Simulator};
+pub use submit::{DEFAULT_SUBMIT_TIMEOUT, SubmitError, Submitter};

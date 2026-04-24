@@ -39,6 +39,17 @@ pub enum ConfigError {
     Parse(#[from] toml::de::Error),
     #[error("validation: {0}")]
     Validation(String),
+    /// A chain has no `private_rpc_url` and did not opt in to
+    /// public-mempool submission via `allow_public_mempool = true`.
+    /// Refusing to start is deliberate: broadcasting liquidation
+    /// calldata to the public mempool is a guaranteed front-run.
+    #[error(
+        "chain '{chain}' has no private_rpc_url; set one, or set allow_public_mempool = true to opt in (testnet/dev only)"
+    )]
+    PrivateRpcRequired {
+        /// Chain key (matches a `[chain.<name>]` section).
+        chain: String,
+    },
 }
 
 /// Shorthand `Result`.
@@ -201,6 +212,37 @@ pub struct ChainConfig {
     pub http_url: String,
     #[serde(default = "default_priority_fee_gwei")]
     pub priority_fee_gwei: u64,
+    /// Optional private-RPC endpoint for transaction submission
+    /// (bloxroute / blocknative on BSC, sequencer endpoints on L2s).
+    /// When set, the submitter posts `eth_sendRawTransaction` here
+    /// instead of the public `http_url`, so pending txs skip the
+    /// public mempool and front-runners.
+    ///
+    /// Held in a [`SecretString`] because vendor URLs typically embed
+    /// an API key in the path (e.g. `https://.../?auth=<key>`). Call
+    /// `expose_secret()` only at the single point of use (the
+    /// submitter); never log the raw string.
+    ///
+    /// An empty env-substituted string is treated as `None`, so
+    /// `CHARON_<CHAIN>_PRIVATE_RPC_URL=` in `.env` produces an unset
+    /// endpoint (caught by validation unless `allow_public_mempool`
+    /// is set) rather than a nonsense empty-URL submitter.
+    #[serde(default, deserialize_with = "deser_optional_secret")]
+    pub private_rpc_url: Option<SecretString>,
+    /// Optional bearer token for the private RPC. Attached verbatim
+    /// as `Authorization: Bearer <token>`. Use this when the vendor
+    /// prefers a header over a URL-embedded key. Loaded from
+    /// `CHARON_<CHAIN>_PRIVATE_RPC_AUTH` via env substitution. Empty
+    /// string = unset.
+    #[serde(default, deserialize_with = "deser_optional_secret")]
+    pub private_rpc_auth: Option<SecretString>,
+    /// Escape hatch for local / testnet runs where no private RPC
+    /// exists. When `false` (the default) [`Config::validate`]
+    /// refuses to start a chain with no `private_rpc_url`, because
+    /// submitting liquidation calldata to the public mempool is a
+    /// guaranteed front-run. NEVER enable on mainnet.
+    #[serde(default)]
+    pub allow_public_mempool: bool,
 }
 
 fn default_priority_fee_gwei() -> u64 {
@@ -214,6 +256,23 @@ impl fmt::Debug for ChainConfig {
             .field("ws_url", &"<redacted>")
             .field("http_url", &"<redacted>")
             .field("priority_fee_gwei", &self.priority_fee_gwei)
+            .field(
+                "private_rpc_url",
+                &if self.private_rpc_url.is_some() {
+                    "<redacted>"
+                } else {
+                    "<unset>"
+                },
+            )
+            .field(
+                "private_rpc_auth",
+                &if self.private_rpc_auth.is_some() {
+                    "<redacted>"
+                } else {
+                    "<unset>"
+                },
+            )
+            .field("allow_public_mempool", &self.allow_public_mempool)
             .finish()
     }
 }
@@ -278,10 +337,29 @@ impl Config {
     }
 
     /// Cross-reference chain keys, reject sentinel zero addresses, and
-    /// sanity-check scanner bucket thresholds + cadence.
-    fn validate(&self) -> Result<()> {
+    /// sanity-check scanner bucket thresholds + cadence. Also enforces
+    /// the private-mempool gate: every chain must either carry a
+    /// `private_rpc_url` or opt in to `allow_public_mempool`.
+    ///
+    /// Called from `from_str` on every load, and additionally exposed
+    /// for callers (CLI) that want an explicit belt-and-braces check
+    /// after any programmatic override.
+    pub fn validate(&self) -> Result<()> {
         if self.chain.is_empty() {
             return Err(ConfigError::Validation("no [chain.*] entries".into()));
+        }
+        // Private-mempool gate: every configured chain must either carry
+        // a `private_rpc_url` or explicitly opt in to the public mempool
+        // via `allow_public_mempool = true`. Applying the check per
+        // chain (rather than only per deployed liquidator) means a
+        // misconfigured chain can never fall back to public broadcast
+        // later in the pipeline.
+        for (name, c) in &self.chain {
+            if c.private_rpc_url.is_none() && !c.allow_public_mempool {
+                return Err(ConfigError::PrivateRpcRequired {
+                    chain: name.clone(),
+                });
+            }
         }
         if self.bot.near_liq_threshold_bps <= self.bot.liquidatable_threshold_bps {
             return Err(ConfigError::Validation(format!(
@@ -432,4 +510,121 @@ fn is_valid_env_name(s: &str) -> bool {
         _ => return false,
     }
     chars.all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
+}
+
+#[cfg(test)]
+mod private_rpc_tests {
+    //! Tests for the private-RPC gate and secret redaction on
+    //! `ChainConfig`. These tests are isolated from the file-loading
+    //! `substitute_env_vars` path so they do not race with any other
+    //! `std::env::set_var` usage in the crate.
+
+    use super::*;
+    use secrecy::ExposeSecret;
+
+    fn chain_cfg(private_rpc: Option<&str>, allow_public: bool) -> ChainConfig {
+        ChainConfig {
+            chain_id: 56,
+            ws_url: "wss://example/ws".into(),
+            http_url: "https://example/http".into(),
+            priority_fee_gwei: 1,
+            private_rpc_url: private_rpc.map(|s| SecretString::from(s.to_string())),
+            private_rpc_auth: None,
+            allow_public_mempool: allow_public,
+        }
+    }
+
+    fn base(chain: ChainConfig) -> Config {
+        let mut chains = HashMap::new();
+        chains.insert("bnb".to_string(), chain);
+        Config {
+            bot: BotConfig {
+                min_profit_usd_1e6: 5_000_000,
+                max_gas_wei: U256::from(3_000_000_000u64),
+                scan_interval_ms: 1000,
+                liquidatable_threshold_bps: 10_000,
+                near_liq_threshold_bps: 10_500,
+                hot_scan_blocks: 1,
+                warm_scan_blocks: 10,
+                cold_scan_blocks: 100,
+                signer_key: None,
+            },
+            chain: chains,
+            protocol: HashMap::new(),
+            flashloan: HashMap::new(),
+            liquidator: HashMap::new(),
+            chainlink: HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn validate_rejects_chain_without_private_rpc() {
+        let cfg = base(chain_cfg(None, false));
+        let err = cfg.validate().expect_err("must refuse public mempool");
+        match err {
+            ConfigError::PrivateRpcRequired { chain } => assert_eq!(chain, "bnb"),
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_allows_public_mempool_opt_in() {
+        let cfg = base(chain_cfg(None, true));
+        cfg.validate().expect("opt-in must be honoured");
+    }
+
+    #[test]
+    fn validate_passes_with_private_rpc_configured() {
+        let cfg = base(chain_cfg(Some("https://private.example"), false));
+        cfg.validate().expect("private rpc present -> valid");
+    }
+
+    #[test]
+    fn debug_redacts_private_rpc_url_and_auth() {
+        let mut c = chain_cfg(Some("https://key.example/?auth=SUPER_SECRET_KEY"), false);
+        c.private_rpc_auth = Some(SecretString::from("SECRET_TOKEN".to_string()));
+        let dbg = format!("{c:?}");
+        assert!(
+            !dbg.contains("SUPER_SECRET_KEY"),
+            "private_rpc_url leaked: {dbg}"
+        );
+        assert!(!dbg.contains("SECRET_TOKEN"), "auth token leaked: {dbg}");
+        assert!(
+            dbg.contains("<redacted>"),
+            "redaction marker missing: {dbg}"
+        );
+    }
+
+    #[test]
+    fn deser_treats_empty_private_rpc_as_unset() {
+        // Simulates the env-substitution result when
+        // `CHARON_BSC_PRIVATE_RPC_URL=` is blank: the string reaches
+        // serde as `""`, which must collapse to `None` so the
+        // `PrivateRpcRequired` gate fires instead of constructing a
+        // bogus empty-URL submitter.
+        let toml_src = r#"
+            chain_id = 56
+            ws_url = "wss://x/y"
+            http_url = "https://x/y"
+            private_rpc_url = ""
+            private_rpc_auth = ""
+            allow_public_mempool = true
+        "#;
+        let c: ChainConfig = toml::from_str(toml_src).expect("parse");
+        assert!(c.private_rpc_url.is_none());
+        assert!(c.private_rpc_auth.is_none());
+    }
+
+    #[test]
+    fn deser_keeps_non_empty_private_rpc() {
+        let toml_src = r#"
+            chain_id = 56
+            ws_url = "wss://x/y"
+            http_url = "https://x/y"
+            private_rpc_url = "https://priv.example/rpc"
+        "#;
+        let c: ChainConfig = toml::from_str(toml_src).expect("parse");
+        let url = c.private_rpc_url.expect("url present");
+        assert_eq!(url.expose_secret(), "https://priv.example/rpc");
+    }
 }

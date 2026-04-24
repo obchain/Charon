@@ -35,8 +35,16 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 anyhow = "1"
 thiserror = "2"
 
-# Secret-holding wrapper (zeroes memory on drop, redacts from Debug)
+# Secret-holding wrapper (zeroes memory on drop, redacts from Debug).
+# `serde` feature lets `ChainConfig::private_rpc_*` deserialize directly
+# into `SecretString` via the TOML env-substitution layer.
 secrecy = { version = "0.10", features = ["serde"] }
+
+# URL parsing (scheme validation in the submitter)
+url = "2"
+
+# HTTP client (custom headers on private-RPC transport)
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 
 # Async trait objects
 async-trait = "0.1"
