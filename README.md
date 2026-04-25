@@ -4,7 +4,8 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-edition_2024-orange.svg)](https://www.rust-lang.org/)
-[![Status](https://img.shields.io/badge/status-v0.1%20WIP-yellow.svg)](#roadmap)
+[![Release](https://img.shields.io/github/v/release/obchain/Charon?include_prereleases&sort=semver)](https://github.com/obchain/Charon/releases)
+[![Container](https://img.shields.io/badge/ghcr.io-obchain%2Fcharon-2496ED?logo=docker)](https://github.com/obchain/Charon/pkgs/container/charon)
 
 Charon monitors under-collateralized positions across major DeFi lending protocols and executes profitable liquidations using flash loans — **zero upfront capital, zero position risk**. If a liquidation turns out to be unprofitable at execution time, the entire transaction reverts atomically; the only cost is a failed simulation's gas.
 
@@ -159,6 +160,23 @@ INFO charon: listen: not wired up yet — scanner arrives in Day 2
 ```
 
 For verbose logs, prepend `RUST_LOG=debug`.
+
+### Run from a published container
+
+Tagged releases are published to GitHub Container Registry as `ghcr.io/obchain/charon`:
+
+```bash
+docker pull ghcr.io/obchain/charon:v0.1.0
+docker run --rm \
+  --env-file .env \
+  -v "$PWD/config:/app/config:ro" \
+  ghcr.io/obchain/charon:v0.1.0 \
+  --config /app/config/default.toml listen
+```
+
+Tag schema: `vMAJOR.MINOR.PATCH`, `MAJOR.MINOR.PATCH`, `MAJOR.MINOR`, and `latest`. Each release page lists the published `sha256` digest — pin to it in production.
+
+For a full local stack (Charon + Alloy → Grafana Cloud), use the compose recipe in [`deploy/compose/`](deploy/compose/) — see [Deploy](#deploy-single-host-eg-hetzner-cx22).
 
 ---
 
