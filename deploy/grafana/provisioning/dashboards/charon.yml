@@ -1,0 +1,26 @@
+# Charon — Grafana dashboard provisioning (issue #311).
+#
+# File-based dashboard provider so `deploy/grafana/charon.json` is
+# loaded into Grafana on container startup and shows up under the
+# `Charon` folder. Re-importing the same file replaces the existing
+# copy in place rather than duplicating it (matches the dashboard's
+# fixed UID `charon-v0`).
+
+apiVersion: 1
+
+providers:
+  - name: charon
+    orgId: 1
+    folder: Charon
+    type: file
+    # Pre-existing dashboards on disk should be preserved across
+    # restarts; the operator might be iterating on a panel locally.
+    disableDeletion: true
+    # Re-read the JSON from disk every minute so a `git pull` of
+    # an updated dashboard surfaces in Grafana without a container
+    # restart.
+    updateIntervalSeconds: 60
+    allowUiUpdates: true
+    options:
+      path: /var/lib/grafana/dashboards
+      foldersFromFilesStructure: false
