@@ -202,7 +202,7 @@ enum Command {
         /// opportunity that clears the simulation gate. Off by
         /// default — the pipeline runs scan + simulate only. Requires
         /// all of:
-        ///   * `bot.signer_key` populated (via `BOT_SIGNER_KEY` env),
+        ///   * `bot.signer_key` populated (via `CHARON_SIGNER_KEY` env),
         ///   * every chain with a `[liquidator.<chain>]` section has
         ///     a non-zero `contract_address`,
         ///   * every chain has either `private_rpc_url` configured or
@@ -422,7 +422,7 @@ async fn run_listen(config: &Config, borrowers: Vec<Address>, execute: bool) -> 
         if config.bot.signer_key.is_none() {
             bail!(
                 "--execute refuses to start: bot.signer_key is not set (expected via \
-                 BOT_SIGNER_KEY env in the signer_key = \"${{BOT_SIGNER_KEY}}\" substitution)"
+                 CHARON_SIGNER_KEY env in the signer_key = \"${{CHARON_SIGNER_KEY}}\" substitution)"
             );
         }
         for (chain_name, liq_cfg) in &config.liquidator {
