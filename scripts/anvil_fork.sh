@@ -209,6 +209,13 @@ ANVIL_ARGS=(
     # block-duration histograms and gas-oracle refresh intervals read
     # sensibly during a demo.
     --block-time 3
+    # Throttle upstream call rate so free-tier dRPC / Onfinality / Ankr
+    # endpoints don't 429 us during the heavy boot-time snapshot of all
+    # vToken markets and Chainlink feeds. Override with FORK_CUPS=0 to
+    # disable, or pass a higher value if upstream is keyed.
+    --compute-units-per-second "${FORK_CUPS:-150}"
+    --fork-retry-backoff "${FORK_RETRY_BACKOFF:-1500}"
+    --retries "${FORK_RETRIES:-15}"
 )
 
 # Resolve the effective fork block. Unset ⇒ the pinned default (for
