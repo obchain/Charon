@@ -1,0 +1,61 @@
+name: test
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rust:
+    name: cargo test + release build
+    # Pinned to macos-latest to match the developer environment that produced
+    # the green local Layer 1 pass. charon-executor's
+    # submit_returns_connection_lost_when_transport_fails is platform-sensitive
+    # on Linux runners — see issue #322. Flip back to ubuntu-latest once the
+    # classifier in crates/charon-executor/src/submit.rs is broadened.
+    runs-on: macos-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: cargo test --workspace --locked
+        run: cargo test --workspace --locked
+
+      - name: cargo build --workspace --locked --release
+        run: cargo build --workspace --locked --release
+
+  solidity:
+    name: forge build + forge test
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: contracts
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install Foundry
+        uses: foundry-rs/foundry-toolchain@v1
+
+      - name: forge build --sizes
+        run: forge build --sizes
+
+      - name: forge test -vvv
+        run: forge test -vvv
