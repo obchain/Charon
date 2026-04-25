@@ -1,0 +1,122 @@
+# Charon — local Prometheus + Grafana stack (issue #311).
+#
+# Runs alongside the existing `docker-compose.yml` (charon + alloy ->
+# Grafana Cloud) but keeps a clean separation of concerns: this stack
+# is the *visualisation* surface for laptop demos and pre-merge
+# validation, the cloud-bound stack is the production deploy.
+#
+# The bot itself is intentionally NOT included here. The expected
+# workflow is:
+#
+#   * `cargo run -- --config config/default.toml listen` on the host
+#     (native, fastest iteration), OR
+#   * `docker compose -f deploy/compose/docker-compose.yml up -d`
+#     (containerised, mirrors production).
+#
+# Both topologies are scraped — `prometheus.yml` lists both
+# `host.docker.internal:9091` (native) and `charon:9091` (containerised)
+# as static targets, so whichever path is running shows UP.
+#
+# Ports exposed on the host:
+#   * 9090 — Prometheus UI / API
+#   * 3000 — Grafana UI (anonymous Admin org role; demo only)
+#
+# Usage:
+#   docker compose -f deploy/compose/local-stack.yml up -d
+#   open http://localhost:3000/d/charon-v0      # dashboard auto-loads
+#   open http://localhost:9090/targets          # confirm scrape UP
+#
+# Tear-down:
+#   docker compose -f deploy/compose/local-stack.yml down -v
+#
+# Security note: anonymous Admin is a deliberate concession for laptop
+# demos so the operator does not have to log in on every cold start.
+# Do NOT bring this stack up on a host that exposes :3000 to anything
+# beyond loopback — the Grafana UI would let a passer-by edit panels
+# and read every series. The compose `ports:` mapping below uses
+# `127.0.0.1:` prefixes to enforce loopback-only at the docker level.
+
+services:
+  prometheus:
+    image: prom/prometheus:v2.55.1
+    restart: unless-stopped
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      # Cap retention so a long-running demo cannot fill the laptop
+      # disk; 7 days is well over the longest soak test we run.
+      - --storage.tsdb.retention.time=7d
+      - --web.enable-lifecycle
+    volumes:
+      - ../prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ../grafana/alerts.yaml:/etc/prometheus/alerts.yaml:ro
+      - prometheus_data:/prometheus
+    ports:
+      - "127.0.0.1:9090:9090"
+    extra_hosts:
+      # Required on Linux Docker so `host.docker.internal` resolves
+      # to the host gateway. macOS / Windows already wire this name
+      # automatically; the line is a no-op there.
+      - "host.docker.internal:host-gateway"
+    networks:
+      - local_stack
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 512M
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "3"
+
+  grafana:
+    image: grafana/grafana:10.4.10
+    restart: unless-stopped
+    environment:
+      # Anonymous Admin so the operator never sees a login screen.
+      # See the security note at the top of this file before changing
+      # the host port mapping.
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: "Admin"
+      GF_AUTH_DISABLE_LOGIN_FORM: "true"
+      # Pin the org so provisioned datasources / dashboards land in
+      # the org the anonymous user actually browses.
+      GF_AUTH_ANONYMOUS_ORG_NAME: "Main Org."
+      # Disable telemetry pings during demos so the Grafana UI does
+      # not block the panels on a stats.grafana.org outage.
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+      # Quiet the default first-run banner.
+      GF_USERS_DEFAULT_THEME: "dark"
+    volumes:
+      - ../grafana-provisioning:/etc/grafana/provisioning:ro
+      # Mount the canonical dashboard JSON read-only at the path the
+      # provisioning provider points at; UID `charon-v0` keeps the
+      # imported copy stable across reloads.
+      - ../grafana/charon.json:/var/lib/grafana/dashboards/charon.json:ro
+      - grafana_data:/var/lib/grafana
+    ports:
+      - "127.0.0.1:3000:3000"
+    networks:
+      - local_stack
+    depends_on:
+      - prometheus
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 256M
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "3"
+
+networks:
+  local_stack: {}
+
+volumes:
+  prometheus_data: {}
+  grafana_data: {}

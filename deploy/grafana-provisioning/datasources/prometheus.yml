@@ -1,0 +1,27 @@
+# Charon — Grafana datasource provisioning (issue #311).
+#
+# Auto-registers the in-stack Prometheus as the default datasource so
+# the dashboard JSON resolves its `${datasource}` variable on first
+# load. Without this file the operator would have to click through
+# Grafana's "Add data source" UI before the panels would render.
+#
+# UID is pinned (`prometheus`) so the dashboard JSON's datasource
+# template references stay stable across re-provisions; deleting the
+# datasource on the next compose-up restores it identically.
+
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    uid: prometheus
+    type: prometheus
+    access: proxy
+    # Service DNS name from `local-stack.yml`. `:9090` is the
+    # Prometheus default; we expose `:9090` on the host as well so
+    # the operator can curl `localhost:9090/targets` for diagnostics.
+    url: http://prometheus:9090
+    isDefault: true
+    editable: false
+    jsonData:
+      timeInterval: 15s
+      httpMethod: POST
