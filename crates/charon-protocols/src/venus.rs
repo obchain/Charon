@@ -210,12 +210,20 @@ impl VenusAdapter {
             .await
             .context("Venus: Comptroller.closeFactorMantissa() failed")?
             ._0;
-        let liquidation_incentive_mantissa = comp
+        let liquidation_incentive_mantissa = match comp
             .liquidationIncentiveMantissa()
             .call()
             .await
-            .context("Venus: Comptroller.liquidationIncentiveMantissa() failed")?
-            ._0;
+        {
+            Ok(r) => r._0,
+            Err(err) => {
+                warn!(
+                    err = ?err,
+                    "Venus Comptroller diamond did not route liquidationIncentiveMantissa() — falling back to governance default 1.10e18 (10% bonus)"
+                );
+                U256::from(1_100_000_000_000_000_000u64)
+            }
+        };
 
         let mut underlying_to_vtoken = HashMap::with_capacity(markets.len());
         let mut vtoken_to_underlying = HashMap::with_capacity(markets.len());
