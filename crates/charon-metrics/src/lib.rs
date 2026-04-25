@@ -375,7 +375,7 @@ fn describe_all() {
     );
     describe_counter!(
         names::EXECUTOR_OPPS_QUEUED_TOTAL,
-        "Liquidation opportunities that landed in the queue, labelled `simulated=true|false` to distinguish sim-gated entries from dry-run pushes (BOT_SIGNER_KEY unset)."
+        "Liquidation opportunities that landed in the queue, labelled `simulated=true|false` to distinguish sim-gated entries from dry-run pushes (CHARON_SIGNER_KEY unset)."
     );
     describe_counter!(
         names::EXECUTOR_OPPS_DROPPED_TOTAL,
@@ -468,7 +468,7 @@ pub fn record_simulation(chain: &str, result: &str) {
 ///
 /// `simulated` distinguishes entries that cleared the `eth_call`
 /// simulation gate from entries enqueued without simulation (dry-run
-/// mode when `BOT_SIGNER_KEY` is unset). Splitting on this label keeps
+/// mode when `CHARON_SIGNER_KEY` is unset). Splitting on this label keeps
 /// the gate bypass observable from dashboards instead of letting
 /// unsimulated pushes masquerade as healthy throughput.
 pub fn record_opportunity_queued(chain: &str, profit_usd_cents: u64, simulated: bool) {
