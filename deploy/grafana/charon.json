@@ -433,7 +433,7 @@
         "hide": 0,
         "includeAll": true,
         "label": "Job",
-        "multi": false,
+        "multi": true,
         "name": "job",
         "options": [],
         "query": { "query": "label_values(charon_build_info, job)", "refId": "StandardVariableQuery" },
