@@ -91,7 +91,7 @@ services:
       # Quiet the default first-run banner.
       GF_USERS_DEFAULT_THEME: "dark"
     volumes:
-      - ../grafana/provisioning:/etc/grafana/provisioning:ro
+      - ../grafana-provisioning:/etc/grafana/provisioning:ro
       # Mount the canonical dashboard JSON read-only at the path the
       # provisioning provider points at; UID `charon-v0` keeps the
       # imported copy stable across reloads.
