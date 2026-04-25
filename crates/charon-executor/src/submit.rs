@@ -33,7 +33,7 @@ use alloy::rpc::client::ClientBuilder;
 use alloy::transports::Authorization;
 use alloy::transports::http::Http;
 use alloy::transports::ws::WsConnect;
-use alloy::transports::{BoxTransport, RpcError, TransportError};
+use alloy::transports::{BoxTransport, RpcError, TransportError, TransportErrorKind};
 use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderValue};
 use secrecy::{ExposeSecret, SecretString};
 use tracing::{info, warn};
@@ -314,23 +314,14 @@ fn classify_transport_error(err: TransportError) -> SubmitError {
         RpcError::DeserError { .. } | RpcError::SerError(_) | RpcError::NullResp => {
             SubmitError::RpcRejected(err.to_string())
         }
-        RpcError::Transport(ref kind) => {
-            let msg = kind.to_string();
-            // alloy renders HTTP status errors as "HTTP error <code>...".
-            // 4xx (including 429) is a deterministic rejection; 5xx and
-            // everything else (TCP reset, TLS, DNS) means the caller
-            // should reconnect.
-            let is_4xx = msg.contains("429")
-                || msg.contains("400")
-                || msg.contains("401")
-                || msg.contains("403")
-                || msg.contains("404")
-                || msg.contains("408")
-                || msg.contains("413")
-                || msg.contains("415")
-                || msg.contains("422");
-            if is_4xx {
-                SubmitError::RpcRejected(msg)
+        RpcError::Transport(TransportErrorKind::HttpError(ref http)) => {
+            // 4xx (including 429) is a deterministic RPC-level rejection;
+            // 5xx is server-side and means the caller should reconnect.
+            // Read the structured status code rather than substring-matching
+            // the rendered error — substring matches collide with random
+            // ephemeral ports in transport error messages on Linux runners.
+            if (400..500).contains(&http.status) {
+                SubmitError::RpcRejected(format!("HTTP {} {}", http.status, http.body))
             } else {
                 SubmitError::ConnectionLost(err)
             }
