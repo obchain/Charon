@@ -35,6 +35,7 @@ jobs:
 
       - name: Validate alert rules with promtool
         run: |
-          docker run --rm -v "$PWD/deploy/grafana:/rules:ro" \
+          docker run --rm --entrypoint=promtool \
+            -v "$PWD/deploy/grafana:/rules:ro" \
             prom/prometheus:v2.55.1 \
-            promtool check rules /rules/alerts.yaml
+            check rules /rules/alerts.yaml
