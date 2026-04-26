@@ -111,6 +111,20 @@ pub struct Config {
     /// configured, scanner falls back to protocol oracle.
     #[serde(default)]
     pub chainlink: HashMap<String, HashMap<String, Address>>,
+    /// Per-feed Chainlink staleness window overrides, keyed by chain
+    /// then asset symbol (`chainlink_max_age_secs.bnb.USDT = 86400`).
+    /// Stable feeds (USDC/USDT/FDUSD on BSC) update on deviation, not
+    /// heartbeat, so the global 600s default routinely flags them as
+    /// stale even though the price has not moved. Missing entry =
+    /// fall back to the global default (`DEFAULT_MAX_AGE` / the
+    /// `CHARON_PRICE_MAX_AGE_SECS` env override). See #331.
+    ///
+    /// Top-level section (not nested under `[chainlink.<chain>]`)
+    /// because the existing `chainlink.<chain>` table is symbol-keyed
+    /// and mixing a typed `max_age_secs` sub-table with raw symbol
+    /// entries breaks serde's `HashMap<String, Address>` parse.
+    #[serde(default)]
+    pub chainlink_max_age_secs: HashMap<String, HashMap<String, u64>>,
     /// Prometheus exporter configuration. Missing `[metrics]` block ⇒
     /// defaults from [`MetricsConfig::default`] (enabled, port 9091).
     #[serde(default)]
@@ -915,6 +929,7 @@ mod private_rpc_tests {
             flashloan: HashMap::new(),
             liquidator: HashMap::new(),
             chainlink: HashMap::new(),
+            chainlink_max_age_secs: HashMap::new(),
             metrics: MetricsConfig::default(),
         }
     }
@@ -1168,6 +1183,7 @@ mod fork_profile_tests {
             flashloan: HashMap::new(),
             liquidator: HashMap::new(),
             chainlink: HashMap::new(),
+            chainlink_max_age_secs: HashMap::new(),
             metrics: MetricsConfig::default(),
         }
     }
@@ -1267,5 +1283,44 @@ mod fork_profile_tests {
         assert!(!is_loopback_url("http://10.0.0.1:8545"));
         assert!(!is_loopback_url("http://192.168.1.1"));
         assert!(!is_loopback_url("not-a-url"));
+    }
+
+    #[test]
+    fn chainlink_max_age_secs_round_trips_through_toml() {
+        // Round-trip the per-feed override map through the same
+        // serde derive Config uses. A standalone wrapper keeps the
+        // test focused on the new field — the rest of Config has
+        // a dozen required sections that are out of scope here.
+        #[derive(Deserialize)]
+        struct Wrapper {
+            #[serde(default)]
+            chainlink_max_age_secs: HashMap<String, HashMap<String, u64>>,
+        }
+
+        let toml_src = r#"
+            [chainlink_max_age_secs.bnb]
+            USDT = 86400
+            USDC = 3600
+        "#;
+        let w: Wrapper = toml::from_str(toml_src).expect("parse");
+        let bnb = w
+            .chainlink_max_age_secs
+            .get("bnb")
+            .expect("bnb override section");
+        assert_eq!(bnb.get("USDT"), Some(&86400u64));
+        assert_eq!(bnb.get("USDC"), Some(&3600u64));
+        assert_eq!(bnb.get("BNB"), None, "unspecified feed must fall through");
+    }
+
+    #[test]
+    fn chainlink_max_age_secs_defaults_to_empty_when_missing() {
+        #[derive(Deserialize)]
+        struct Wrapper {
+            #[serde(default)]
+            chainlink_max_age_secs: HashMap<String, HashMap<String, u64>>,
+        }
+
+        let w: Wrapper = toml::from_str("").expect("parse empty");
+        assert!(w.chainlink_max_age_secs.is_empty());
     }
 }
