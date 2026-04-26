@@ -51,10 +51,7 @@ const META_MAX_ATTEMPTS: usize = 5;
 // `fetch_with_retry` is sound only if the loop body executes at
 // least once. A zero attempt cap would skip the loop and hit the
 // unreachable, which would be a bug, not a panic-by-design.
-const _: () = assert!(
-    META_MAX_ATTEMPTS >= 1,
-    "META_MAX_ATTEMPTS must be >= 1"
-);
+const _: () = assert!(META_MAX_ATTEMPTS >= 1, "META_MAX_ATTEMPTS must be >= 1");
 
 /// Initial backoff before the first retry. Doubles every failed
 /// attempt up to `META_MAX_ATTEMPTS`.
@@ -131,11 +128,7 @@ fn is_transient(err: &(impl std::fmt::Debug + ?Sized)) -> bool {
 /// as permanent. `op_name` and `token` are only used for the warn
 /// log on retry, so the operator can correlate dropped markets to
 /// upstream blips.
-async fn fetch_with_retry<F, Fut, T, E>(
-    op_name: &str,
-    token: Address,
-    mut op: F,
-) -> Result<T, E>
+async fn fetch_with_retry<F, Fut, T, E>(op_name: &str, token: Address, mut op: F) -> Result<T, E>
 where
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = Result<T, E>>,
@@ -285,7 +278,9 @@ mod tests {
         assert!(is_transient(&"http error: status 429 Too Many Requests"));
         // Upstream LB 5xx (overload / brief out-of-rotation).
         assert!(is_transient(&"upstream error: status 502 Bad Gateway"));
-        assert!(is_transient(&"upstream error: status 503 Service Unavailable"));
+        assert!(is_transient(
+            &"upstream error: status 503 Service Unavailable"
+        ));
         assert!(is_transient(&"upstream error: status 504 Gateway Timeout"));
         // Generic JSON-RPC throttle codes.
         assert!(is_transient(&"rpc error: code: -32603 internal error"));
@@ -314,12 +309,11 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn fetch_with_retry_returns_first_ok() {
         let mut calls = 0_usize;
-        let result: Result<u8, &'static str> =
-            fetch_with_retry("test", Address::ZERO, || {
-                calls += 1;
-                async move { Ok::<u8, &'static str>(42) }
-            })
-            .await;
+        let result: Result<u8, &'static str> = fetch_with_retry("test", Address::ZERO, || {
+            calls += 1;
+            async move { Ok::<u8, &'static str>(42) }
+        })
+        .await;
         assert_eq!(result, Ok(42));
         assert_eq!(calls, 1);
     }
@@ -332,7 +326,9 @@ mod tests {
             let attempt = calls;
             async move {
                 if attempt < 3 {
-                    Err(format!("http error: status 429 Too Many Requests (attempt {attempt})"))
+                    Err(format!(
+                        "http error: status 429 Too Many Requests (attempt {attempt})"
+                    ))
                 } else {
                     Ok(7)
                 }
@@ -395,7 +391,10 @@ mod tests {
         })
         .await;
         assert!(result.is_err());
-        assert_eq!(calls, 2, "permanent error must short-circuit further retries");
+        assert_eq!(
+            calls, 2,
+            "permanent error must short-circuit further retries"
+        );
     }
 
     #[tokio::test(start_paused = true)]
