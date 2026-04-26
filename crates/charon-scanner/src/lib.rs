@@ -1,5 +1,9 @@
 //! Charon scanner — chain listener, health-factor scanner, and price cache.
 
+// Tests panic on bad fixtures by design; `unwrap_used = "deny"` at the
+// workspace level is for production code.
+#![cfg_attr(test, allow(clippy::unwrap_used))]
+
 pub mod discovery;
 pub mod listener;
 pub mod mempool;

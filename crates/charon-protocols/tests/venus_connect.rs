@@ -1,3 +1,5 @@
+#![allow(clippy::unwrap_used, clippy::expect_used)]
+
 //! Live connectivity smoke test for `VenusAdapter::connect`.
 //!
 //! Skipped unless `BNB_WS_URL` is set — CI / offline runs see no failure,

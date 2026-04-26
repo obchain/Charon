@@ -1,3 +1,5 @@
+#![allow(clippy::unwrap_used, clippy::expect_used)]
+
 //! Profile smoke-tests: every shipped `config/*.toml` must parse
 //! cleanly once its referenced environment variables are populated.
 //!
@@ -14,7 +16,7 @@
 //! Rust 2024. To avoid process-global env mutation entirely, these
 //! tests read the TOML file directly, perform the `${VAR}` ⇒ stub
 //! substitution in a local string, and hand the result to
-//! `Config::from_str`. Both functions are public, both exercise the
+//! `Config::from_toml_str`. Both functions are public, both exercise the
 //! exact validation path `Config::load` uses.
 
 use std::fs;
@@ -39,6 +41,10 @@ fn workspace_root() -> PathBuf {
 /// resolve via their embedded default. Unknown tokens without a
 /// default trigger a test-time panic — a missing stub for a required
 /// var is almost always a test-bug rather than a config issue.
+// `start + 2` and `end + 1` are str-byte offsets bounded by `rest.len()`;
+// overflow would require an input larger than `usize::MAX - 2`, which Rust
+// cannot allocate. Mirrors the production parser in `src/config.rs`.
+#[allow(clippy::arithmetic_side_effects)]
 fn load_with_stubbed_env(path: &PathBuf, pairs: &[(&str, &str)]) -> String {
     let raw = fs::read_to_string(path).expect("read config toml");
     let mut out = String::with_capacity(raw.len());
@@ -81,7 +87,7 @@ fn default_profile_parses() {
         ("CHARON_METRICS_AUTH_TOKEN", ""),
     ];
     let raw = load_with_stubbed_env(&workspace_root().join("config/default.toml"), &pairs);
-    let cfg = Config::from_str(&raw).expect("default.toml should parse");
+    let cfg = Config::from_toml_str(&raw).expect("default.toml should parse");
 
     assert_eq!(cfg.chain["bnb"].chain_id, 56);
     assert!(cfg.flashloan.contains_key("aave_v3_bsc"));
@@ -105,7 +111,7 @@ fn testnet_profile_parses_and_omits_flashloan() {
         ("CHARON_SIGNER_KEY", ""),
     ];
     let raw = load_with_stubbed_env(&workspace_root().join("config/testnet.toml"), &pairs);
-    let cfg = Config::from_str(&raw).expect("testnet.toml should parse");
+    let cfg = Config::from_toml_str(&raw).expect("testnet.toml should parse");
 
     assert_eq!(cfg.chain["bnb"].chain_id, 97);
     assert!(
@@ -137,7 +143,7 @@ fn fork_profile_parses_and_targets_localhost() {
     // updated alongside the TOML.
     let fork_path = workspace_root().join("config/fork.toml");
     let raw = load_with_stubbed_env(&fork_path, &[]);
-    let cfg = Config::from_str(&raw).expect("fork.toml should parse and validate");
+    let cfg = Config::from_toml_str(&raw).expect("fork.toml should parse and validate");
 
     assert_eq!(cfg.chain["bnb"].chain_id, 56);
     assert!(
@@ -189,7 +195,7 @@ fn fork_profile_parses_and_targets_localhost() {
         &workspace_root().join("config/default.toml"),
         &default_pairs,
     );
-    let default_cfg = Config::from_str(&default_raw).expect("default.toml parses");
+    let default_cfg = Config::from_toml_str(&default_raw).expect("default.toml parses");
     assert!(
         cfg.bot.min_profit_usd_1e6 < default_cfg.bot.min_profit_usd_1e6,
         "fork profile min_profit_usd_1e6 ({}) must be strictly lower than default profile ({}) — \

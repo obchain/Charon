@@ -1,3 +1,5 @@
+#![allow(clippy::unwrap_used, clippy::expect_used)]
+
 //! Live `fetch_positions` smoke test against BSC.
 //!
 //! Skipped without `BNB_WS_URL`. Verifies the pipeline — Comptroller,

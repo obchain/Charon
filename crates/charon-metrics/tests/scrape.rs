@@ -1,3 +1,5 @@
+#![allow(clippy::unwrap_used, clippy::expect_used)]
+
 //! End-to-end scrape test for the Prometheus exporter.
 //!
 //! Lives in `tests/` rather than `src/lib.rs`'s `#[cfg(test)]` module

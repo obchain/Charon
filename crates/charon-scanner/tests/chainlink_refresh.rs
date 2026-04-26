@@ -1,3 +1,5 @@
+#![allow(clippy::unwrap_used, clippy::expect_used)]
+
 //! Live Chainlink feed smoke test on BSC.
 //!
 //! Skipped without `BNB_WS_URL`. Verifies `PriceCache::refresh` speaks

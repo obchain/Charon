@@ -16,7 +16,7 @@ use std::fmt;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
-/// Structured error returned by `Config::load` / `Config::from_str`.
+/// Structured error returned by `Config::load` / `Config::from_toml_str`.
 ///
 /// Callers match on the variant to choose exit code or remediation.
 #[derive(Debug, thiserror::Error)]
@@ -486,11 +486,11 @@ impl Config {
                 }
             }
         })?;
-        Self::from_str(&raw)
+        Self::from_toml_str(&raw)
     }
 
     /// Parse an already-loaded TOML string (used by tests and embedded configs).
-    pub fn from_str(raw: &str) -> Result<Self> {
+    pub fn from_toml_str(raw: &str) -> Result<Self> {
         let substituted = substitute_env_vars(raw)?;
         let mut config: Config = toml::from_str(&substituted)?;
         // Collapse any `Some(SecretString(""))` to `None` BEFORE
@@ -545,7 +545,7 @@ impl Config {
     /// the private-mempool gate: every chain must either carry a
     /// `private_rpc_url` or opt in to `allow_public_mempool`.
     ///
-    /// Called from `from_str` on every load, and additionally exposed
+    /// Called from `from_toml_str` on every load, and additionally exposed
     /// for callers (CLI) that want an explicit belt-and-braces check
     /// after any programmatic override.
     pub fn validate(&self) -> Result<()> {
@@ -762,6 +762,12 @@ where
 /// characters (`"`, `\`, newline) inside env values cannot corrupt the parse.
 ///
 /// Values are expected to be placed inside double-quoted TOML strings.
+//
+// `start + 2` and `end + 1` are str-byte offsets bounded by `rest.len()`
+// (which fits in `usize`); overflow would require an input larger than
+// `usize::MAX - 2`, which Rust cannot allocate. Allow the lint locally so
+// the parser stays readable instead of `checked_add`-spelunking each step.
+#[allow(clippy::arithmetic_side_effects)]
 fn substitute_env_vars(input: &str) -> Result<String> {
     let mut output = String::with_capacity(input.len());
     let mut rest = input;
@@ -1031,7 +1037,7 @@ mod private_rpc_tests {
     #[test]
     fn normalize_empty_private_rpc_url_triggers_private_rpc_required() {
         // Planting `Some(SecretString(""))` past the serde layer and
-        // then running `from_str`'s normalize + validate pipeline must
+        // then running `from_toml_str`'s normalize + validate pipeline must
         // leave `private_rpc_url = None` and fire `PrivateRpcRequired`.
         let mut c = chain_cfg(None, false);
         c.private_rpc_url = Some(SecretString::from(String::new()));

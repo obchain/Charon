@@ -39,6 +39,20 @@
 //! against Chainlink feeds for the native asset (BNB) and the debt
 //! token.
 
+// `result_large_err` is allowed module-wide because every variant of
+// `ProfitError` is meaningful to the executor's match arms — the
+// `Unprofitable` branch in particular is the *common* return on the hot
+// path (most candidate opportunities are unprofitable). Boxing it would
+// add a heap allocation per dropped opportunity for no caller benefit.
+//
+// `arithmetic_side_effects` is allowed because the remaining arithmetic
+// in this module is checked-by-construction: U256 divisors are non-zero
+// constants (`10_000`, `10`) or already-validated products of non-zero
+// scales, and additions are gated by explicit `checked_*` chains higher
+// in the call. The lint fires on the divisions only because clippy
+// cannot prove the divisor non-zero across U256.
+#![allow(clippy::result_large_err, clippy::arithmetic_side_effects)]
+
 use alloy::primitives::U256;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;

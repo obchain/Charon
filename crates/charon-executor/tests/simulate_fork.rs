@@ -1,3 +1,5 @@
+#![allow(clippy::unwrap_used, clippy::expect_used)]
+
 //! Fork tests for the `eth_call` simulation gate.
 //!
 //! These tests run against a BSC fork URL (anvil, Hardhat, or a
