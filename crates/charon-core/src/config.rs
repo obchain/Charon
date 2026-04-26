@@ -281,6 +281,15 @@ pub struct BotConfig {
     /// COLD (Healthy) bucket scan cadence. Default every 100 blocks.
     #[serde(default = "default_cold_scan_blocks")]
     pub cold_scan_blocks: u64,
+    /// Cadence (in blocks) for the operator-visible INFO heartbeat
+    /// emitted while listening (#333). Under the default
+    /// `RUST_LOG=info` filter the post-startup terminal is otherwise
+    /// silent for minutes at a time, and operators routinely assume
+    /// the bot has hung. `50` ≈ 150s on BSC's 3s block time. Set to
+    /// `0` to disable the heartbeat entirely (the existing DEBUG
+    /// per-block line still fires when `RUST_LOG=debug`).
+    #[serde(default = "default_heartbeat_blocks")]
+    pub heartbeat_blocks: u64,
     /// Hot-wallet signer key, fed in via `${CHARON_SIGNER_KEY}` env
     /// substitution in `config/default.toml`. Held in a
     /// [`SecretString`] so the raw hex never reaches `Debug` output or
@@ -327,6 +336,7 @@ impl fmt::Debug for BotConfig {
             .field("hot_scan_blocks", &self.hot_scan_blocks)
             .field("warm_scan_blocks", &self.warm_scan_blocks)
             .field("cold_scan_blocks", &self.cold_scan_blocks)
+            .field("heartbeat_blocks", &self.heartbeat_blocks)
             .field(
                 "signer_key",
                 &if self.signer_key.is_some() {
@@ -354,6 +364,9 @@ fn default_warm_scan_blocks() -> u64 {
 }
 fn default_cold_scan_blocks() -> u64 {
     100
+}
+fn default_heartbeat_blocks() -> u64 {
+    50
 }
 
 /// RPC endpoints for a single chain. **The URLs typically embed API keys;
@@ -1053,6 +1066,7 @@ mod private_rpc_tests {
                 hot_scan_blocks: 1,
                 warm_scan_blocks: 10,
                 cold_scan_blocks: 100,
+                heartbeat_blocks: 50,
                 signer_key: None,
                 profile_tag: None,
             },
@@ -1307,6 +1321,7 @@ mod fork_profile_tests {
                 hot_scan_blocks: 1,
                 warm_scan_blocks: 10,
                 cold_scan_blocks: 100,
+                heartbeat_blocks: 50,
                 signer_key: None,
                 profile_tag: Some("fork".into()),
             },
@@ -1454,6 +1469,32 @@ mod fork_profile_tests {
 
         let w: Wrapper = toml::from_str("").expect("parse empty");
         assert!(w.chainlink_max_age_secs.is_empty());
+    }
+
+    #[test]
+    fn heartbeat_blocks_defaults_to_50_when_unset() {
+        // BotConfig requires several non-default fields; populate
+        // only what serde demands and let `heartbeat_blocks` flow
+        // through `default_heartbeat_blocks()`.
+        let toml_src = r#"
+            min_profit_usd_1e6 = 5000000
+            max_gas_wei = "5000000000"
+            scan_interval_ms = 1000
+        "#;
+        let bot: BotConfig = toml::from_str(toml_src).expect("parse");
+        assert_eq!(bot.heartbeat_blocks, 50);
+    }
+
+    #[test]
+    fn heartbeat_blocks_round_trips_explicit_override() {
+        let toml_src = r#"
+            min_profit_usd_1e6 = 5000000
+            max_gas_wei = "5000000000"
+            scan_interval_ms = 1000
+            heartbeat_blocks = 0
+        "#;
+        let bot: BotConfig = toml::from_str(toml_src).expect("parse");
+        assert_eq!(bot.heartbeat_blocks, 0, "explicit 0 disables heartbeat");
     }
 }
 

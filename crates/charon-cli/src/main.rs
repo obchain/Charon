@@ -1019,6 +1019,15 @@ async fn run_listen(config: &Config, borrowers: Vec<Address>, execute: bool) -> 
     // bytes.
     let signer_key = config.bot.signer_key.clone();
 
+    // Operator heartbeat cadence (#333). Default 50 blocks ≈ 150s
+    // on BSC. The block listener used to log only at DEBUG, so a
+    // bot running cleanly under default `RUST_LOG=info` produced no
+    // post-startup output for minutes at a time and operators
+    // routinely assumed it had hung. `heartbeat_blocks = 0`
+    // disables the heartbeat entirely (e.g. JSON-log pipelines that
+    // prefer to derive liveness from the metrics surface).
+    let heartbeat_blocks = config.bot.heartbeat_blocks;
+
     // The first real (non-backfill) block on the Venus chain seeds
     // the scanner with the operator-supplied borrower list.
     // Subsequent scans pull from the scheduler-selected bucket
@@ -1045,6 +1054,24 @@ async fn run_listen(config: &Config, borrowers: Vec<Address>, execute: bool) -> 
                             backfill,
                             "cli drained event"
                         );
+                        // Operator-visible heartbeat. Keyed off the
+                        // chain block number so the cadence is
+                        // deterministic across restarts (versus an
+                        // internal counter that resets to 0 on every
+                        // boot). Skip backfill heads so a reconnect
+                        // storm does not produce a heartbeat per
+                        // replayed block.
+                        if !backfill
+                            && heartbeat_blocks != 0
+                            && number % heartbeat_blocks == 0
+                        {
+                            tracing::info!(
+                                chain = %chain,
+                                block = number,
+                                cadence_blocks = heartbeat_blocks,
+                                "block listener heartbeat"
+                            );
+                        }
                         if backfill {
                             // Skip backfill — the next real head will
                             // snapshot the final state of the missed
