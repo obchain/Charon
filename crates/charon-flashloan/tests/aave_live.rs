@@ -1,3 +1,5 @@
+#![allow(clippy::unwrap_used, clippy::expect_used)]
+
 //! Live Aave V3 flash-loan adapter smoke test on BSC.
 //!
 //! `#[ignore]`-gated: run with `cargo test -p charon-flashloan -- --ignored`

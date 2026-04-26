@@ -569,12 +569,14 @@ impl LendingProtocol for VenusAdapter {
             .underlying_to_vtoken
             .get(&position.collateral_token)
             .copied()
-            .ok_or_else(|| LendingProtocolError::UnsupportedAsset(position.collateral_token))?;
+            .ok_or(LendingProtocolError::UnsupportedAsset(
+                position.collateral_token,
+            ))?;
         let debt_vtoken = snap
             .underlying_to_vtoken
             .get(&position.debt_token)
             .copied()
-            .ok_or_else(|| LendingProtocolError::UnsupportedAsset(position.debt_token))?;
+            .ok_or(LendingProtocolError::UnsupportedAsset(position.debt_token))?;
 
         let scale = one_e18();
         let repay_amount = position

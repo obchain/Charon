@@ -208,6 +208,7 @@ enum Command {
         ///   * every chain has either `private_rpc_url` configured or
         ///     `allow_public_mempool = true` (dev only), and
         ///   * `CHARON_EXECUTE_CONFIRMED=1` in the environment.
+        ///
         /// Any gate failing aborts startup — `--execute` is an
         /// explicit operator intent and must not silently degrade to
         /// scan-only.
@@ -1027,6 +1028,7 @@ async fn run_listen(config: &Config, borrowers: Vec<Address>, execute: bool) -> 
     tokio::select! {
         _ = async {
             while let Some(event) = rx.recv().await {
+                #[allow(clippy::single_match)]
                 match event {
                     ChainEvent::NewBlock {
                         chain,
@@ -1274,7 +1276,7 @@ struct ProductionSimGate<'a> {
 }
 
 #[async_trait]
-impl<'a> SimGate for ProductionSimGate<'a> {
+impl SimGate for ProductionSimGate<'_> {
     async fn encode_and_simulate(
         &self,
         opp: &LiquidationOpportunity,
@@ -1864,6 +1866,7 @@ fn gas_cost_in_debt_wei(
 }
 
 #[cfg(test)]
+#[allow(clippy::items_after_test_module)]
 mod gas_cost_in_debt_wei_tests {
     use super::*;
 

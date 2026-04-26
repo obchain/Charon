@@ -13,6 +13,10 @@
 //! encodes `batchExecute(LiquidationParams[])` calldata for the
 //! on-chain `CharonLiquidator.batchExecute` entrypoint.
 
+// Tests panic on bad fixtures by design; `unwrap_used = "deny"` at the
+// workspace level is for production code.
+#![cfg_attr(test, allow(clippy::unwrap_used))]
+
 pub mod batcher;
 pub mod builder;
 pub mod gas;
