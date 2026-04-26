@@ -61,11 +61,7 @@ pub struct BlockListener {
 
 impl BlockListener {
     /// Build a listener for a single chain.
-    pub fn new(
-        name: impl Into<String>,
-        config: ChainConfig,
-        tx: mpsc::Sender<ChainEvent>,
-    ) -> Self {
+    pub fn new(name: impl Into<String>, config: ChainConfig, tx: mpsc::Sender<ChainEvent>) -> Self {
         Self {
             name: name.into(),
             config,
@@ -105,9 +101,7 @@ impl BlockListener {
                     // `newHeads` rides the public chain RPC, so
                     // `endpoint_kind::PUBLIC` is the right label —
                     // the submitter (PRIVATE) owns its own counter.
-                    charon_metrics::record_rpc_reconnect(
-                        charon_metrics::endpoint_kind::PUBLIC,
-                    );
+                    charon_metrics::record_rpc_reconnect(charon_metrics::endpoint_kind::PUBLIC);
                     let jitter_ms = rand::thread_rng()
                         .gen_range(0..=(backoff.as_millis() as u64).saturating_div(4));
                     let wait = backoff + Duration::from_millis(jitter_ms);
@@ -152,7 +146,10 @@ impl BlockListener {
                         .get_block_by_number(number.into(), false.into())
                         .await
                         .with_context(|| {
-                            format!("chain '{}': get_block_by_number({number}) failed", self.name)
+                            format!(
+                                "chain '{}': get_block_by_number({number}) failed",
+                                self.name
+                            )
                         })?;
                     let (ts, hash) = header
                         .map(|b| (b.header.timestamp, b.header.hash))

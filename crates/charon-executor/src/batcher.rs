@@ -425,9 +425,12 @@ impl Batcher {
             // requires `swapPoolFee > 0` inside `_initiateFlashLoan`.
             // Refuse the calldata here rather than emit a tx that
             // would revert with `"!swapPoolFee"` on-chain.
-            let fee_u32 = opp.swap_route.pool_fee.ok_or(BatcherError::MissingPoolFee {
-                borrower: *borrower,
-            })?;
+            let fee_u32 = opp
+                .swap_route
+                .pool_fee
+                .ok_or(BatcherError::MissingPoolFee {
+                    borrower: *borrower,
+                })?;
             if fee_u32 > UINT24_MAX {
                 return Err(BatcherError::PoolFeeOutOfRange {
                     borrower: *borrower,

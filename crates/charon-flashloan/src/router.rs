@@ -283,7 +283,10 @@ mod tests {
             chain: 56,
         });
         let router = FlashLoanRouter::with_liquidity_tiebreaker(vec![shallow, deep], token()).await;
-        assert_eq!(router.providers()[0].source(), FlashLoanSource::PancakeSwapV3);
+        assert_eq!(
+            router.providers()[0].source(),
+            FlashLoanSource::PancakeSwapV3
+        );
         assert_eq!(router.providers()[1].source(), FlashLoanSource::AaveV3);
     }
 }

@@ -498,7 +498,11 @@ async fn run_listen(config: &Config, borrowers: Vec<Address>, execute: bool) -> 
             // Chainlink price cache. Empty map = no feeds configured,
             // cache stays idle and downstream stages fall back to the
             // protocol oracle. Reuses the Venus adapter's WS provider.
-            let price_feeds = config.chainlink.get(chain_name).cloned().unwrap_or_default();
+            let price_feeds = config
+                .chainlink
+                .get(chain_name)
+                .cloned()
+                .unwrap_or_default();
             let prices = Arc::new(PriceCache::new(
                 provider.clone(),
                 price_feeds,
@@ -591,7 +595,10 @@ async fn run_listen(config: &Config, borrowers: Vec<Address>, execute: bool) -> 
                         .await
                         .context("aave v3: failed to connect flash-loan adapter")?,
                     );
-                    Some((Arc::new(FlashLoanRouter::new(vec![aave])), liq_cfg.contract_address))
+                    Some((
+                        Arc::new(FlashLoanRouter::new(vec![aave])),
+                        liq_cfg.contract_address,
+                    ))
                 }
                 _ => {
                     info!(
@@ -662,10 +669,9 @@ async fn run_listen(config: &Config, borrowers: Vec<Address>, execute: bool) -> 
                         .context("--execute: failed to connect private-RPC submitter")?;
                         let submitter_label = submitter.endpoint().to_string();
 
-                        let nonce_manager =
-                            NonceManager::init(provider.as_ref(), signer_address)
-                                .await
-                                .context("--execute: failed to initialise nonce manager")?;
+                        let nonce_manager = NonceManager::init(provider.as_ref(), signer_address)
+                            .await
+                            .context("--execute: failed to initialise nonce manager")?;
 
                         let gas_oracle = GasOracle::new_for_chain(
                             chain_name.clone(),
@@ -732,9 +738,7 @@ async fn run_listen(config: &Config, borrowers: Vec<Address>, execute: bool) -> 
                      start an execute-mode listener without a protocol pipeline"
                 );
             }
-            info!(
-                "no [protocol.venus] configured — listener will drain events without scanning"
-            );
+            info!("no [protocol.venus] configured — listener will drain events without scanning");
             None
         }
     };
@@ -1070,16 +1074,8 @@ async fn run_block_pipeline(
     // rather than a stale counter that decays with TTL.
     let chain = pipeline.chain_name.as_str();
     charon_metrics::set_position_bucket(chain, bucket::HEALTHY, counts.healthy as u64);
-    charon_metrics::set_position_bucket(
-        chain,
-        bucket::NEAR_LIQ,
-        counts.near_liquidation as u64,
-    );
-    charon_metrics::set_position_bucket(
-        chain,
-        bucket::LIQUIDATABLE,
-        counts.liquidatable as u64,
-    );
+    charon_metrics::set_position_bucket(chain, bucket::NEAR_LIQ, counts.near_liquidation as u64);
+    charon_metrics::set_position_bucket(chain, bucket::LIQUIDATABLE, counts.liquidatable as u64);
 
     // Walk each liquidatable position through the e2e pipeline. Only
     // opportunities that pass the simulation gate reach the queue.
@@ -1618,9 +1614,7 @@ async fn broadcast_opportunity(
         .estimate_gas(&est_tx)
         .await
         .context("broadcast: eth_estimateGas failed")?;
-    let gas_limit = gas_units
-        .saturating_mul(BROADCAST_GAS_BUFFER_NUM)
-        / BROADCAST_GAS_BUFFER_DEN;
+    let gas_limit = gas_units.saturating_mul(BROADCAST_GAS_BUFFER_NUM) / BROADCAST_GAS_BUFFER_DEN;
 
     // 3. Claim a nonce locally — atomic, no race with a parallel
     //    opportunity in the same block.
@@ -1714,8 +1708,7 @@ fn gas_cost_in_debt_wei(
     if debt_price_1e8 == 0 {
         return U256::ZERO;
     }
-    let native_wei =
-        U256::from(gas_units).saturating_mul(U256::from(max_fee_per_gas));
+    let native_wei = U256::from(gas_units).saturating_mul(U256::from(max_fee_per_gas));
     let usd_numerator = native_wei.saturating_mul(U256::from(native_price_1e8));
     // Apply the decimal delta between native and debt. Two separate
     // branches avoid `pow(0)` path-noise and keep the intent obvious.

@@ -52,10 +52,7 @@ impl ChainProvider {
     ///
     /// No panics, no silent fallbacks. Embedded API keys in the RPC URL are
     /// never printed — logs show only the URL's scheme + host portion.
-    pub async fn connect(
-        name: impl Into<String>,
-        config: &ChainConfig,
-    ) -> Result<Arc<Self>> {
+    pub async fn connect(name: impl Into<String>, config: &ChainConfig) -> Result<Arc<Self>> {
         Self::connect_with_timeout(name, config, DEFAULT_CONNECT_TIMEOUT).await
     }
 
@@ -78,9 +75,7 @@ impl ChainProvider {
                     deadline.as_secs()
                 )
             })?
-            .with_context(|| {
-                format!("chain '{name}': failed to connect over ws to {safe_url}")
-            })?;
+            .with_context(|| format!("chain '{name}': failed to connect over ws to {safe_url}"))?;
 
         // Chain id verification — reject a misconfigured endpoint pointing at
         // the wrong network before any state-dependent call runs.

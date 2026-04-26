@@ -305,7 +305,10 @@ impl fmt::Debug for BotConfig {
             .field("min_profit_usd_1e6", &self.min_profit_usd_1e6)
             .field("max_gas_wei", &self.max_gas_wei)
             .field("scan_interval_ms", &self.scan_interval_ms)
-            .field("liquidatable_threshold_bps", &self.liquidatable_threshold_bps)
+            .field(
+                "liquidatable_threshold_bps",
+                &self.liquidatable_threshold_bps,
+            )
             .field("near_liq_threshold_bps", &self.near_liq_threshold_bps)
             .field("hot_scan_blocks", &self.hot_scan_blocks)
             .field("warm_scan_blocks", &self.warm_scan_blocks)
@@ -663,7 +666,9 @@ fn is_loopback_url(url: &str) -> bool {
         return false;
     };
     // Strip off userinfo if present ("user:pass@host").
-    let after_userinfo = after_scheme.rsplit_once('@').map_or(after_scheme, |(_, h)| h);
+    let after_userinfo = after_scheme
+        .rsplit_once('@')
+        .map_or(after_scheme, |(_, h)| h);
     // Host ends at the first '/', '?', '#', or end-of-string.
     let host_and_port = after_userinfo
         .find(['/', '?', '#'])
@@ -709,7 +714,10 @@ where
     match StringOrInt::deserialize(d)? {
         StringOrInt::String(s) => {
             let trimmed = s.trim();
-            if let Some(hex) = trimmed.strip_prefix("0x").or_else(|| trimmed.strip_prefix("0X")) {
+            if let Some(hex) = trimmed
+                .strip_prefix("0x")
+                .or_else(|| trimmed.strip_prefix("0X"))
+            {
                 U256::from_str_radix(hex, 16).map_err(D::Error::custom)
             } else {
                 U256::from_str_radix(trimmed, 10).map_err(D::Error::custom)
@@ -746,9 +754,7 @@ fn substitute_env_vars(input: &str) -> Result<String> {
     while let Some(start) = rest.find("${") {
         output.push_str(&rest[..start]);
         let after = &rest[start + 2..];
-        let end = after
-            .find('}')
-            .ok_or(ConfigError::UnterminatedInterp)?;
+        let end = after.find('}').ok_or(ConfigError::UnterminatedInterp)?;
         let token = &after[..end];
         let (var_name, default) = match token.split_once(":-") {
             Some((name, def)) => (name, Some(def)),
@@ -1198,10 +1204,7 @@ mod fork_profile_tests {
 
     #[test]
     fn fork_profile_rejects_non_loopback_http() {
-        let cfg = fork_cfg(fork_chain(
-            "ws://127.0.0.1:8545",
-            "https://bsc.drpc.org",
-        ));
+        let cfg = fork_cfg(fork_chain("ws://127.0.0.1:8545", "https://bsc.drpc.org"));
         let err = cfg
             .validate()
             .expect_err("fork profile with public http_url must fail");
@@ -1236,10 +1239,7 @@ mod fork_profile_tests {
         // invariant behaviour. Pair a missing private_rpc_url with
         // no allow_public_mempool and the PrivateRpcRequired gate
         // must fire — same as an untagged mainnet profile.
-        let mut cfg = fork_cfg(fork_chain(
-            "wss://remote.example",
-            "https://remote.example",
-        ));
+        let mut cfg = fork_cfg(fork_chain("wss://remote.example", "https://remote.example"));
         cfg.bot.profile_tag = Some("froke".into());
         let err = cfg
             .validate()

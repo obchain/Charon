@@ -46,7 +46,9 @@ fn load_with_stubbed_env(path: &PathBuf, pairs: &[(&str, &str)]) -> String {
     while let Some(start) = rest.find("${") {
         out.push_str(&rest[..start]);
         let after = &rest[start + 2..];
-        let end = after.find('}').expect("unterminated placeholder in fixture");
+        let end = after
+            .find('}')
+            .expect("unterminated placeholder in fixture");
         let token = &after[..end];
         let (name, default) = match token.split_once(":-") {
             Some((n, d)) => (n, Some(d)),

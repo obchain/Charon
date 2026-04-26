@@ -438,12 +438,7 @@ impl PendingCache {
     /// Use in production so `charon_mempool_*` samples carry the
     /// `chain` label.
     pub fn with_defaults_for_chain(chain: impl Into<String>, oracle: Address) -> Self {
-        Self::new_for_chain(
-            chain,
-            oracle,
-            default_selectors(),
-            DEFAULT_MAX_PENDING_AGE,
-        )
+        Self::new_for_chain(chain, oracle, default_selectors(), DEFAULT_MAX_PENDING_AGE)
     }
 
     /// Chain short-name this cache labels its metrics with. Empty
@@ -476,10 +471,7 @@ impl PendingCache {
         // concurrent drain racing this insert still surfaces a
         // well-defined value (count is eventually consistent, which
         // is what dashboards need — not per-event accuracy).
-        charon_metrics::set_mempool_pending_oracle_updates(
-            &self.chain,
-            self.pending.len() as u64,
-        );
+        charon_metrics::set_mempool_pending_oracle_updates(&self.chain, self.pending.len() as u64);
     }
 
     pub fn pending_len(&self) -> usize {
@@ -579,10 +571,7 @@ impl PendingCache {
         // "happy path", whereas drained=0 + pending climbing means
         // "triggers not landing on-chain, TTL about to sweep".
         charon_metrics::record_mempool_drained(&self.chain, out.len() as u64);
-        charon_metrics::set_mempool_pending_oracle_updates(
-            &self.chain,
-            self.pending.len() as u64,
-        );
+        charon_metrics::set_mempool_pending_oracle_updates(&self.chain, self.pending.len() as u64);
         out
     }
 
@@ -776,9 +765,7 @@ impl MempoolMonitor {
                     // picks this up without depending on the mempool
                     // being wired.
                     charon_metrics::record_mempool_ws_reconnect(self.cache.chain());
-                    charon_metrics::record_rpc_reconnect(
-                        charon_metrics::endpoint_kind::PUBLIC,
-                    );
+                    charon_metrics::record_rpc_reconnect(charon_metrics::endpoint_kind::PUBLIC);
                     tokio::time::sleep(backoff).await;
                     backoff = backoff_with_jitter(backoff, MAX_BACKOFF);
                 }

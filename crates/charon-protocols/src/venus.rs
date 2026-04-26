@@ -210,10 +210,7 @@ impl VenusAdapter {
             .await
             .context("Venus: Comptroller.closeFactorMantissa() failed")?
             ._0;
-        let liquidation_incentive_mantissa = match comp
-            .liquidationIncentiveMantissa()
-            .call()
-            .await
+        let liquidation_incentive_mantissa = match comp.liquidationIncentiveMantissa().call().await
         {
             Ok(r) => r._0,
             Err(err) => {
@@ -338,7 +335,12 @@ impl VenusAdapter {
             };
             let vt = abi::IVToken::new(*vtoken, self.provider.clone());
 
-            let borrow = match vt.borrowBalanceStored(borrower).block(block_id).call().await {
+            let borrow = match vt
+                .borrowBalanceStored(borrower)
+                .block(block_id)
+                .call()
+                .await
+            {
                 Ok(r) => r._0,
                 Err(err) => {
                     warn!(%vtoken, %borrower, ?err, "borrowBalanceStored failed");
@@ -406,8 +408,7 @@ impl VenusAdapter {
         let incentive = snap.liquidation_incentive_mantissa;
         let bonus_1e18 = incentive.saturating_sub(scale);
         let one_e14 = U256::from(10u64).pow(U256::from(14u64));
-        let liquidation_bonus_bps = u16::try_from(bonus_1e18 / one_e14)
-            .unwrap_or(0);
+        let liquidation_bonus_bps = u16::try_from(bonus_1e18 / one_e14).unwrap_or(0);
 
         Ok(Some(Position {
             protocol: ProtocolId::Venus,
@@ -468,9 +469,7 @@ impl LendingProtocol for VenusAdapter {
     ) -> LendingResult<Vec<Position>> {
         let mut futs = FuturesUnordered::new();
         for &borrower in borrowers {
-            futs.push(async move {
-                (borrower, self.fetch_position_inner(borrower, block).await)
-            });
+            futs.push(async move { (borrower, self.fetch_position_inner(borrower, block).await) });
         }
         let mut out = Vec::with_capacity(borrowers.len());
         while let Some((borrower, res)) = futs.next().await {
@@ -558,10 +557,7 @@ impl LendingProtocol for VenusAdapter {
     /// Liquidation incentive on Venus is also a **global** Comptroller
     /// parameter (`liquidationIncentiveMantissa`), not per-market.
     /// `collateral_market` is accepted to match the trait shape.
-    async fn get_liquidation_incentive(
-        &self,
-        _collateral_market: Address,
-    ) -> LendingResult<U256> {
+    async fn get_liquidation_incentive(&self, _collateral_market: Address) -> LendingResult<U256> {
         Ok(self.snapshot.read().await.liquidation_incentive_mantissa)
     }
 
@@ -573,9 +569,7 @@ impl LendingProtocol for VenusAdapter {
             .underlying_to_vtoken
             .get(&position.collateral_token)
             .copied()
-            .ok_or_else(|| {
-                LendingProtocolError::UnsupportedAsset(position.collateral_token)
-            })?;
+            .ok_or_else(|| LendingProtocolError::UnsupportedAsset(position.collateral_token))?;
         let debt_vtoken = snap
             .underlying_to_vtoken
             .get(&position.debt_token)
