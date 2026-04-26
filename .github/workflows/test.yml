@@ -14,13 +14,8 @@ concurrency:
 
 jobs:
   rust:
-    name: cargo test + release build
-    # Pinned to macos-latest to match the developer environment that produced
-    # the green local Layer 1 pass. charon-executor's
-    # submit_returns_connection_lost_when_transport_fails is platform-sensitive
-    # on Linux runners — see issue #322. Flip back to ubuntu-latest once the
-    # classifier in crates/charon-executor/src/submit.rs is broadened.
-    runs-on: macos-latest
+    name: cargo fmt + clippy + test + release
+    runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
       - name: Checkout
@@ -28,9 +23,17 @@ jobs:
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
+
+      - name: cargo fmt --all -- --check
+        run: cargo fmt --all -- --check
+
+      - name: cargo clippy --workspace --all-targets --locked -- -D warnings
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
       - name: cargo test --workspace --locked
         run: cargo test --workspace --locked
