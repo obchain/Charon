@@ -178,8 +178,11 @@ impl BlockListener {
     /// stalled consumer cannot stall the WebSocket drain loop; full channel
     /// drops the event with a warning (back-pressure visible to ops).
     fn publish(&mut self, number: u64, timestamp: u64, block_hash: B256, backfill: bool) {
-        metrics::counter!("charon_blocks_received_total", "chain" => self.name.clone())
-            .increment(1);
+        // Route through the typed helper so this counter shares the
+        // same name constant the dashboard and alert rules read; a
+        // raw string here used to drift away from `names::*` and
+        // never showed up on any panel (#328).
+        charon_metrics::record_block_received(&self.name);
         debug!(
             chain = %self.name,
             block = number,

@@ -123,6 +123,15 @@ pub mod names {
     pub const SCANNER_BLOCKS_TOTAL: &str = "charon_scanner_blocks_total";
     pub const SCANNER_POSITIONS: &str = "charon_scanner_positions";
 
+    // Listener — counts every `new_heads` arrival the moment the
+    // websocket subscription delivers it, before the pipeline runs.
+    // Distinct from `SCANNER_BLOCKS_TOTAL` (which advances per
+    // pipeline tick): if the pipeline stalls or the per-block work
+    // unit panics, the listener counter still climbs and the
+    // dashboard can distinguish "no blocks arriving" from "blocks
+    // arriving but pipeline wedged" (#328).
+    pub const LISTENER_BLOCKS_RECEIVED_TOTAL: &str = "charon_listener_blocks_received_total";
+
     // Pipeline
     pub const PIPELINE_BLOCK_DURATION_SECONDS: &str = "charon_pipeline_block_duration_seconds";
 
@@ -358,7 +367,11 @@ pub fn install(bind: SocketAddr) -> Result<Option<ExporterFuture>> {
 fn describe_all() {
     describe_counter!(
         names::SCANNER_BLOCKS_TOTAL,
-        "Total blocks drained from chain listeners."
+        "Total blocks processed by the scanner pipeline (one increment per per-block tick)."
+    );
+    describe_counter!(
+        names::LISTENER_BLOCKS_RECEIVED_TOTAL,
+        "Total `new_heads` events delivered by the chain websocket. Climbs whether or not the pipeline ticks."
     );
     describe_gauge!(
         names::SCANNER_POSITIONS,
@@ -441,6 +454,14 @@ fn describe_all() {
 /// Increment the per-chain blocks-scanned counter.
 pub fn record_block_scanned(chain: &str) {
     counter!(names::SCANNER_BLOCKS_TOTAL, "chain" => chain.to_owned()).increment(1);
+}
+
+/// Increment the per-chain listener block-ingress counter (#328).
+/// Bumped from the websocket `new_heads` handler before the pipeline
+/// runs, so a flat listener counter unambiguously means "no blocks
+/// arriving" rather than "pipeline stalled".
+pub fn record_block_received(chain: &str) {
+    counter!(names::LISTENER_BLOCKS_RECEIVED_TOTAL, "chain" => chain.to_owned()).increment(1);
 }
 
 /// Set the gauge for one health bucket on one chain.
