@@ -272,6 +272,13 @@ struct VenusPipeline {
     /// signer key is caught on boot, not on the first liquidatable
     /// position to land.
     exec_harness: Option<Arc<ExecHarness>>,
+    /// Auto-discovered borrower set (issue #329). Populated in the
+    /// background by `charon_scanner::backfill_borrowers` (one-shot
+    /// historical sweep) and `run_discovery_live_once` (live WS tail
+    /// of `Borrow` events). Merged into the per-block scan set so the
+    /// scanner has a real population to bucket without operator
+    /// `--borrower` seeding.
+    discovery: charon_scanner::BorrowerSet,
 }
 
 /// Bundle of executor components needed to broadcast a simulated
@@ -459,6 +466,14 @@ async fn run_listen(config: &Config, borrowers: Vec<Address>, execute: bool) -> 
         );
     }
 
+    // Borrower-discovery background tasks (issue #329). Stored
+    // outside the protocol-pipeline match so the SIGINT/SIGTERM path
+    // can `abort()` them on graceful shutdown — the discovery tasks
+    // do not run on the supervisor `JoinSet` because that set is
+    // constructed later in this function, after the Venus pipeline
+    // assembly that produces them.
+    let mut discovery_tasks: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+
     // Venus pipeline state is currently single-chain (BNB) per config
     // scope. Build it only if `[protocol.venus]` exists and its target
     // chain plus flashloan+liquidator entries are all configured;
@@ -484,6 +499,92 @@ async fn run_listen(config: &Config, borrowers: Vec<Address>, execute: bool) -> 
 
             let adapter =
                 Arc::new(VenusAdapter::connect(provider.clone(), venus_cfg.comptroller).await?);
+
+            // ── Borrower auto-discovery (issue #329) ─────────────────
+            //
+            // Subscribe to Venus vToken `Borrow(address,uint,uint,uint)`
+            // logs so the scanner has a real population to bucket without
+            // requiring `--borrower 0x...` seeding. Backfill runs as a
+            // bounded background task so startup is not blocked by a slow
+            // free-tier RPC; the live tail starts immediately and merges
+            // discovered addresses into the per-block scan set.
+            //
+            // Spawned task handles are pushed onto `discovery_tasks` so
+            // the SIGINT/SIGTERM path can abort them cleanly — see the
+            // shutdown branches at the bottom of this function.
+            let discovery = charon_scanner::BorrowerSet::new();
+            let vtokens_for_discovery = adapter.markets().await;
+            if vtokens_for_discovery.is_empty() {
+                warn!(
+                    chain = %chain_name,
+                    "discovery: VenusAdapter reports zero markets — discovery tasks not spawned"
+                );
+            } else {
+                {
+                    let provider = provider.clone();
+                    let set = discovery.clone();
+                    let vtokens = vtokens_for_discovery.clone();
+                    let chain = chain_name.clone();
+                    discovery_tasks.push(tokio::spawn(async move {
+                        let head = match provider.get_block_number().await {
+                            Ok(h) => h,
+                            Err(err) => {
+                                warn!(
+                                    chain = %chain,
+                                    error = ?err,
+                                    "discovery backfill: get_block_number failed"
+                                );
+                                return;
+                            }
+                        };
+                        let from = head.saturating_sub(charon_scanner::DEFAULT_BACKFILL_BLOCKS);
+                        if let Err(err) = charon_scanner::backfill_borrowers(
+                            provider.as_ref(),
+                            vtokens,
+                            &set,
+                            from,
+                            head,
+                        )
+                        .await
+                        {
+                            warn!(chain = %chain, error = ?err, "discovery backfill failed");
+                        }
+                    }));
+                }
+                {
+                    let provider = provider.clone();
+                    let set = discovery.clone();
+                    let vtokens = vtokens_for_discovery.clone();
+                    let chain_log = chain_name.clone();
+                    let chain_drain = chain_name.clone();
+                    let (tx, mut rx) = tokio::sync::mpsc::channel::<alloy::primitives::Address>(
+                        charon_scanner::DISCOVERY_CHANNEL_CAPACITY,
+                    );
+                    // Drain the notification channel into a debug log
+                    // — the canonical sink is the BorrowerSet itself;
+                    // this just gives operators a visible heartbeat
+                    // that discovery is observing live events.
+                    discovery_tasks.push(tokio::spawn(async move {
+                        while let Some(addr) = rx.recv().await {
+                            debug!(
+                                chain = %chain_drain,
+                                borrower = %addr,
+                                "discovery: new borrower"
+                            );
+                        }
+                    }));
+                    // Live-tail supervisor — jittered exponential
+                    // backoff with a 30 s cap, mirroring
+                    // `BlockListener::run` so a flapping upstream WS
+                    // does not cause a thundering-herd reconnect.
+                    discovery_tasks.push(tokio::spawn(async move {
+                        charon_scanner::run_discovery_live_with_reconnect(
+                            provider, vtokens, set, tx, chain_log,
+                        )
+                        .await;
+                    }));
+                }
+            }
 
             let scanner = Arc::new(HealthScanner::new(
                 config.bot.liquidatable_threshold_bps,
@@ -717,6 +818,7 @@ async fn run_listen(config: &Config, borrowers: Vec<Address>, execute: bool) -> 
                         min_profit_usd_1e6: config.bot.min_profit_usd_1e6,
                         chain_id,
                         exec_harness,
+                        discovery: discovery.clone(),
                     }))
                 }
                 None => {
@@ -998,6 +1100,16 @@ async fn run_listen(config: &Config, borrowers: Vec<Address>, execute: bool) -> 
         }
     }
 
+    // Cancel the borrower-discovery background tasks on every exit
+    // path. `JoinSet::shutdown` only abort()s tasks it owns; the
+    // discovery tasks (issue #329) live outside that set because they
+    // are constructed before `listeners`, so we abort them explicitly
+    // here. `abort()` is best-effort but the tasks hold no on-chain
+    // locks — only an Arc<DashMap> that drops cleanly.
+    for handle in &discovery_tasks {
+        handle.abort();
+    }
+
     Ok(())
 }
 
@@ -1022,8 +1134,11 @@ async fn run_block_pipeline(
 
     // Which borrowers to scan this tick. First real block uses the
     // operator's seed list; thereafter the scheduler picks buckets
-    // whose cadence fires.
-    let scan_set: Vec<Address> = if !*seeded {
+    // whose cadence fires. Either way, every newly discovered borrower
+    // (issue #329 — populated by the background `charon_scanner`
+    // discovery tasks) is merged in so we ingest fresh addresses
+    // without waiting a full COLD cadence.
+    let mut scan_set: Vec<Address> = if !*seeded {
         *seeded = true;
         borrowers.to_vec()
     } else {
@@ -1039,6 +1154,14 @@ async fn run_block_pipeline(
         }
         v
     };
+    // Pull in the discovered set every block. Addresses already in
+    // `scan_set` (operator seed or bucket member) are de-duplicated
+    // below, so the cost of including them here is one DashMap snapshot.
+    for addr in pipeline.discovery.snapshot() {
+        scan_set.push(addr);
+    }
+    scan_set.sort_unstable();
+    scan_set.dedup();
     if scan_set.is_empty() {
         return;
     }
