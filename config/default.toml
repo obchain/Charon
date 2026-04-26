@@ -107,3 +107,13 @@ BTCB = "0x8ECF7dE377F788A813F5215668E282556b35f300" # BTC / USD — 18-dec Aggre
 ETH  = "0x9ef1B8c0E4F7dc8bF5719Ea496883DC6401d5b2e"
 USDT = "0xB97Ad0E74fa7d920791E90258A6E2085088b4320"
 USDC = "0x51597f405303C4377E36123cBc172b13269EA163"
+
+# Per-feed staleness windows (seconds). Stable-coin Chainlink feeds on
+# BSC update on deviation, not heartbeat — the global 600s default
+# routinely flags USDT / USDC / FDUSD as stale even when the price has
+# not moved, and the freshness gate then drops every position priced
+# against them. Volatile feeds (BNB / ETH / BTCB) keep the global
+# default; only stables override here. See #331.
+[chainlink_max_age_secs.bnb]
+USDT = 86400
+USDC = 86400

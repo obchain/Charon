@@ -41,7 +41,7 @@
 //!   and a fresh scan is cheaper than reconciling retroactive bucket
 //!   transitions.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -604,10 +604,24 @@ async fn run_listen(config: &Config, borrowers: Vec<Address>, execute: bool) -> 
                 .get(chain_name)
                 .cloned()
                 .unwrap_or_default();
-            let prices = Arc::new(PriceCache::new(
+            // Per-symbol max_age overrides: stable feeds (USDT/USDC/FDUSD)
+            // update on deviation, not heartbeat, so the global 600s
+            // default flags them as stale even when the price has not
+            // moved. Operators set these in `[chainlink_max_age_secs.<chain>]`.
+            let per_symbol_max_age: HashMap<String, Duration> = config
+                .chainlink_max_age_secs
+                .get(chain_name)
+                .map(|m| {
+                    m.iter()
+                        .map(|(sym, secs)| (sym.clone(), Duration::from_secs(*secs)))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let prices = Arc::new(PriceCache::with_per_symbol_max_age(
                 provider.clone(),
                 price_feeds,
                 DEFAULT_MAX_AGE,
+                per_symbol_max_age,
             ));
             prices.refresh_all().await;
             let fresh_feeds: Vec<String> = prices.symbols().map(str::to_string).collect();
