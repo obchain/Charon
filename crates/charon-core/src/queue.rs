@@ -209,9 +209,18 @@ mod tests {
         q.push(mk_opp(U256::from(100u64)), 1).await;
         q.push(mk_opp(U256::from(500u64)), 1).await;
         q.push(mk_opp(U256::from(250u64)), 1).await;
-        assert_eq!(q.pop(1).await.expect("fresh").net_profit_wei, U256::from(500u64));
-        assert_eq!(q.pop(1).await.expect("fresh").net_profit_wei, U256::from(250u64));
-        assert_eq!(q.pop(1).await.expect("fresh").net_profit_wei, U256::from(100u64));
+        assert_eq!(
+            q.pop(1).await.expect("fresh").net_profit_wei,
+            U256::from(500u64)
+        );
+        assert_eq!(
+            q.pop(1).await.expect("fresh").net_profit_wei,
+            U256::from(250u64)
+        );
+        assert_eq!(
+            q.pop(1).await.expect("fresh").net_profit_wei,
+            U256::from(100u64)
+        );
         assert!(q.pop(1).await.is_none());
     }
 

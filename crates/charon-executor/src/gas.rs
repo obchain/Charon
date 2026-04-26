@@ -92,7 +92,10 @@ pub enum GasDecision {
     /// the opportunity and logs — both values are wei, mirroring the
     /// config surface, so there is never a gwei/wei mix-up at the
     /// log line.
-    SkipCeilingExceeded { max_fee_wei: U256, ceiling_wei: U256 },
+    SkipCeilingExceeded {
+        max_fee_wei: U256,
+        ceiling_wei: U256,
+    },
 }
 
 /// Per-block cache entry so repeated `fetch_params(block_n)` calls

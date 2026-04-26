@@ -148,10 +148,7 @@ impl HealthScanner {
     pub fn upsert(&self, positions: impl IntoIterator<Item = Position>) {
         for p in positions {
             let new_bucket = self.classify(p.health_factor);
-            let prev_bucket = self
-                .positions
-                .get(&p.borrower)
-                .map(|e| e.value().bucket);
+            let prev_bucket = self.positions.get(&p.borrower).map(|e| e.value().bucket);
             self.positions.insert(
                 p.borrower,
                 BucketedPosition {

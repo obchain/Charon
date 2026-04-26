@@ -366,8 +366,8 @@ mod tests {
         let np = calculate_profit(&inputs, 5_000_000).expect("profitable");
 
         // slippage = 1.1 BNB * 50 / 10_000 = 0.0055 BNB
-        let expected_slippage = inputs.expected_swap_output_wei * U256::from(50u64)
-            / U256::from(10_000u64);
+        let expected_slippage =
+            inputs.expected_swap_output_wei * U256::from(50u64) / U256::from(10_000u64);
         assert_eq!(np.slippage_wei, expected_slippage);
 
         // net = 1.1 - 0.0005 - 0.001 - 0.0055 = 1.0930 BNB
@@ -422,8 +422,7 @@ mod tests {
         // 100% slippage consumes the full swap output -> unprofitable,
         // but the bps check itself must *pass*.
         inputs.slippage_bps = 10_000;
-        let err = calculate_profit(&inputs, 0)
-            .expect_err("100% slippage eats the whole swap");
+        let err = calculate_profit(&inputs, 0).expect_err("100% slippage eats the whole swap");
         assert!(matches!(err, ProfitError::Unprofitable { .. }));
 
         inputs.slippage_bps = 10_001;

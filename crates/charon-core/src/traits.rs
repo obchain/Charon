@@ -76,11 +76,7 @@ pub trait LendingProtocol: Send + Sync {
     ///
     /// Cheaper than `fetch_positions` for gating decisions (e.g. mempool
     /// monitor refresh) because only one aggregate call is needed.
-    async fn get_health_factor(
-        &self,
-        borrower: Address,
-        block: BlockNumberOrTag,
-    ) -> Result<U256>;
+    async fn get_health_factor(&self, borrower: Address, block: BlockNumberOrTag) -> Result<U256>;
 
     /// Close factor for a market, 1e18-scaled.
     ///
@@ -94,24 +90,15 @@ pub trait LendingProtocol: Send + Sync {
     /// Venus uses `liquidationIncentiveMantissa` (default 1.1e18 = 10%
     /// bonus) and it is per-market. Aave uses `LiquidationBonus` in bps.
     /// Profit calculator scales seized collateral by this value.
-    async fn get_liquidation_incentive(
-        &self,
-        collateral_market: Address,
-    ) -> Result<U256>;
+    async fn get_liquidation_incentive(&self, collateral_market: Address) -> Result<U256>;
 
     /// Compute protocol-specific liquidation parameters for a position.
     ///
     /// Handles close-factor math (Aave's 50% cap, Compound's 100% absorb,
     /// etc.) and resolves any protocol-specific token addresses (e.g., Venus
     /// vToken addresses).
-    fn get_liquidation_params(
-        &self,
-        position: &Position,
-    ) -> Result<LiquidationParams>;
+    fn get_liquidation_params(&self, position: &Position) -> Result<LiquidationParams>;
 
     /// Encode the ABI calldata for `CharonLiquidator.executeLiquidation(...)`.
-    fn build_liquidation_calldata(
-        &self,
-        params: &LiquidationParams,
-    ) -> Result<Vec<u8>>;
+    fn build_liquidation_calldata(&self, params: &LiquidationParams) -> Result<Vec<u8>>;
 }
