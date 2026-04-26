@@ -762,47 +762,173 @@ where
 /// characters (`"`, `\`, newline) inside env values cannot corrupt the parse.
 ///
 /// Values are expected to be placed inside double-quoted TOML strings.
+///
+/// Substitution honours TOML comment boundaries (#324): a `${VAR}` token
+/// inside a `#`-prefixed comment is left verbatim rather than substituted,
+/// so a documentation example like
+///
+/// ```toml
+/// # auth_token = "${CHARON_METRICS_AUTH_TOKEN}"
+/// ```
+///
+/// no longer demands that `CHARON_METRICS_AUTH_TOKEN` be exported just to
+/// load the file. String contents (basic `"..."`, literal `'...'`, and the
+/// multi-line `"""..."""` / `'''...'''` forms) are tracked so a `#`
+/// embedded in a string value is not mistaken for a comment.
 //
-// `start + 2` and `end + 1` are str-byte offsets bounded by `rest.len()`
-// (which fits in `usize`); overflow would require an input larger than
-// `usize::MAX - 2`, which Rust cannot allocate. Allow the lint locally so
-// the parser stays readable instead of `checked_add`-spelunking each step.
+// Index increments below are bounded by `chars.len()` (which fits in
+// `usize`); overflow would require an input larger than `usize::MAX`,
+// which Rust cannot allocate. Allow the arithmetic-side-effects lint
+// at function scope so the parser stays readable.
 #[allow(clippy::arithmetic_side_effects)]
 fn substitute_env_vars(input: &str) -> Result<String> {
     let mut output = String::with_capacity(input.len());
-    let mut rest = input;
-    while let Some(start) = rest.find("${") {
-        output.push_str(&rest[..start]);
-        let after = &rest[start + 2..];
-        let end = after.find('}').ok_or(ConfigError::UnterminatedInterp)?;
-        let token = &after[..end];
-        let (var_name, default) = match token.split_once(":-") {
-            Some((name, def)) => (name, Some(def)),
-            None => (token, None),
-        };
-        if !is_valid_env_name(var_name) {
-            return Err(ConfigError::InvalidEnvVarName(var_name.to_string()));
+    // Iterate by Unicode scalar values, not raw bytes. A previous
+    // revision used `bytes[i] as char`, which silently corrupted
+    // non-ASCII bytes (e.g. UTF-8 `é` 0xC3 0xA9 was re-encoded as
+    // `Ã©` 0xC3 0x83 0xC2 0xA9). The lex tokens we care about (`#`,
+    // `"`, `'`, `$`, `{`, `}`, `\`) are all ASCII, so `char_indices`
+    // gives us correct semantics with no extra cost. Byte-offset
+    // slicing for the `${...}` arm still lands on char boundaries
+    // because `${` and `}` are ASCII.
+    let chars: Vec<(usize, char)> = input.char_indices().collect();
+    let mut idx: usize = 0;
+
+    // TOML lexer state. We track string membership only to avoid
+    // mistaking a `#` inside a string for a comment-starter (e.g.
+    // `url = "https://example.com#fragment"`). Substitution still
+    // runs inside strings — that is the entire point of the
+    // substitution helper, since `${VAR}` placeholders are by
+    // convention placed inside double-quoted TOML strings.
+    let mut in_string: Option<(char, bool)> = None;
+    let mut in_comment = false;
+
+    // `idx + N` lookups are bounded by `chars.len()` (which fits in
+    // `usize`); overflow would require an input larger than
+    // `usize::MAX`, which Rust cannot allocate. Allow the lint
+    // locally so the parser stays readable instead of `checked_add`-
+    // spelunking each step.
+    #[allow(clippy::arithmetic_side_effects)]
+    while idx < chars.len() {
+        let (byte_off, c) = chars[idx];
+
+        // Comment lines pass through verbatim — substitution is
+        // skipped — so commented documentation examples like
+        // `# auth_token = "${CHARON_DOC_VAR}"` no longer require the
+        // referenced env var to be set just to load the file (#324).
+        if in_comment {
+            output.push(c);
+            idx += 1;
+            if c == '\n' {
+                in_comment = false;
+            }
+            continue;
         }
-        let value = match std::env::var(var_name) {
-            Ok(v) => v,
-            Err(_) => match default {
-                Some(d) => d.to_string(),
-                None => return Err(ConfigError::UnsetEnvVar(var_name.to_string())),
-            },
-        };
-        for c in value.chars() {
-            match c {
-                '\\' => output.push_str("\\\\"),
-                '"' => output.push_str("\\\""),
-                '\n' => output.push_str("\\n"),
-                '\r' => output.push_str("\\r"),
-                '\t' => output.push_str("\\t"),
-                _ => output.push(c),
+
+        // Track string boundaries so a `#` inside a string is not
+        // mistaken for a comment.
+        if let Some((delim, multi)) = in_string {
+            if multi {
+                if c == delim
+                    && idx + 2 < chars.len()
+                    && chars[idx + 1].1 == delim
+                    && chars[idx + 2].1 == delim
+                {
+                    output.push(c);
+                    output.push(c);
+                    output.push(c);
+                    idx += 3;
+                    in_string = None;
+                    continue;
+                }
+            } else if c == delim {
+                output.push(c);
+                idx += 1;
+                in_string = None;
+                continue;
+            }
+            if delim == '"' && !multi && c == '\\' && idx + 1 < chars.len() {
+                output.push(c);
+                output.push(chars[idx + 1].1);
+                idx += 2;
+                continue;
+            }
+            // Fall through to the `${...}` arm below — substitution
+            // inside strings is supported and load-bearing.
+        } else {
+            // Outside any string. `#` starts a comment that runs to
+            // end of line; comments are preserved verbatim above.
+            if c == '#' {
+                in_comment = true;
+                output.push(c);
+                idx += 1;
+                continue;
+            }
+
+            // String openers: detect `"""`/`'''` first so the trailing
+            // pair isn't misread as two empty single-line strings.
+            if (c == '"' || c == '\'')
+                && idx + 2 < chars.len()
+                && chars[idx + 1].1 == c
+                && chars[idx + 2].1 == c
+            {
+                output.push(c);
+                output.push(c);
+                output.push(c);
+                idx += 3;
+                in_string = Some((c, true));
+                continue;
+            }
+            if c == '"' || c == '\'' {
+                output.push(c);
+                idx += 1;
+                in_string = Some((c, false));
+                continue;
             }
         }
-        rest = &after[end + 1..];
+
+        // `${...}` substitution. Reachable inside strings (load-bearing
+        // for placeholder values) and outside; never inside comments.
+        if c == '$' && idx + 1 < chars.len() && chars[idx + 1].1 == '{' {
+            // `${` is ASCII, so `byte_off + 2` is a valid char boundary.
+            let after = &input[byte_off + 2..];
+            let end = after.find('}').ok_or(ConfigError::UnterminatedInterp)?;
+            let token = &after[..end];
+            let (var_name, default) = match token.split_once(":-") {
+                Some((name, def)) => (name, Some(def)),
+                None => (token, None),
+            };
+            if !is_valid_env_name(var_name) {
+                return Err(ConfigError::InvalidEnvVarName(var_name.to_string()));
+            }
+            let value = match std::env::var(var_name) {
+                Ok(v) => v,
+                Err(_) => match default {
+                    Some(d) => d.to_string(),
+                    None => return Err(ConfigError::UnsetEnvVar(var_name.to_string())),
+                },
+            };
+            for ch in value.chars() {
+                match ch {
+                    '\\' => output.push_str("\\\\"),
+                    '"' => output.push_str("\\\""),
+                    '\n' => output.push_str("\\n"),
+                    '\r' => output.push_str("\\r"),
+                    '\t' => output.push_str("\\t"),
+                    _ => output.push(ch),
+                }
+            }
+            // Advance the char-index cursor past `${`, the token, and `}`.
+            // `${` and `}` are ASCII (1 char each); `token` may contain
+            // multi-byte chars, so count it in chars, not bytes.
+            idx += 2 + token.chars().count() + 1;
+            continue;
+        }
+
+        output.push(c);
+        idx += 1;
     }
-    output.push_str(rest);
+
     Ok(output)
 }
 
@@ -1328,5 +1454,133 @@ mod fork_profile_tests {
 
         let w: Wrapper = toml::from_str("").expect("parse empty");
         assert!(w.chainlink_max_age_secs.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod env_substitution_tests {
+    //! Coverage for `substitute_env_vars`'s comment-aware substitution
+    //! (#324). The regression these guard against is documentation
+    //! examples in commented-out lines forcing every example env var
+    //! to be exported just to load the file.
+
+    use super::*;
+
+    #[test]
+    fn substitution_ignores_commented_env_var_examples() {
+        // The exact bug shape from #324: a commented documentation
+        // example mentions `${UNSET_EXAMPLE_VAR}` to show operators
+        // what an opt-in escape hatch looks like. The unset env var
+        // must not block the load.
+        let toml = "# auth_token = \"${CHARON_DOC_EXAMPLE_UNSET_VAR}\"\nkey = \"value\"\n";
+        let out = substitute_env_vars(toml).expect("commented placeholder is ignored");
+        // Comment line is preserved verbatim, including the placeholder.
+        assert!(out.contains("${CHARON_DOC_EXAMPLE_UNSET_VAR}"));
+        assert!(out.contains("key = \"value\""));
+    }
+
+    #[test]
+    fn substitution_still_runs_outside_comments_with_default() {
+        // Live (non-commented) line with a `:-default` form should still
+        // substitute even when the var is unset.
+        let toml = "host = \"${CHARON_DOC_EXAMPLE_HOST:-localhost}\"\n";
+        let out = substitute_env_vars(toml).expect("default form must apply");
+        assert!(out.contains("host = \"localhost\""));
+    }
+
+    #[test]
+    fn substitution_treats_hash_inside_string_as_literal() {
+        // `#` inside a basic string is part of the value, not a comment.
+        // Substitution must run inside the string. Use the `:-default`
+        // form so this test does not need to mutate the process env
+        // (which is `unsafe` on edition 2024 and racy under cargo's
+        // default parallel test runner).
+        let toml = "label = \"prefix#${CHARON_TEST_HASH_IN_STR_NOT_SET:-ok}\"\n";
+        let out = substitute_env_vars(toml).expect("hash inside string is not a comment");
+        assert!(out.contains("label = \"prefix#ok\""));
+    }
+
+    #[test]
+    fn substitution_treats_hash_inside_literal_string_as_literal() {
+        // Single-quoted literal strings: no escapes, but `#` is still
+        // string content, not a comment. The walker substitutes inside
+        // them too — matches existing behavior; this test pins it.
+        let toml = "raw = 'a#b${CHARON_TEST_LIT_HASH_NOT_SET:-x}'\n";
+        let out = substitute_env_vars(toml).expect("literal-string content");
+        assert!(out.contains("raw = 'a#bx'"));
+    }
+
+    #[test]
+    fn substitution_handles_multi_line_string() {
+        // `"""..."""` content must be preserved including any embedded
+        // `#` characters; the walker must not flip into comment mode
+        // mid-string.
+        let toml = "blob = \"\"\"line1#not-a-comment\nline2\"\"\"\nrest = 1\n";
+        let out = substitute_env_vars(toml).expect("multi-line basic string");
+        assert!(out.contains("line1#not-a-comment"));
+        assert!(out.contains("rest = 1"));
+    }
+
+    #[test]
+    fn substitution_unset_required_var_in_live_line_still_errors() {
+        // Without `:-default` and without env, a live line still errors —
+        // we did NOT relax the unset-var contract for non-commented input.
+        let toml = "url = \"${CHARON_DOC_EXAMPLE_DEFINITELY_UNSET_99}\"\n";
+        let err = substitute_env_vars(toml).expect_err("live unset must fail");
+        assert!(matches!(err, ConfigError::UnsetEnvVar(_)));
+    }
+
+    #[test]
+    fn substitution_preserves_comment_exact_text() {
+        // Line numbers in TOML parser errors must still point at the
+        // right line, so commented lines are passed through unchanged
+        // (no length-shifting from a stripped placeholder).
+        let toml = "# example: ${CHARON_DOC_NOT_SET_AT_ALL}\nfoo = 1\n";
+        let out = substitute_env_vars(toml).expect("comment preserved");
+        assert_eq!(out, toml);
+    }
+
+    #[test]
+    fn substitution_preserves_non_ascii_bytes() {
+        // Regression: an earlier revision of the walker used
+        // `bytes[i] as char` and re-pushed each byte, which mojibake'd
+        // any UTF-8 multi-byte sequence (e.g. `é` 0xC3 0xA9 became
+        // `Ã©` 0xC3 0x83 0xC2 0xA9). TOML permits non-ASCII anywhere
+        // in comments and string values, so the walker must round-trip
+        // every code point byte-for-byte.
+        let toml = "# café — naïve façade ☕\nlabel = \"héllo wörld\"\n";
+        let out = substitute_env_vars(toml).expect("non-ASCII round-trips");
+        assert_eq!(out, toml);
+    }
+
+    #[test]
+    fn substitution_handles_escaped_quote_inside_basic_string() {
+        // `\"` inside a basic string must not be treated as a closer,
+        // otherwise the rest of the line drops out of `in_string` and
+        // a `#` later on the same line would flip the walker into
+        // comment mode mid-value.
+        let toml = "msg = \"a\\\"b#c\"\nnext = 1\n";
+        let out = substitute_env_vars(toml).expect("escaped quote handled");
+        assert_eq!(out, toml);
+    }
+
+    #[test]
+    fn substitution_treats_dollar_brace_inside_comment_as_literal() {
+        // The motivating bug: a `${...}` token inside a comment must
+        // not be rewritten, even if the named env var is unset and
+        // there is no default. This is the inverse of the live-line
+        // unset-error test.
+        let toml = "# placeholder ${SOME_VAR_THAT_IS_NOT_SET_42} end\nx = 1\n";
+        let out = substitute_env_vars(toml).expect("comment ${...} ignored");
+        assert_eq!(out, toml);
+    }
+
+    #[test]
+    fn substitution_treats_hash_in_url_string_as_literal() {
+        // The user-facing motivating case for in-string `#` handling:
+        // a URL fragment inside a basic string must not start a comment.
+        let toml = "rpc_url = \"https://example.com/path#section\"\nnext = 2\n";
+        let out = substitute_env_vars(toml).expect("URL fragment preserved");
+        assert_eq!(out, toml);
     }
 }
