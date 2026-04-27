@@ -23,6 +23,8 @@ use rand::Rng as _;
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
+use crate::token_meta::is_transient;
+
 /// `keccak256("Borrow(address,uint256,uint256,uint256)")` — the Compound /
 /// Venus `Borrow` event signature. Unindexed `borrower` lives in `data[0..32]`.
 pub const BORROW_TOPIC0: B256 =
@@ -49,6 +51,22 @@ pub const DISCOVERY_CHANNEL_CAPACITY: usize = 1_024;
 /// the burst. 50 ms across ~22 chunks adds ~1 s to startup, which is
 /// invisible next to the WS subscription handshake.
 const BACKFILL_INTER_CHUNK_PACING: Duration = Duration::from_millis(50);
+
+/// Per-chunk retry budget for [`backfill_borrowers`]. Free-tier RPCs
+/// occasionally return a 5xx / `-32603` "temporary internal error" on a
+/// single chunk while the next chunk succeeds, so a one-shot failure used
+/// to leave the borrower set empty until the next live `Borrow` event —
+/// during which window the bot misses any pre-existing liquidatable
+/// account. Retry transient classes only (see [`is_transient`]); a
+/// genuinely permanent error (range too large, malformed filter) still
+/// surfaces immediately so the operator notices.
+const BACKFILL_CHUNK_MAX_ATTEMPTS: u32 = 4;
+
+/// Initial backoff between chunk retries; doubles up to a 5 s cap. Worst
+/// case latency added per failing chunk is `0.5 + 1 + 2 + 4 = 7.5 s`,
+/// bounded by `BACKFILL_CHUNK_MAX_ATTEMPTS`.
+const BACKFILL_CHUNK_INITIAL_BACKOFF: Duration = Duration::from_millis(500);
+const BACKFILL_CHUNK_MAX_BACKOFF: Duration = Duration::from_secs(5);
 
 /// Reconnect-backoff ceiling for [`run_discovery_live_with_reconnect`].
 /// Mirrors `BlockListener::run`'s 30 s cap so a long upstream outage
@@ -125,13 +143,49 @@ pub fn decode_borrow_borrower(log: &Log) -> Option<Address> {
     Some(Address::from_slice(&data[12..32]))
 }
 
+/// `eth_getLogs` wrapper with bounded exponential-backoff retry on
+/// transient upstream failures (5xx, `-32603` "temporary internal
+/// error", rate limits, transport drops). Permanent errors — range
+/// too large, malformed filter — surface on the first attempt so the
+/// operator notices instead of waiting through retries.
+async fn get_logs_with_retry(
+    provider: &RootProvider<PubSubFrontend>,
+    filter: &Filter,
+    from_block: u64,
+    to_block: u64,
+) -> Result<Vec<Log>, alloy::transports::RpcError<alloy::transports::TransportErrorKind>> {
+    let mut backoff = BACKFILL_CHUNK_INITIAL_BACKOFF;
+    for attempt in 1..=BACKFILL_CHUNK_MAX_ATTEMPTS {
+        match provider.get_logs(filter).await {
+            Ok(logs) => return Ok(logs),
+            Err(err) => {
+                if !is_transient(&err) || attempt == BACKFILL_CHUNK_MAX_ATTEMPTS {
+                    return Err(err);
+                }
+                warn!(
+                    from_block,
+                    to_block,
+                    attempt,
+                    backoff_ms = backoff.as_millis() as u64,
+                    error = ?err,
+                    "discovery backfill: transient eth_getLogs failure — retrying",
+                );
+                tokio::time::sleep(backoff).await;
+                backoff = backoff.saturating_mul(2).min(BACKFILL_CHUNK_MAX_BACKOFF);
+            }
+        }
+    }
+    unreachable!("get_logs_with_retry: loop must return on final attempt")
+}
+
 /// Backfill the borrower set by paging `eth_getLogs` across the requested
 /// block range in `MAX_LOG_CHUNK_BLOCKS`-sized windows. Returns the number
 /// of distinct addresses observed.
 ///
 /// All vTokens are filtered in a single `Filter::address(vec![...])` per
 /// chunk so the upstream gets one request per chunk rather than one per
-/// market.
+/// market. Each chunk is wrapped in [`get_logs_with_retry`] so a single
+/// transient 5xx no longer leaves the borrower set empty for the run.
 pub async fn backfill_borrowers(
     provider: &RootProvider<PubSubFrontend>,
     vtokens: Vec<Address>,
@@ -164,8 +218,7 @@ pub async fn backfill_borrowers(
             .to_block(chunk_end)
             .address(vtokens.clone())
             .event_signature(topic);
-        let logs = provider
-            .get_logs(&filter)
+        let logs = get_logs_with_retry(provider, &filter, cursor, chunk_end)
             .await
             .with_context(|| format!("eth_getLogs {}..{}", cursor, chunk_end))?;
         debug!(

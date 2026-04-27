@@ -102,7 +102,7 @@ pub struct TokenMetaCache {
 /// permanent error than mis-classify a transient one as terminal:
 /// a permanent error will exhaust `META_MAX_ATTEMPTS` and still
 /// surface, just with a small delay.
-fn is_transient(err: &(impl std::fmt::Debug + ?Sized)) -> bool {
+pub(crate) fn is_transient(err: &(impl std::fmt::Debug + ?Sized)) -> bool {
     let s = format!("{err:?}");
     let lower = s.to_ascii_lowercase();
     s.contains("429")
