@@ -380,3 +380,11 @@ New to the codebase? Check issues tagged [`good first issue`](https://github.com
 ## License
 
 MIT — see [LICENSE](LICENSE).
+
+## 💰 Bounty Contribution
+
+- **Task:** cli: replace static debt-token gas + profit floors with live native/USD conversi
+- **Reward:** $3000
+- **Source:** GitHub-Paid
+- **Date:** 2026-04-27
+
