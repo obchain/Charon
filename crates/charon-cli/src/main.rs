@@ -1206,6 +1206,28 @@ async fn run_block_pipeline(
     scan_set.sort_unstable();
     scan_set.dedup();
     if scan_set.is_empty() {
+        // Idle-tick observability: emit the per-bucket gauges, queue
+        // depth, and block-duration histogram even when there is
+        // nothing to scan, so dashboards distinguish "bot alive but
+        // nothing to do" from "metrics pipeline broken". Without
+        // these, only the scanner block counter advances and every
+        // other panel renders "No data" until the first liquidatable
+        // borrower lands.
+        let chain = pipeline.chain_name.as_str();
+        let counts = pipeline.scanner.bucket_counts();
+        charon_metrics::set_position_bucket(chain, bucket::HEALTHY, counts.healthy as u64);
+        charon_metrics::set_position_bucket(
+            chain,
+            bucket::NEAR_LIQ,
+            counts.near_liquidation as u64,
+        );
+        charon_metrics::set_position_bucket(
+            chain,
+            bucket::LIQUIDATABLE,
+            counts.liquidatable as u64,
+        );
+        charon_metrics::set_queue_depth(pipeline.queue.len().await as u64);
+        charon_metrics::observe_block_duration(chain, start.elapsed().as_secs_f64());
         return;
     }
 
