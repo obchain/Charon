@@ -282,6 +282,35 @@ while ! probe_rpc "$LOCAL_RPC"; do
     sleep 1
 done
 
+# ── Reset dev-account 0 nonce so CREATE address is deterministic ─────
+# CharonLiquidator's documented deploy address
+# (0x5FbDB2315678afecb367f032d93F642f64180aa3) baked into
+# `config/fork.toml` only holds when dev-account-0 has nonce 0 at
+# deploy time. On a BSC mainnet fork, anvil inherits the upstream
+# nonce of 0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266 (~20k+ on real
+# BSC), so the first `forge create` lands at a non-deterministic
+# address and the bot — pointed at the baked-in 0x5FbDB... — sees
+# empty bytecode and silently can't liquidate. Force the nonce to 0
+# so the deterministic-CREATE claim in README §Step 7 holds for any
+# upstream the operator picks.
+readonly DEV0_ADDRESS="0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266"
+if [[ "${CHARON_SKIP_DEV0_NONCE_RESET:-0}" == "1" ]]; then
+    echo "anvil: CHARON_SKIP_DEV0_NONCE_RESET=1 — leaving dev-0 nonce at upstream value; deterministic CharonLiquidator address is NOT guaranteed"
+else
+    # Quote the nonce as a JSON string so `cast rpc` parses it strictly
+    # rather than relying on its bare-token tolerance. Capture stderr
+    # so a failure surfaces a real diagnostic instead of a bare WARNING
+    # line. `2>&1 >/dev/null` is intentional: redirect stderr to where
+    # stdout currently points (the command-substitution sink), then
+    # silence stdout — we only want the error text.
+    set_nonce_err="$(cast rpc --rpc-url "$LOCAL_RPC" anvil_setNonce "$DEV0_ADDRESS" '"0x0"' 2>&1 >/dev/null)" && set_nonce_ok=1 || set_nonce_ok=0
+    if [[ "$set_nonce_ok" == "1" ]]; then
+        echo "anvil: dev-0 nonce reset to 0 — first forge create will land at deterministic 0x5FbDB2315678afecb367f032d93F642f64180aa3"
+    else
+        echo "anvil: WARNING — anvil_setNonce on dev-0 failed (${set_nonce_err}); first forge create may land at a non-deterministic address (update [liquidator.bnb].contract_address in config/fork.toml if so)" >&2
+    fi
+fi
+
 # ── Background keep-alive for Chainlink freshness (#244) ─────────────
 if [[ "$MINE_INTERVAL_SECS" != "0" ]]; then
     echo "anvil: keep-alive enabled — mining 1 extra block every ${MINE_INTERVAL_SECS}s to keep Chainlink feeds fresh"
