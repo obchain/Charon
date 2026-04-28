@@ -263,13 +263,8 @@ fn write_borrower_file(output: &std::path::Path, set: &BorrowerSet) -> Result<()
     }
     std::fs::write(&tmp_path, buf)
         .with_context(|| format!("write temp borrower file {}", tmp_path.display()))?;
-    std::fs::rename(&tmp_path, output).with_context(|| {
-        format!(
-            "rename {} -> {}",
-            tmp_path.display(),
-            output.display()
-        )
-    })?;
+    std::fs::rename(&tmp_path, output)
+        .with_context(|| format!("rename {} -> {}", tmp_path.display(), output.display()))?;
     Ok(())
 }
 
