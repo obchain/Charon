@@ -21,7 +21,9 @@ Charon monitors under-collateralized positions across major DeFi lending protoco
 - [Safety model](#safety-model)
 - [Getting started](#getting-started)
 - [Configuration](#configuration)
+- [Overnight automation (auditor + implementer)](#overnight-automation-auditor--implementer)
 - [Metrics](#metrics)
+- [Deploy (single host, e.g. Hetzner CX22)](#deploy-single-host-eg-hetzner-cx22)
 - [Project structure](#project-structure)
 - [Roadmap](#roadmap)
 - [Contributing](#contributing)
@@ -31,11 +33,13 @@ Charon monitors under-collateralized positions across major DeFi lending protoco
 
 ## Status
 
-**v0.1 — work in progress.** The foundation is in place: Cargo workspace, normalized types, the `LendingProtocol` trait, a TOML config loader with env-var substitution, and a runnable CLI that validates and reports on the loaded config. Chain listening, health scanning, and on-chain execution arrive in the next phases of the build.
+**v0.1 — local end-to-end validated.** Full pipeline runs against a local anvil fork of BSC mainnet: chain listener, Venus adapter (48 vToken markets, Diamond proxy), Chainlink price feeds (BNB / BTCB / ETH / USDT / USDC), Aave V3 flash-loan adapter (0.05 % premium verified), `CharonLiquidator.sol` deployed and exercised via the simulation gate, Prometheus metrics on `:9091`, Grafana dashboard live on `:3000`. The bot scans operator-supplied borrowers every block, classifies them HOT / WARM / COLD by health factor, and runs the full profit / build / simulate / queue / sign chain on liquidatable positions.
 
 **Current scope:** Venus Protocol on BNB Chain. Other protocols and chains are on the [roadmap](#roadmap).
 
-> ⚠️ **Do not run this against mainnet with real funds yet.** Nothing has been battle-tested. Treat v0.1 as development-only.
+**One outstanding gap to autonomous operation:** a paid BSC archive RPC. Free public tiers (dRPC, BlastAPI, 1rpc.io, Ankr) reject the 200 k-block `eth_getLogs` backfill needed for borrower auto-discovery — either rate-limit, return HTTP 500s, or cap chunks at 5 k blocks. Until then, borrowers are passed manually via `--borrower <addr>` (multiple flags allowed). One env var swap to a keyed archive (QuickNode, BlockPi, paid dRPC, Alchemy, Chainstack) unlocks auto-discovery — no code change.
+
+> ⚠️ **Do not run this against mainnet with real funds yet.** End-to-end is proven on fork only. Production checklist (private mempool relay, audited mainnet `CharonLiquidator` deploy, HSM/KMS signer, alerting) lives in the [Roadmap](#roadmap).
 
 ---
 
@@ -134,7 +138,10 @@ git clone https://github.com/obchain/Charon.git
 git clone git@github.com:obchain/Charon.git
 
 cd Charon
-cargo build
+git submodule update --init --recursive   # contracts/lib (forge-std, OZ, Aave V3)
+cargo build --release                     # ~3–5 min cold; ~150 MB final binary
+cargo test --workspace                    # unit + integration tests
+forge test --root contracts               # Solidity unit tests (no fork)
 ```
 
 ### Configure
@@ -144,22 +151,46 @@ cp .env.example .env
 # edit .env with your RPC endpoints
 ```
 
+### After cloning — what you can do
+
+Three first-class paths once `cargo build` succeeds. Pick whichever matches the goal.
+
+| Goal | Profile | Capital risk | Walkthrough |
+|---|---|---|---|
+| **Sanity-check the RPC + config** | any | none | `cargo run -- --config config/default.toml test-connection --chain bnb` — prints latest block. |
+| **Run the full pipeline against a local fork of BSC mainnet (recommended demo)** | `config/fork.toml` | none | [Local anvil fork](#local-anvil-fork--full-end-to-end-demo-validated-april-2026) — three-pane walkthrough below. |
+| **Run scan-only against BSC mainnet (read-only, no signing)** | `config/default.toml` | none — no signer | `cargo run --release -- --config config/default.toml listen --borrower 0x…` |
+| **Run with broadcast against BSC mainnet** | `config/default.toml` | real funds at risk | Read [Safety model](#safety-model) and [Status](#status) first. Set `CHARON_SIGNER_KEY`, `CHARON_BSC_PRIVATE_RPC_URL`, deploy `CharonLiquidator.sol`, set `CHARON_EXECUTE_CONFIRMED=1`, then `listen --execute`. |
+| **Run the Solidity fork tests** | — | none | `forge test --root contracts --fork-url https://bsc-rpc.publicnode.com -vv` |
+| **Stand up the production-shaped Docker stack** | `config/default.toml` | depends on signer | [Deploy](#deploy-single-host-eg-hetzner-cx22) — `cd deploy/compose && docker compose up -d --build`. |
+
 ### Run
 
+The `charon` binary exposes two subcommands:
+
+| Command | Purpose |
+|---|---|
+| `listen` | Spawn one block listener per configured chain, run the full scan + simulate pipeline every block. Add `--borrower 0x…` (repeatable) to seed addresses, `--execute` to sign + broadcast. |
+| `test-connection --chain <name>` | Connect to a configured chain over WS and print its latest block number. Sanity-check that an RPC URL works before standing the full pipeline up. |
+
 ```bash
-cargo run -- --config config/default.toml listen
+# Smoke test the BSC RPC:
+cargo run -- --config config/default.toml test-connection --chain bnb
+
+# Run scan-only (no signer needed, no broadcasts):
+cargo run -- --config config/default.toml listen \
+    --borrower 0x95e704c5f7f3c1b28a99473fd0c27d542bb59be1
+
+# Run with broadcast enabled (mainnet — read the safety model first):
+export CHARON_SIGNER_KEY=0x...
+export CHARON_EXECUTE_CONFIRMED=1
+cargo run --release -- --config config/default.toml listen --execute \
+    --borrower 0x...
 ```
 
-Expected output (v0.1 — scanner not wired up yet):
+`--execute` is gated four-ways at startup — signer key set, every chain has a non-zero `[liquidator.<chain>].contract_address`, every chain has either a `private_rpc_url` or `allow_public_mempool = true`, and `CHARON_EXECUTE_CONFIRMED=1`. Any gate failing aborts launch.
 
-```
-INFO charon: charon starting up
-INFO charon: loading config path=config/default.toml
-INFO charon: config loaded chains=1 protocols=1 flashloan_sources=1 liquidators=1 min_profit_usd=5
-INFO charon: listen: not wired up yet — scanner arrives in Day 2
-```
-
-For verbose logs, prepend `RUST_LOG=debug`.
+For verbose logs, prepend `RUST_LOG=debug` (or `RUST_LOG=charon=debug,info` to mute deps). `RUST_LOG=info` is the default if unset.
 
 ### Run from a published container
 
@@ -223,27 +254,207 @@ Three TOML profiles ship in [`config/`](config/). Pick one with `--config`.
 | Testnet | `config/testnet.toml` | Venus on BSC testnet (Chapel, chainId 97) — no Aave V3 on Chapel, runs read-only. |
 | Local anvil fork | `config/fork.toml` | Full end-to-end against a local anvil fork of BSC mainnet. Zero capital risk. |
 
-#### Local anvil fork (full end-to-end, no capital)
+#### Local anvil fork — full end-to-end demo (validated April 2026)
 
-Fork BSC mainnet locally. Real Venus state, real Aave V3, real PancakeSwap — liquidate real positions against a private chain.
+Fork BSC mainnet locally and run the entire bot — listener, scanner, Venus adapter, Aave V3 flash-loan path, `CharonLiquidator.sol`, Prometheus metrics, Grafana dashboard — without touching real funds.
 
-Terminal A — boot the fork:
+Three-terminal layout: **Pane A** = anvil fork, **Pane B** = bot foreground, **Pane C** = curl + observability + ad-hoc.
 
-```sh
-./scripts/anvil_fork.sh                         # forks latest block via dRPC, falls back to PublicNode
-FORK_BLOCK=41000000 ./scripts/anvil_fork.sh     # pin a specific block
-CHARON_ANVIL_PORT=8546 ./scripts/anvil_fork.sh  # run on a non-default port
-```
+##### 0. Prerequisites (one-time)
 
-Terminal B — run Charon against it:
+Install toolchain + observability stack via Homebrew (macOS) or your distro equivalent.
 
 ```sh
-cargo run -- --config config/fork.toml listen
+# Toolchain
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+curl -L https://foundry.paradigm.xyz | bash && foundryup     # forge, cast, anvil
+
+# Observability (macOS)
+brew install prometheus grafana
+brew services start grafana
 ```
 
-The fork profile carries `profile_tag = "fork"`; `Config::validate` rejects it at startup if any chain's `ws_url` / `http_url` resolves to a non-loopback host. This keeps the intentionally lowered profit gate from ever pointing at mainnet by accident.
+##### 1. Configure local Prometheus to scrape Charon
 
-The fork profile omits `[liquidator.bnb]` by default — after `forge create` against the local anvil, add a `[liquidator.bnb]` section pointing at the deployed address to exercise the full liquidation path. Until then the CLI runs in read-only mode (scanner + metrics only).
+Charon's exporter binds `127.0.0.1:9091`. Drop a Prometheus config at `/tmp/charon-demo/prometheus.yml`:
+
+```yaml
+global:
+  scrape_interval: 5s
+  evaluation_interval: 5s
+
+scrape_configs:
+  - job_name: charon
+    static_configs:
+      - targets: ['127.0.0.1:9091']
+```
+
+Start Prometheus pointed at it:
+
+```sh
+mkdir -p /tmp/charon-demo/data/prom
+prometheus \
+  --config.file=/tmp/charon-demo/prometheus.yml \
+  --storage.tsdb.path=/tmp/charon-demo/data/prom \
+  --web.listen-address=127.0.0.1:9090 \
+  --storage.tsdb.retention.time=7d &
+```
+
+Verify:
+
+```sh
+curl -s -o /dev/null -w "prometheus: %{http_code}\n" http://127.0.0.1:9090/-/ready   # 200
+curl -s -o /dev/null -w "grafana:    %{http_code}\n" http://127.0.0.1:3000/api/health # 200
+```
+
+##### 2. Add the Prometheus data source + Charon dashboard to Grafana
+
+1. Open `http://127.0.0.1:3000` (default login `admin` / `admin`, you'll be prompted to change).
+2. **Connections → Data sources → Add data source → Prometheus**, URL `http://127.0.0.1:9090`, **Save & test**.
+3. **Dashboards → New → Import → Upload JSON file** and pick [`deploy/grafana/charon.json`](deploy/grafana/charon.json). Select the Prometheus data source. **Import**.
+4. Optional alert rules: **Alerting → Alert rules → New rule from file** and pick [`deploy/grafana/alerts.yaml`](deploy/grafana/alerts.yaml).
+
+Dashboard UID is `charon-v0`; re-importing replaces in-place.
+
+##### 3. Pane A — start the anvil fork
+
+The `scripts/anvil_fork.sh` wrapper forks BSC mainnet onto `127.0.0.1:8545`. Pick a free public BSC archive endpoint — **1rpc.io** is the most reliable no-signup option as of April 2026:
+
+```sh
+export FORK_RPC=https://1rpc.io/bnb
+FORK_CUPS=20 FORK_BLOCK=latest ./scripts/anvil_fork.sh
+```
+
+Backups if 1rpc is throttled:
+
+```sh
+export FORK_RPC=https://binance.llamarpc.com   # LlamaRPC
+export FORK_RPC=https://bsc-rpc.publicnode.com # PublicNode
+export FORK_RPC=https://bsc.drpc.org           # dRPC default — flaky on free tier
+```
+
+Wait for `Listening on 0.0.0.0:8545`. Leave this pane running. **Note:** `FORK_BLOCK=latest` follows upstream head; pinned blocks (e.g. `FORK_BLOCK=94000000`) require archive state at `fork_block - 6` and will abort with `metadata is not found` on free tiers.
+
+##### 4. Pane B — build the bot + deploy `CharonLiquidator` on the fork
+
+Open a second terminal in the project root.
+
+```sh
+cargo build --release -p charon-cli
+
+# Anvil dev account 0 — local-only signer
+export CHARON_SIGNER_KEY=0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80
+
+forge create \
+  contracts/src/CharonLiquidator.sol:CharonLiquidator \
+  --rpc-url http://127.0.0.1:8545 \
+  --private-key $CHARON_SIGNER_KEY \
+  --broadcast \
+  --constructor-args \
+    0x6807dc923806fE8Fd134338EABCA509979a7e0cB \
+    0x13f4EA83D0bd40E75C8222255bc855a974568Dd4 \
+    0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266
+```
+
+Constructor args: Aave V3 BSC pool (flash-loan source), PancakeSwap V3 SwapRouter (collateral disposal — `CharonLiquidator` calls `ISwapRouter.exactInputSingle`), cold wallet. Deploy is deterministic — anvil dev-0 with nonce 0 lands at `0x56a1D1cb94711265AdC9A8c01236e11867654Edc` every run, matching the `[liquidator.bnb]` section already in `config/fork.toml`. If you redeploy at a different address, update `contract_address` there before launching the bot.
+
+##### 5. Pane B — launch the bot
+
+Pass one or more borrower addresses via `--borrower` (repeatable):
+
+```sh
+./target/release/charon --config config/fork.toml listen \
+  --borrower 0x95e704c5f7f3c1b28a99473fd0c27d542bb59be1 \
+  --borrower 0xANOTHER_BORROWER_ADDRESS
+```
+
+Watch for these log lines, in order:
+
+```
+charon starting up
+config loaded chains=1 protocols=1 flashloan_sources=1 liquidators=1   # liquidators=1 is critical
+Venus adapter connected ... market_count=48 mapped_markets=47
+discovery live subscription established
+chainlink feed symbol=BNB price=...                                    # × 5 feeds
+token metadata cache built tokens_cached=47
+Aave V3 flash-loan adapter ready pool=0x6807...e0cb premium=5
+venus pipeline ready borrower_count=N
+metrics exporter listening bind=127.0.0.1:9091
+listen: draining chain events
+block subscription established chain=bnb
+block listener heartbeat chain=bnb block=... cadence_blocks=50
+```
+
+Cold start 2–5 min on free RPC; transient HTTP 500 / 429 retries (PR #348, #330) are absorbed automatically. If the bot dies with `Aave V3: FLASHLOAN_PREMIUM_TOTAL() failed`, the upstream is throttling — restart anvil with `FORK_CUPS=20` or swap `FORK_RPC` to a different free endpoint.
+
+##### 6. Pane C — verify metrics + watch Grafana
+
+```sh
+curl -s http://127.0.0.1:9091/metrics | grep charon_ | head -20
+open http://127.0.0.1:3000/d/charon-v0/charon-bot
+```
+
+Expected on the dashboard:
+
+| Panel | Reading |
+| --- | --- |
+| Listener — blocks/s | climbs ~0.33/s (BSC's 3 s block cadence) once anvil mines |
+| Pipeline block latency p50 / p95 | flat lines — fast scans = healthy |
+| Scanner positions by bucket | seeded borrower(s) bucketed HEALTHY / NEAR_LIQ / LIQUIDATABLE |
+| Executor queue depth | near 0 in healthy operation |
+| Profit USD (cents) | zero on a quiet fork unless you replay a known-underwater block |
+
+##### 7. Clean shutdown
+
+```sh
+# Pane B: Ctrl+C  — bot drains then exits
+# Pane A: Ctrl+C  — anvil + mining loop reaped together
+# Prometheus + Grafana left running; they reattach to the next bot session.
+```
+
+##### Profile guarantees
+
+The `fork` profile carries `profile_tag = "fork"`; `Config::validate` rejects it at startup if any chain's `ws_url` / `http_url` resolves to a non-loopback host. This keeps the intentionally lowered profit gate from ever pointing at mainnet by accident.
+
+If `[liquidator.bnb]` is missing from `config/fork.toml`, the pipeline is built without an executor and the listener metrics tick but no scanner gauges fire. Look for `liquidators=1` in the startup banner — `=0` means the section is missing.
+
+---
+
+## Overnight automation (auditor + implementer)
+
+Charon ships a two-script automation pair for unattended overnight iteration. They share a 5 h Claude usage window via `~/.charon-overnight/window-start` so neither runs during a known-throttled period.
+
+| Script | Role | Cadence |
+| --- | --- | --- |
+| [`scripts/overnight_autonomy.sh`](scripts/overnight_autonomy.sh) | **Auditor.** Reads PRD + repo state, identifies gaps, files 5–10 fresh GitHub issues per iteration with `status:ready` label and target milestone. | 22:00 |
+| `~/bin/charon-overnight.sh` (operator-local) | **Implementer.** Picks one `status:ready` issue, branches, lets Claude implement, runs tests, opens a PR. | 02:00 + 05:00 |
+| [`scripts/overnight_doctor.sh`](scripts/overnight_doctor.sh) | **Pre-flight check.** Validates every moving piece (gh auth, branch protection, worktree state, milestone label, Claude CLI reachable, RPC reachable). Run before trusting an unattended launch. | manual |
+| [`scripts/setup_overnight_worktrees.sh`](scripts/setup_overnight_worktrees.sh) | **One-shot setup.** Creates the implementer's dedicated worktree on `impl-base` so auditor + implementer don't deadlock fighting over `main`. Idempotent. | one-time |
+
+### Initial setup
+
+```sh
+./scripts/setup_overnight_worktrees.sh
+./scripts/overnight_doctor.sh        # exits 0 = green
+```
+
+### launchd schedule (macOS)
+
+Create three plists under `~/Library/LaunchAgents/`:
+
+- `dev.charon.auditor.plist` — `StartCalendarInterval { Hour: 22, Minute: 0 }`, runs `scripts/overnight_autonomy.sh`.
+- `dev.charon.implementer.0200.plist` — `StartCalendarInterval { Hour: 2,  Minute: 0 }`, runs `~/bin/charon-overnight.sh`.
+- `dev.charon.implementer.0500.plist` — `StartCalendarInterval { Hour: 5,  Minute: 0 }`, runs `~/bin/charon-overnight.sh`.
+
+Load each: `launchctl load ~/Library/LaunchAgents/dev.charon.auditor.plist` etc. Verify with `launchctl list | grep charon`.
+
+### Constraints enforced by the scripts
+
+- **Window-shared throttle awareness** — neither auditor nor implementer attempts new Claude work while the active 5 h window is known-exhausted (`window-start` file lookup).
+- **Worktree isolation** — implementer runs in a dedicated worktree (`impl-base`) hard-reset to `origin/main` at each launch, so it never collides with the auditor on the same branch.
+- **Audit log append-only** — every iteration's filed issues + opened PRs are appended to a local ledger (no rewriting history).
+- **Dry-run gate** — `CHARON_OVERNIGHT_DRY_RUN=1` runs both scripts without firing `gh issue create` / `gh pr create`, for testing.
+- **Single-PR-per-launch** — implementer picks exactly one issue per fire, so a stuck PR never blocks the queue across multiple cron firings.
 
 ---
 
@@ -307,22 +518,36 @@ The metrics endpoint is not exposed to the host — Alloy reaches it by DNS name
 ```
 Charon/
 ├── crates/
-│   ├── charon-core/        # Shared types, LendingProtocol trait, config loader
-│   ├── charon-scanner/     # Chain listener + health-factor scanner (v0.1 WIP)
-│   └── charon-cli/         # Command-line binary (`charon`)
+│   ├── charon-core/        # Shared types, LendingProtocol trait, config loader,
+│   │                       # opportunity queue, profit calculator
+│   ├── charon-protocols/   # Lending-protocol adapters (Venus on BSC; more in v0.2)
+│   ├── charon-scanner/     # Block listener, health scanner, price cache,
+│   │                       # token metadata cache, mempool monitor, scan scheduler
+│   ├── charon-flashloan/   # Flash-loan source router (Aave V3 on BSC today)
+│   ├── charon-executor/    # Tx builder, simulator, gas oracle, nonce manager,
+│   │                       # private-RPC submitter
+│   ├── charon-metrics/     # Prometheus exporter + canonical metric names module
+│   └── charon-cli/         # `charon` binary — wires every crate together
+├── contracts/              # Foundry workspace housing CharonLiquidator.sol +
+│                           # fork tests against BSC mainnet state
 ├── config/
-│   └── default.toml        # Default configuration (Venus on BNB)
+│   ├── default.toml        # Mainnet — Venus on BNB Chain
+│   ├── testnet.toml        # Chapel (BSC testnet, chainId 97) — read-only
+│   └── fork.toml           # Local anvil fork — full pipeline, zero capital risk
+├── deploy/
+│   ├── compose/            # docker-compose stack: charon + Grafana Alloy
+│   ├── grafana/            # Importable dashboard (charon.json) + alert rules
+│   ├── grafana-provisioning/
+│   └── prometheus/         # Local Prometheus scrape config for the laptop demo
+├── scripts/
+│   ├── anvil_fork.sh                # Forks BSC mainnet onto 127.0.0.1:8545
+│   ├── overnight_autonomy.sh        # Auditor — files GitHub issues unattended
+│   ├── overnight_doctor.sh          # Pre-flight check for unattended runs
+│   └── setup_overnight_worktrees.sh # One-shot worktree setup for the implementer
 ├── .env.example            # Environment variable template
+├── Dockerfile              # Multi-stage build → ~150 MB runtime image
 └── Cargo.toml              # Workspace root + shared dependency versions
 ```
-
-Crates planned for later phases:
-
-- **`charon-protocols/`** — per-protocol adapters (Venus, Aave V3, Compound V3, Morpho, …)
-- **`charon-flashloan/`** — flash-loan source router
-- **`charon-executor/`** — transaction builder, batcher, gas strategy, nonce manager
-- **`charon-telemetry/`** — Prometheus metrics + Telegram alerting
-- **`contracts/`** — Foundry workspace housing `CharonLiquidator.sol`
 
 ---
 
@@ -330,22 +555,30 @@ Crates planned for later phases:
 
 Tracked on GitHub: [obchain/Charon › Milestones](https://github.com/obchain/Charon/milestones).
 
-### v0.1 — Venus on BNB *(current)*
+### v0.1 — Venus on BNB *(current — local end-to-end validated)*
 
-- [x] Cargo workspace + three-crate skeleton
+- [x] Cargo workspace + seven-crate split (`core`, `protocols`, `scanner`, `flashloan`, `executor`, `metrics`, `cli`)
 - [x] Core types (`Position`, `LiquidationOpportunity`, `FlashLoanSource`, `SwapRoute`, …)
-- [x] `LendingProtocol` trait
-- [x] TOML config loader with env-var substitution
-- [x] CLI with `--config` flag and `listen` subcommand
-- [ ] Venus adapter — fetch positions, compute liquidation params
-- [ ] Chainlink price engine (with Uniswap V3 TWAP fallback)
-- [ ] Health-factor scanner + near-liquidation cache
-- [ ] `CharonLiquidator.sol` (Foundry) + deploy script
-- [ ] Flash-loan router (Aave V3 on BSC)
-- [ ] DEX swap optimizer (PancakeSwap / Uniswap V3)
-- [ ] Transaction builder with `eth_call` simulation
-- [ ] Prometheus metrics + Telegram alerts
-- [ ] Docker Compose deployment
+- [x] `LendingProtocol` trait + `Venus` adapter (48 vToken markets, Diamond proxy)
+- [x] TOML config loader with `${ENV_VAR}` substitution + per-profile validation
+- [x] CLI with `listen` (+ `--borrower`, `--execute`) and `test-connection` subcommands
+- [x] Block listener (WebSocket) + automatic reconnect + heartbeat
+- [x] Chainlink price cache + per-feed staleness windows (BNB / BTCB / ETH / USDT / USDC)
+- [x] Token metadata cache with retry on transient RPC failures
+- [x] Health-factor scanner (HEALTHY / NEAR_LIQ / LIQUIDATABLE buckets) + scan scheduler
+- [x] Borrower auto-discovery via vToken `Borrow` event backfill (paid archive RPC required)
+- [x] `CharonLiquidator.sol` + Foundry fork test suite
+- [x] Flash-loan router — Aave V3 on BSC (0.05 % premium verified live)
+- [x] PancakeSwap V3 swap path for collateral disposal (`exactInputSingle`)
+- [x] Tx builder with `eth_call` simulation gate (no sim → no enqueue)
+- [x] Private-RPC submitter (bloxroute / blocknative compatible) + nonce manager + gas oracle
+- [x] Prometheus exporter + Grafana dashboard + alert rules
+- [x] Docker Compose deployment (`charon` + Grafana Alloy → Grafana Cloud)
+- [x] Local anvil-fork demo profile + walkthrough
+- [x] Overnight automation pair (auditor + implementer) with throttle awareness
+- [ ] Paid BSC archive RPC integration test (last gap before unattended mainnet)
+- [ ] Telegram / PagerDuty alert sink
+- [ ] HSM / KMS signer adapter (currently `SecretString`-wrapped local key)
 
 ### v0.2 — Multi-protocol *(planned)*
 
