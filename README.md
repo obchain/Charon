@@ -171,10 +171,16 @@ git submodule update --init --recursive   # contracts/lib (forge-std, OpenZeppel
 ```sh
 cargo build --release                     # ~3–5 min cold; produces ./target/release/charon
 cargo test --workspace                    # Rust unit + integration tests
-forge test --root contracts               # Solidity unit tests (no fork needed)
 ```
 
-If any of these fail, **stop and fix before moving on** — every subsequent step depends on a working `target/release/charon` binary.
+If either of these fail, **stop and fix before moving on** — every subsequent step depends on a working `target/release/charon` binary.
+
+**Foundry tests (optional, archive RPC required).** The Solidity suite under `contracts/test/` is fork-backed: every test gates on a `BNB_HTTP_URL` / `BNB_RPC_URL` env var pointing at a real **archive** BSC endpoint. With no env var the whole suite skips cleanly; with a non-archive endpoint (`bsc-rpc.publicnode.com`, free dRPC, etc.) `setUp` errors with `historical state is not available`. Skip this step unless you have an archive endpoint:
+
+```sh
+# Only if you have a BSC archive RPC (QuickNode, BlockPi, paid dRPC, Alchemy, Chainstack):
+BNB_HTTP_URL=https://your-archive-rpc forge test --root contracts
+```
 
 ### Step 4 — Configure environment variables
 
