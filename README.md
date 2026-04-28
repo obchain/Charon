@@ -28,6 +28,7 @@ Charon monitors under-collateralized positions across major DeFi lending protoco
 - [Deploy (single host, e.g. Hetzner CX22)](#deploy-single-host-eg-hetzner-cx22)
 - [Project structure](#project-structure)
 - [Roadmap](#roadmap)
+- [Viewing the bot's live report on Grafana](#viewing-the-bots-live-report-on-grafana)
 - [Contributing](#contributing)
 - [License](#license)
 
@@ -606,6 +607,68 @@ Tracked on GitHub: [obchain/Charon › Milestones](https://github.com/obchain/Ch
 - Polygon PoS
 - Base
 - Avalanche C-Chain
+
+---
+
+## Viewing the bot's live report on Grafana
+
+After cloning and finishing the [Quick start](#quick-start--clone-to-running-bot-on-a-local-bsc-fork) (steps 1 → 9), the bot is publishing metrics on `http://127.0.0.1:9091/metrics`, Prometheus is scraping every 5 s, and Grafana is rendering the `charon-v0` dashboard. Here is exactly what to look at and how to read it.
+
+### 1. Open the dashboard
+
+```sh
+open http://127.0.0.1:3000/d/charon-v0/charon-bot      # macOS
+xdg-open http://127.0.0.1:3000/d/charon-v0/charon-bot  # Linux
+```
+
+Login `admin` / `admin` (or whatever you reset it to in Step 6). The dashboard URL is bookmarkable — it survives restarts of both Prometheus and Grafana.
+
+### 2. Pick the right time window
+
+Top-right time picker → **Last 15 minutes** for an active demo, **Last 24 hours** for an overnight soak. Set auto-refresh to **5s** (top-right next to the picker) so panels track live as the bot ticks.
+
+The top-bar variables `Chain` and `Instance` populate from label values once metrics start flowing — leave them on `All` for a single-chain run.
+
+### 3. Read each panel
+
+Nine panels ship in [`deploy/grafana/charon.json`](deploy/grafana/charon.json). Read them in this order to debug from "nothing works" to "missed a profitable trade":
+
+| # | Panel | What healthy looks like | What it tells you |
+|---|---|---|---|
+| 1 | **Scanner — blocks per second** | climbs to ~0.33/s on BSC (3 s blocks) | Block listener is connected to the chain. Flat zero = WS dead, restart bot. |
+| 2 | **Pipeline — block latency p50 / p95** | flat lines under ~500 ms | Per-block scan + simulate duration. Climbing p95 = RPC slow or borrower set too large. |
+| 3 | **Scanner — positions by bucket** | every seeded `--borrower` accounted for across HEALTHY / NEAR_LIQ / LIQUIDATABLE | Confirms positions are being decoded. Missing = wrong borrower address or Venus adapter not wired. |
+| 4 | **Queue depth** | hovers near 0 | Opportunities waiting for broadcast. Persistently > 0 = submitter blocked / private RPC down. |
+| 5 | **Profit (selected range)** | zero on quiet fork; non-zero whenever a liquidation lands | Cumulative realised profit in USD cents over the selected window. |
+| 6 | **Executor — simulations per minute** | non-zero whenever bucket #3 is non-empty | `eth_call` rate. Should track the rate at which positions enter LIQUIDATABLE bucket. |
+| 7 | **Executor — opportunities queued vs dropped** | drop reasons visible per stage | Funnel from scan → enqueue, broken down by drop stage (`unprofitable`, `simulation_revert`, `gas_too_high`, …). This is your debugging surface. |
+| 8 | **Executor — per-opportunity profit distribution** | histogram populates as opportunities fire | Per-opportunity profit in cents. Tail to the right = profitable, clustered near zero = profit gate too low. |
+| 9 | **Build info** | shows version + git SHA of the running binary | Sanity-check that the bot you booted is the bot you built. |
+
+### 4. What to expect on a quiet fork
+
+`config/fork.toml` against `FORK_BLOCK=latest` mirrors live BSC mainnet state, which means most seeded borrowers are healthy. So:
+
+- Panels **#1, #2, #3, #9** populate immediately and stay populated.
+- Panels **#5, #6, #7, #8** stay quiet unless you either (a) pin `FORK_BLOCK` to a known underwater block or (b) drop the borrower's collateral price using `cast rpc anvil_setStorageAt` to force them into LIQUIDATABLE.
+
+A flat profit panel is **not a bug** on a quiet fork — it is the bot correctly observing that nothing is liquidatable right now.
+
+### 5. Optional — load the alert rules
+
+Same Grafana, **Alerting → Alert rules → New rule from file**, pick [`deploy/grafana/alerts.yaml`](deploy/grafana/alerts.yaml). Loads thresholds for: stalled block listener, missing Chainlink prices, climbing queue depth, runaway drop rate. Tune per-environment before wiring a pager.
+
+### 6. Headless capture (no browser)
+
+Need a screenshot for a PR or report:
+
+```sh
+curl -u admin:<password> \
+  "http://127.0.0.1:3000/render/d-solo/charon-v0/charon-bot?orgId=1&panelId=3&width=1000&height=500&from=now-15m&to=now" \
+  -o /tmp/charon-bucket.png
+```
+
+Requires the [Grafana image renderer plugin](https://grafana.com/grafana/plugins/grafana-image-renderer/). On a single-host install: `grafana-cli plugins install grafana-image-renderer && brew services restart grafana`.
 
 ---
 
