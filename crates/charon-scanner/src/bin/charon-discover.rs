@@ -106,7 +106,11 @@ async fn main() -> Result<()> {
         "charon-discover starting"
     );
 
-    let config = Config::load(&cli.config)
+    // Use the unvalidated loader: discovery is read-only and has no
+    // business being gated on broadcaster-only invariants like
+    // `private_rpc_url` or `signer_key`. The full `charon` binary
+    // still validates on its own load path.
+    let config = Config::load_unvalidated(&cli.config)
         .with_context(|| format!("failed to load config from {}", cli.config.display()))?;
 
     let chain_cfg = config
@@ -221,9 +225,21 @@ async fn try_one_rpc(
         "discovery: starting backfill"
     );
 
-    backfill_borrowers(provider.as_ref(), vtokens, set, from_block, to_block)
-        .await
-        .context("backfill_borrowers failed")?;
+    // Free-tier RPCs (PublicNode, dRPC, etc.) commonly reject
+    // multi-address `eth_getLogs` filters with `-32602 blocked
+    // parameter: params.0.address.#`, so pass the vToken list one
+    // contract at a time. Slower (one filter per market per chunk)
+    // but the only shape the public endpoints accept. A paid RPC
+    // would happily eat the full 48-address filter — that path is
+    // still available by setting MARKET_BATCH_SIZE higher, but the
+    // sidecar's whole reason to exist is the free-tier case, so we
+    // default to the lowest-common-denominator shape.
+    const MARKET_BATCH_SIZE: usize = 1;
+    for batch in vtokens.chunks(MARKET_BATCH_SIZE) {
+        backfill_borrowers(provider.as_ref(), batch.to_vec(), set, from_block, to_block)
+            .await
+            .context("backfill_borrowers failed")?;
+    }
     Ok(())
 }
 

@@ -519,6 +519,30 @@ impl Config {
         Ok(config)
     }
 
+    /// Parse + substitute env vars without invoking `validate()`. Intended
+    /// for read-only auxiliary tools (e.g. the `charon-discover` sidecar)
+    /// that only need a subset of fields (chain ws_url, venus comptroller)
+    /// and have no business being gated on broadcaster-only invariants
+    /// like `private_rpc_url`. The main `charon` binary still routes
+    /// through `from_toml_str` and remains fully validated.
+    pub fn load_unvalidated(path: impl AsRef<Path>) -> Result<Self> {
+        let path_buf = path.as_ref().to_path_buf();
+        let raw = std::fs::read_to_string(&path_buf).map_err(|source| {
+            if source.kind() == std::io::ErrorKind::NotFound {
+                ConfigError::NotFound(path_buf.clone())
+            } else {
+                ConfigError::Io {
+                    path: path_buf.clone(),
+                    source,
+                }
+            }
+        })?;
+        let substituted = substitute_env_vars(&raw)?;
+        let mut config: Config = toml::from_str(&substituted)?;
+        config.normalize_empty_secrets();
+        Ok(config)
+    }
+
     /// Collapse every empty `Option<SecretString>` value to `None`.
     ///
     /// `substitute_env_vars` replaces a `${VAR}` placeholder with the
