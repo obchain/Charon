@@ -20,6 +20,7 @@ Charon monitors under-collateralized positions across major DeFi lending protoco
 - [Key features](#key-features)
 - [Safety model](#safety-model)
 - [Quick start — clone to running bot on a local BSC fork](#quick-start--clone-to-running-bot-on-a-local-bsc-fork)
+- [Mainnet workflow (real-money path)](#mainnet-workflow-real-money-path)
 - [CLI reference](#cli-reference)
 - [Configuration](#configuration)
 - [Run from a published container](#run-from-a-published-container)
@@ -332,6 +333,139 @@ That's it — you have run the full pipeline end-to-end on a local fork.
 
 ---
 
+## Mainnet workflow (real-money path)
+
+The fork demo above proves the pipeline works without spending anything. To run against BSC mainnet you need three things the fork doesn't: a real RPC tier that won't throttle the scanner, a real `CharonLiquidator` deploy, and a borrower set to scan. This section walks the full mainnet bring-up assuming you finished the Quick start successfully.
+
+> ⚠️ **Capital risk starts here.** Read [Safety model](#safety-model) and [Status](#status) first. Use a hot wallet you can afford to lose; cold wallet only ever appears in the deploy constructor.
+
+### M1 — Pick an RPC tier that the scanner can actually use
+
+The scanner makes ~30–60 RPC calls per block (Chainlink feeds × per-borrower account snapshot multicall). On BSC's 3 s block cadence that is steady-state ~15–25 req/s with bursts to 50+. RPCs that cap below this **silently break the scanner** — listener still counts blocks, but `charon_scanner_*` metrics stay flat and Grafana panels show "No data".
+
+| Tier | Examples | Works for | Notes |
+|---|---|---|---|
+| **Free, unmetered** | `wss://bsc-rpc.publicnode.com`, `wss://bsc.publicnode.com` | Live scanner + listener (recent state only) | Pruned archive — rejects ≥200k-block `eth_getLogs` backfill. Use for the bot's hot path and pair with the sidecar (M3) for borrower discovery. |
+| **Free, rate-limited** | QuickNode "Discover", BlastAPI, Ankr free | Sidecar one-shot at small windows | Reject big `eth_getLogs` ranges and cap at 15 req/s. **Do not point the bot's primary RPC at these — scanner will tick silently with zero output.** |
+| **Paid archive** | QuickNode Build+, Chainstack, Alchemy, BlockPi | Everything: full backfill, scanner, broadcast | $25–$50/mo entry. Required for unattended operation. |
+
+**Recommended starting setup, $0/mo:** PublicNode primary for the bot, free-tier QuickNode/Ankr/dRPC as `--extra-rpc` fallbacks for the sidecar.
+
+### M2 — Configure secrets in `.env`
+
+Edit `.env` (template already copied in Quick start Step 4). For mainnet runs at minimum set:
+
+```ini
+# Read RPC — what the bot scans + writes through.
+BNB_WS_URL=wss://bsc-rpc.publicnode.com
+BNB_HTTP_URL=https://bsc-rpc.publicnode.com
+
+# Private mempool / submission relay. Required for `--execute`.
+# If you don't have a private relay yet, set this to your read RPC and
+# flip `allow_public_mempool = true` in config/default.toml — public
+# mempool is fine for scan-only validation, NOT for production.
+CHARON_BSC_PRIVATE_RPC_URL=https://bsc-rpc.publicnode.com
+
+# Hot-wallet signer. Only needed for `--execute`. Keep balance ≤ your
+# acceptable loss — this key lives on the host the bot runs on.
+CHARON_SIGNER_KEY=0x...
+
+# Belt-and-braces gate. Bot refuses to broadcast unless this is set.
+CHARON_EXECUTE_CONFIRMED=1
+```
+
+`.env` is git-ignored. **Never commit it.** Run `git check-ignore .env` to confirm — should print `.env`.
+
+### M3 — Seed the borrower set with `charon-discover`
+
+The bot's live WebSocket subscription discovers borrowers in real time, but only from the moment the bot starts — historical underwater accounts are invisible until they emit a fresh `Borrow`. The `charon-discover` sidecar fills that gap by scraping Venus `Borrow` events over a chosen history window and writing the unique borrower set to a text file.
+
+```sh
+cargo build --release --bin charon-discover
+
+# Free-tier path: ~4-hour window via PublicNode (recent blocks only —
+# free RPCs prune deep history). Walltime ~30 s.
+./target/release/charon-discover \
+  --config config/default.toml \
+  --output /tmp/borrowers.txt \
+  --window-blocks 5000 \
+  --extra-rpc wss://bsc-rpc.publicnode.com \
+  --extra-rpc wss://bsc.publicnode.com
+
+# Verify file written:
+wc -l /tmp/borrowers.txt
+head -3 /tmp/borrowers.txt
+```
+
+The sidecar rotates across `[chain.bnb].ws_url` (primary, from `.env`) then each `--extra-rpc` in declaration order. On any failure (timeout, range rejection, pruned-history error) it rotates to the next; only a fully exhausted pool exits non-zero.
+
+**For a full ~7-day backfill** (`--window-blocks 200000`) you need an archive RPC. Free-tier endpoints will reject the request with `History has been pruned for this block`. Either upgrade your primary RPC or live with the smaller window — the bot's live tail catches new borrowers from the moment it starts, so the sidecar is mainly seeding plus crash-recovery.
+
+Schedule the sidecar via cron so the on-disk borrower file stays fresh:
+
+```sh
+# every 4 hours, refresh the disk-backed borrower set
+0 */4 * * * cd /path/to/Charon && ./target/release/charon-discover --config config/default.toml --output /tmp/borrowers.txt --window-blocks 5000 --extra-rpc wss://bsc-rpc.publicnode.com >>/tmp/discover.log 2>&1
+```
+
+### M4 — Deploy `CharonLiquidator` to BSC mainnet
+
+Same `forge create` shape as the fork demo but with mainnet RPC + your real cold wallet. **Triple-check the cold wallet address** — it is baked into the contract immutably and is where every profit will land.
+
+```sh
+forge create \
+  contracts/src/CharonLiquidator.sol:CharonLiquidator \
+  --rpc-url $BNB_HTTP_URL \
+  --private-key $CHARON_SIGNER_KEY \
+  --broadcast \
+  --constructor-args \
+    0x6807dc923806fE8Fd134338EABCA509979a7e0cB \
+    0x13f4EA83D0bd40E75C8222255bc855a974568Dd4 \
+    0xYOUR_COLD_WALLET_ADDRESS_HERE
+```
+
+Constructor args, in order: Aave V3 BSC pool → PancakeSwap V3 SwapRouter → cold wallet. Copy the deployed address from `forge create`'s output and paste it into `config/default.toml`:
+
+```toml
+[liquidator.bnb]
+chain = "bnb"
+contract_address = "0x...your deployed address..."
+```
+
+### M5 — Launch the bot in scan-only mode (no signer)
+
+Always validate the full pipeline against mainnet without `--execute` first. Bot scans, simulates, and bucketises positions but never signs anything.
+
+```sh
+./target/release/charon \
+  --config config/default.toml \
+  listen \
+  --borrower-file /tmp/borrowers.txt
+```
+
+Wait 60 s, then in another terminal:
+
+```sh
+curl -s http://127.0.0.1:9091/metrics | grep "^charon_scanner" | head -10
+```
+
+Expect non-zero values for `charon_scanner_blocks_total`, `charon_scanner_positions{bucket=...}`, and `charon_pipeline_block_duration_seconds_*`. **If those are empty after 60 s, your RPC is rate-limited** — go back to M1 and pick an unmetered tier before continuing.
+
+### M6 — Enable broadcast (real liquidations)
+
+Only flip `--execute` once M5 has been running cleanly for at least a few hours and Grafana shows healthy scanner cadence. All four execute gates must pass at startup:
+
+```sh
+./target/release/charon \
+  --config config/default.toml \
+  listen --execute \
+  --borrower-file /tmp/borrowers.txt
+```
+
+Bot refuses to start if: `CHARON_SIGNER_KEY` unset, `[liquidator.bnb].contract_address` is the zero address, neither `private_rpc_url` nor `allow_public_mempool = true` is configured, or `CHARON_EXECUTE_CONFIRMED=1` is missing. Any gate failure aborts launch with a descriptive error.
+
+---
+
 ## CLI reference
 
 The `charon` binary exposes two subcommands:
@@ -541,7 +675,8 @@ Charon/
 │   │                       # opportunity queue, profit calculator
 │   ├── charon-protocols/   # Lending-protocol adapters (Venus on BSC; more in v0.2)
 │   ├── charon-scanner/     # Block listener, health scanner, price cache,
-│   │                       # token metadata cache, mempool monitor, scan scheduler
+│   │                       # token metadata cache, mempool monitor, scan scheduler.
+│   │                       # Also ships the `charon-discover` borrower-discovery bin.
 │   ├── charon-flashloan/   # Flash-loan source router (Aave V3 on BSC today)
 │   ├── charon-executor/    # Tx builder, simulator, gas oracle, nonce manager,
 │   │                       # private-RPC submitter
@@ -586,6 +721,7 @@ Tracked on GitHub: [obchain/Charon › Milestones](https://github.com/obchain/Ch
 - [x] Token metadata cache with retry on transient RPC failures
 - [x] Health-factor scanner (HEALTHY / NEAR_LIQ / LIQUIDATABLE buckets) + scan scheduler
 - [x] Borrower auto-discovery via vToken `Borrow` event backfill (paid archive RPC required)
+- [x] Standalone `charon-discover` sidecar with rotating free-tier RPC fallback + `--borrower-file` ingest path on the bot
 - [x] `CharonLiquidator.sol` + Foundry fork test suite
 - [x] Flash-loan router — Aave V3 on BSC (0.05 % premium verified live)
 - [x] PancakeSwap V3 swap path for collateral disposal (`exactInputSingle`)
