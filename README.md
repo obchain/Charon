@@ -193,22 +193,15 @@ For the local-fork run you do not need to edit `.env` — the fork profile reads
 
 ### Step 5 — Pane A: start the anvil fork
 
-`scripts/anvil_fork.sh` forks BSC mainnet onto `127.0.0.1:8545`. Pick a free public BSC archive endpoint — **1rpc.io** is the most reliable no-signup option:
+`scripts/anvil_fork.sh` forks BSC mainnet onto `127.0.0.1:8545` and resets the dev-account-0 nonce to 0 so the deterministic CharonLiquidator CREATE address baked into `config/fork.toml` lands on the first `forge create`. Default upstream is `https://bsc.drpc.org` (free, keyless, archive). For the standard local-fork demo no overrides are needed:
 
 ```sh
-export FORK_RPC=https://1rpc.io/bnb
-FORK_CUPS=20 FORK_BLOCK=latest ./scripts/anvil_fork.sh
+FORK_BLOCK=latest ./scripts/anvil_fork.sh
 ```
 
-Backups if 1rpc throttles you:
+If dRPC is throttling you can point at any other BSC **archive** RPC by exporting `FORK_RPC` before running the script — e.g. a keyed QuickNode/BlockPi/Chainstack endpoint, or any other archive provider. Free pruned-history endpoints (PublicNode, 1rpc.io free tier) **do not work** for the fork demo — historical `eth_call` returns `not supported` / `missing trie node` and the bot exits within a minute with `chainlink feed for 'BNB' missing or stale`.
 
-```sh
-export FORK_RPC=https://binance.llamarpc.com   # LlamaRPC
-export FORK_RPC=https://bsc-rpc.publicnode.com # PublicNode
-export FORK_RPC=https://bsc.drpc.org           # dRPC default — flaky on free tier
-```
-
-Wait until you see `Listening on 0.0.0.0:8545`. **Leave this pane running** — closing it kills the fork. `FORK_BLOCK=latest` tracks upstream head; pinned blocks need archive state at `fork_block - 6` and abort with `metadata is not found` on free tiers.
+Wait until you see `Listening on 0.0.0.0:8545` followed by `dev-0 nonce reset to 0 …`. **Leave this pane running** — closing it kills the fork. `FORK_BLOCK=latest` tracks upstream head; pinned blocks need archive state at `fork_block - 6` and abort with `metadata is not found` on free tiers.
 
 ### Step 6 — Wire up Prometheus + Grafana (one-time)
 
@@ -269,7 +262,7 @@ forge create \
     0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266
 ```
 
-Constructor args, in order: Aave V3 BSC pool (flash-loan source) → PancakeSwap V3 SwapRouter (the contract calls `ISwapRouter.exactInputSingle`) → cold wallet. Deploy is deterministic — anvil dev-0 with nonce 0 always lands at `0x5FbDB2315678afecb367f032d93F642f64180aa3`, which is already the `contract_address` baked into `config/fork.toml`. If you redeploy at a different address (different signer or non-zero starting nonce), update `[liquidator.bnb].contract_address` in `config/fork.toml` before Step 8.
+Constructor args, in order: Aave V3 BSC pool (flash-loan source) → PancakeSwap V3 SwapRouter (the contract calls `ISwapRouter.exactInputSingle`) → cold wallet. Deploy is deterministic — Step 5's fork script resets dev-account-0's nonce to 0, so this `forge create` always lands at `0x5FbDB2315678afecb367f032d93F642f64180aa3`, which is already the `contract_address` baked into `config/fork.toml`. If you skip the fork script's nonce reset (e.g. `CHARON_SKIP_DEV0_NONCE_RESET=1`, or a custom anvil launch) and redeploy at a different address, update `[liquidator.bnb].contract_address` in `config/fork.toml` before Step 8.
 
 ### Step 8 — Pane B: launch the bot
 
