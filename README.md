@@ -262,7 +262,7 @@ forge create \
     0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266
 ```
 
-Constructor args, in order: Aave V3 BSC pool (flash-loan source) → PancakeSwap V3 SwapRouter (the contract calls `ISwapRouter.exactInputSingle`) → cold wallet. Deploy is deterministic — anvil dev-0 with nonce 0 always lands at `0x56a1D1cb94711265AdC9A8c01236e11867654Edc`, which is already the `contract_address` baked into `config/fork.toml`. If you redeploy at a different address (different signer or non-zero starting nonce), update `[liquidator.bnb].contract_address` in `config/fork.toml` before Step 8.
+Constructor args, in order: Aave V3 BSC pool (flash-loan source) → PancakeSwap V3 SwapRouter (the contract calls `ISwapRouter.exactInputSingle`) → cold wallet. Deploy is deterministic — anvil dev-0 with nonce 0 always lands at `0x5FbDB2315678afecb367f032d93F642f64180aa3`, which is already the `contract_address` baked into `config/fork.toml`. If you redeploy at a different address (different signer or non-zero starting nonce), update `[liquidator.bnb].contract_address` in `config/fork.toml` before Step 8.
 
 ### Step 8 — Pane B: launch the bot
 

@@ -22,6 +22,7 @@
 use std::fs;
 use std::path::PathBuf;
 
+use alloy::primitives::Address;
 use charon_core::Config;
 
 fn workspace_root() -> PathBuf {
@@ -204,13 +205,18 @@ fn fork_profile_parses_and_targets_localhost() {
         default_cfg.bot.min_profit_usd_1e6
     );
 
-    // `[liquidator.bnb]` placeholder was dropped on feat/24 (commit
-    // 4969bb7) because its address(0) tripped TxBuilder encoding the
-    // moment the executor tried to build calldata (#252). Lock that
-    // in so a future refactor doesn't re-introduce a zero-address row.
-    assert!(
-        cfg.liquidator.is_empty(),
-        "fork profile must not ship a liquidator placeholder — deploy via forge and add \
-         [liquidator.bnb] post-fact"
+    // `[liquidator.bnb]` carries the deterministic anvil dev-0 nonce-0
+    // deployment address so the README Quick start needs no post-deploy
+    // TOML edit. The anti-#252 invariant lives on: the address must be
+    // non-zero (zero-address placeholders trip TxBuilder encoding the
+    // moment the executor tries to build calldata).
+    let bnb_liq = cfg
+        .liquidator
+        .get("bnb")
+        .expect("fork profile must declare [liquidator.bnb] for the e2e walkthrough");
+    assert_ne!(
+        bnb_liq.contract_address,
+        Address::ZERO,
+        "fork profile [liquidator.bnb].contract_address must not be the zero address (#252)"
     );
 }
