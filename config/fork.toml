@@ -108,3 +108,10 @@ USDC = "0x51597f405303C4377E36123cBc172b13269EA163"
 [chainlink_max_age_secs.bnb]
 USDT = 86400
 USDC = 86400
+BNB  = 3600
+BTCB = 3600
+ETH  = 3600
+
+[liquidator.bnb]
+chain = "bnb"
+contract_address = "0x56a1D1cb94711265AdC9A8c01236e11867654Edc"

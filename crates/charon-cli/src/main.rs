@@ -142,7 +142,7 @@ const MIN_PROFIT_FLOOR_DEBT_WEI: u128 = 1_000_000_000_000_000_000;
 /// adapter, router, or simulator stalls beyond this we abandon the
 /// tick so the event drain can pick up on the next block instead of
 /// blocking across multiple heads.
-const PER_BLOCK_TIMEOUT: Duration = Duration::from_millis(2_500);
+const PER_BLOCK_TIMEOUT: Duration = Duration::from_millis(30_000);
 
 /// Env var the operator must set (to `1`) before `--execute` is
 /// honoured. A purely belt-and-braces second confirmation beyond the
@@ -624,7 +624,35 @@ async fn run_listen(config: &Config, borrowers: Vec<Address>, execute: bool) -> 
                 DEFAULT_MAX_AGE,
                 per_symbol_max_age,
             ));
-            prices.refresh_all().await;
+            // Native-feed preflight with bounded retry. Free-tier
+            // RPCs throttle the very first batch of `latestRoundData`
+            // calls (BSC oracle aggregator slot reads), so a single
+            // 429 on BNB used to kill startup with "feed missing or
+            // stale". Retry up to 5 times with 5 s gaps so the
+            // throttle window passes; total worst case 25 s,
+            // negligible vs. cold-start cost. After the final
+            // attempt we still bail — a genuinely dead feed must
+            // not silently degrade gas pricing.
+            const PREFLIGHT_ATTEMPTS: usize = 5;
+            const PREFLIGHT_GAP: Duration = Duration::from_secs(5);
+            let mut bnb_ready = false;
+            for attempt in 1..=PREFLIGHT_ATTEMPTS {
+                prices.refresh_all().await;
+                if prices.get(NATIVE_FEED_SYMBOL).is_some() {
+                    bnb_ready = true;
+                    break;
+                }
+                if attempt < PREFLIGHT_ATTEMPTS {
+                    tracing::warn!(
+                        symbol = NATIVE_FEED_SYMBOL,
+                        attempt,
+                        retry_in_ms = PREFLIGHT_GAP.as_millis() as u64,
+                        "chainlink native feed not ready — retrying"
+                    );
+                    tokio::time::sleep(PREFLIGHT_GAP).await;
+                }
+            }
+
             let fresh_feeds: Vec<String> = prices.symbols().map(str::to_string).collect();
             for sym in &fresh_feeds {
                 if let Some(p) = prices.get(sym) {
@@ -642,10 +670,10 @@ async fn run_listen(config: &Config, borrowers: Vec<Address>, execute: bool) -> 
             // ratio `native_price / debt_price`. Without the native
             // feed we would be guessing. Refuse to start rather than
             // silently drop every opportunity.
-            if prices.get(NATIVE_FEED_SYMBOL).is_none() {
+            if !bnb_ready {
                 bail!(
                     "chainlink feed for '{NATIVE_FEED_SYMBOL}' missing or stale on chain \
-                     '{chain_name}' — gas cost cannot be priced"
+                     '{chain_name}' after {PREFLIGHT_ATTEMPTS} attempts — gas cost cannot be priced"
                 );
             }
 
@@ -1246,6 +1274,28 @@ async fn run_block_pipeline(
                 error = ?err,
                 "venus fetch_positions failed"
             );
+            // Emit last-known per-bucket gauges + queue depth + block
+            // duration even when the upstream RPC drops the entire
+            // fetch — otherwise a single failing scan tick blanks
+            // every dashboard panel until the next successful fetch.
+            // Mirrors the idle-tick observability branch so "fetch
+            // failed" is distinguishable from "metrics pipeline
+            // broken".
+            let chain = pipeline.chain_name.as_str();
+            let counts = pipeline.scanner.bucket_counts();
+            charon_metrics::set_position_bucket(chain, bucket::HEALTHY, counts.healthy as u64);
+            charon_metrics::set_position_bucket(
+                chain,
+                bucket::NEAR_LIQ,
+                counts.near_liquidation as u64,
+            );
+            charon_metrics::set_position_bucket(
+                chain,
+                bucket::LIQUIDATABLE,
+                counts.liquidatable as u64,
+            );
+            charon_metrics::set_queue_depth(pipeline.queue.len().await as u64);
+            charon_metrics::observe_block_duration(chain, start.elapsed().as_secs_f64());
             return;
         }
     };
