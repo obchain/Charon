@@ -42,6 +42,27 @@ Charon monitors under-collateralized positions across major DeFi lending protoco
 
 **One outstanding gap to autonomous operation:** a paid BSC archive RPC. Free public tiers (dRPC, BlastAPI, 1rpc.io, Ankr) reject the 200 k-block `eth_getLogs` backfill needed for borrower auto-discovery — either rate-limit, return HTTP 500s, or cap chunks at 5 k blocks. Until then, borrowers are passed manually via `--borrower <addr>` (multiple flags allowed). One env var swap to a keyed archive (QuickNode, BlockPi, paid dRPC, Alchemy, Chainstack) unlocks auto-discovery — no code change.
 
+### Auto-discover borrowers via sidecar (free-tier RPC fallback)
+
+The `charon-discover` sidecar scrapes Venus `Borrow` events over a rotating list of free-tier WebSocket RPCs and writes the unique borrower set to a text file. Pass that file to `charon listen` via `--borrower-file` and the bot ingests it on startup.
+
+```sh
+# weekly cron
+./target/release/charon-discover \
+  --config config/default.toml \
+  --output borrowers.txt \
+  --window-blocks 200000 \
+  --extra-rpc wss://bsc-rpc.publicnode.com \
+  --extra-rpc wss://bsc.publicnode.com
+
+# bot consumes
+./target/release/charon listen \
+  --config config/default.toml \
+  --borrower-file borrowers.txt
+```
+
+The bot's WebSocket live tail catches new borrowers between sidecar runs; weekly cadence is sufficient on free RPCs.
+
 > ⚠️ **Do not run this against mainnet with real funds yet.** End-to-end is proven on fork only. Production checklist (private mempool relay, audited mainnet `CharonLiquidator` deploy, HSM/KMS signer, alerting) lives in the [Roadmap](#roadmap).
 
 ---

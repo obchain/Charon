@@ -4,6 +4,7 @@
 //! CHARON_CONFIG=/etc/charon/default.toml charon listen
 //! charon --config config/default.toml listen
 //! charon --config config/default.toml listen --borrower 0xABC…
+//! charon --config config/default.toml listen --borrower-file borrowers.txt
 //! charon --config config/default.toml test-connection --chain bnb
 //! ```
 //!
@@ -198,6 +199,12 @@ enum Command {
         #[arg(long = "borrower")]
         borrowers: Vec<Address>,
 
+        /// Path to a text file of EIP-55 / 0x-hex borrower addresses,
+        /// one per line. Lines starting with `#` and blank lines
+        /// ignored. Merged with any `--borrower` flags.
+        #[arg(long = "borrower-file")]
+        borrower_file: Option<PathBuf>,
+
         /// Sign and broadcast the liquidation tx for every
         /// opportunity that clears the simulation gate. Off by
         /// default — the pipeline runs scan + simulate only. Requires
@@ -355,8 +362,12 @@ async fn main() -> Result<()> {
     );
 
     match cli.command {
-        Command::Listen { borrowers, execute } => {
-            run_listen(&config, borrowers, execute).await?;
+        Command::Listen {
+            borrowers,
+            borrower_file,
+            execute,
+        } => {
+            run_listen(&config, borrowers, borrower_file, execute).await?;
         }
         Command::TestConnection { chain } => {
             let chain_cfg = config
@@ -370,6 +381,63 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Parse a newline-delimited borrower file into a `Vec<Address>`.
+///
+/// File format:
+/// - One EIP-55 / 0x-hex address per line.
+/// - Blank lines and lines starting with `#` are ignored.
+/// - A malformed line is logged at `warn!` (with the 1-based line
+///   number) and skipped — partial recovery beats aborting the whole
+///   ingest on one bad entry.
+/// - A missing file emits a single `warn!` and returns an empty vec
+///   so the caller can fall back to whatever `--borrower` flags
+///   supplied without crashing.
+fn parse_borrower_file(path: &std::path::Path) -> Vec<Address> {
+    let raw = match std::fs::read_to_string(path) {
+        Ok(s) => s,
+        Err(err) => {
+            warn!(
+                path = %path.display(),
+                error = ?err,
+                "borrower file not readable — continuing with empty set from this source"
+            );
+            return Vec::new();
+        }
+    };
+
+    let mut out = Vec::new();
+    let mut errors: usize = 0;
+    for (idx, line) in raw.lines().enumerate() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        match Address::from_str(trimmed) {
+            Ok(addr) => out.push(addr),
+            Err(err) => {
+                errors = errors.saturating_add(1);
+                // 1-based line number for operator-friendly logs.
+                let line_no = idx.saturating_add(1);
+                warn!(
+                    path = %path.display(),
+                    line = line_no,
+                    error = ?err,
+                    "borrower file: malformed address — skipping"
+                );
+            }
+        }
+    }
+    if errors > 0 {
+        info!(
+            path = %path.display(),
+            parsed = out.len(),
+            errors,
+            "borrower file parse summary"
+        );
+    }
+    out
 }
 
 /// Long-running listener entry point. Spawns one `BlockListener` per
@@ -395,7 +463,32 @@ async fn main() -> Result<()> {
 /// but not scanned — the state they would produce is superseded by
 /// the next real head and a fresh scan is cheaper than retroactive
 /// bucket transitions.
-async fn run_listen(config: &Config, borrowers: Vec<Address>, execute: bool) -> Result<()> {
+async fn run_listen(
+    config: &Config,
+    borrowers: Vec<Address>,
+    borrower_file: Option<PathBuf>,
+    execute: bool,
+) -> Result<()> {
+    // Merge `--borrower-file` (if any) into the seed list. Parse errors
+    // on individual lines are warned-and-skipped — partial recovery is
+    // strictly better than aborting startup on a single malformed line.
+    // A missing file is also non-fatal: warn and continue with whatever
+    // `--borrower` flags supplied.
+    let mut borrowers = borrowers;
+    if let Some(path) = borrower_file.as_ref() {
+        let parsed = parse_borrower_file(path);
+        info!(
+            path = %path.display(),
+            loaded = parsed.len(),
+            "borrower file ingested"
+        );
+        borrowers.extend(parsed);
+        // Dedupe via HashSet round-trip — preserves correctness even
+        // when the operator double-lists an address across `--borrower`
+        // flags and the file.
+        let dedup: HashSet<Address> = borrowers.into_iter().collect();
+        borrowers = dedup.into_iter().collect();
+    }
     if config.chain.is_empty() {
         anyhow::bail!("no chains configured — nothing to listen to");
     }
@@ -2248,5 +2341,83 @@ async fn drain_mempool_for_block(
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::items_after_test_module)]
+mod parse_borrower_file_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// Cargo runs each `#[test]` on a fresh thread but shares the
+    /// process-level temp dir, so we synthesise a unique filename per
+    /// test invocation to keep parallel runs isolated.
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    fn write_temp(name: &str, contents: &str) -> PathBuf {
+        let n = COUNTER.fetch_add(1, Ordering::SeqCst);
+        let path = std::env::temp_dir().join(format!(
+            "charon-borrower-file-test-{}-{}-{}.txt",
+            std::process::id(),
+            n,
+            name
+        ));
+        std::fs::write(&path, contents).expect("write temp borrower file");
+        path
+    }
+
+    #[test]
+    fn three_valid_addresses_parse() {
+        let body = "\
+0x0000000000000000000000000000000000000001
+0x0000000000000000000000000000000000000002
+0x0000000000000000000000000000000000000003
+";
+        let path = write_temp("three_valid", body);
+        let out = parse_borrower_file(&path);
+        assert_eq!(out.len(), 3);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn comments_and_blank_lines_are_skipped() {
+        let body = "\
+# header comment
+0x0000000000000000000000000000000000000001
+
+# another comment
+0x0000000000000000000000000000000000000002
+
+";
+        let path = write_temp("comments", body);
+        let out = parse_borrower_file(&path);
+        assert_eq!(out.len(), 2);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn malformed_line_is_skipped_not_fatal() {
+        let body = "\
+0x0000000000000000000000000000000000000001
+not-a-real-address
+0x0000000000000000000000000000000000000002
+";
+        let path = write_temp("malformed", body);
+        let out = parse_borrower_file(&path);
+        assert_eq!(out.len(), 2);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn missing_file_returns_empty_no_panic() {
+        let path = std::env::temp_dir().join(format!(
+            "charon-borrower-file-test-{}-missing-{}.txt",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::SeqCst)
+        ));
+        // Don't create it.
+        let out = parse_borrower_file(&path);
+        assert!(out.is_empty());
     }
 }

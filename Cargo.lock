@@ -1465,6 +1465,7 @@ dependencies = [
  "async-trait",
  "charon-core",
  "charon-metrics",
+ "clap",
  "dashmap",
  "dotenvy",
  "futures-util",
@@ -1473,6 +1474,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
