@@ -223,12 +223,7 @@ mod tests {
         fn fee_rate_millionths(&self) -> u32 {
             self.fee_rate_millionths
         }
-        fn effective_fee_millionths(
-            &self,
-            _token: Address,
-            amount: U256,
-            liquidity: U256,
-        ) -> u32 {
+        fn effective_fee_millionths(&self, _token: Address, amount: U256, liquidity: U256) -> u32 {
             match self.utilisation_num {
                 Some(num) if !liquidity.is_zero() && liquidity != U256::MAX => {
                     let penalty = amount.saturating_mul(U256::from(num)) / liquidity;
