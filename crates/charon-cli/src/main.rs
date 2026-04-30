@@ -1593,10 +1593,7 @@ async fn process_opportunity(
     //    repay amount).
     let Some(quote) = pipeline.router.route(pos.debt_token, repay).await else {
         charon_metrics::record_opportunity_dropped(chain, drop_stage::ROUTER);
-        charon_metrics::record_opportunity_dropped_reason(
-            chain,
-            drop_reason::NO_FLASHLOAN_SOURCE,
-        );
+        charon_metrics::record_opportunity_dropped_reason(chain, drop_reason::NO_FLASHLOAN_SOURCE);
         return Ok(false);
     };
 
