@@ -41,6 +41,24 @@ use tracing::{info, warn};
 /// Default submission timeout (6 s ≈ 2 BSC blocks).
 pub const DEFAULT_SUBMIT_TIMEOUT: Duration = Duration::from_secs(6);
 
+/// Number of blocks to wait for inclusion before treating a tx as
+/// stuck and triggering an RBF replacement. Three BSC blocks ≈ 9 s,
+/// long enough that brief mempool-feedback delay does not look
+/// stuck, short enough that a sustained gas spike doesn't cost more
+/// than a few seconds of latency.
+pub const REPLACE_AFTER_BLOCKS: u64 = 3;
+
+/// Per-tx replacement budget. After this many bumps on the same
+/// nonce, give up rather than burn unbounded fee on a sustained
+/// gas spike.
+pub const MAX_REPLACEMENTS_PER_NONCE: u32 = 3;
+
+/// Replacement-fee bump in percent. geth's replacement floor is
+/// 10 % per fee field; 12 % gives a comfortable margin so a router
+/// that strips a fraction of a wei does not silently drop the
+/// replacement.
+pub const REPLACEMENT_BUMP_PCT: u32 = 12;
+
 /// Typed failure modes surfaced by the submitter.
 ///
 /// The enum is `#[non_exhaustive]` so new variants (e.g. circuit-breaker
@@ -186,12 +204,61 @@ impl Submitter {
         &self.endpoint_label
     }
 
+    /// Re-broadcast a replacement for an in-flight tx (RBF, #364).
+    ///
+    /// Caller is responsible for re-encoding + re-signing `raw` with
+    /// the same nonce as the stuck tx but `maxFeePerGas` and
+    /// `maxPriorityFeePerGas` bumped by `>= REPLACEMENT_BUMP_PCT` —
+    /// geth requires both fee fields to clear the replacement floor
+    /// or the new tx is silently dropped from the pool.
+    ///
+    /// This method is a thin wrapper around [`Submitter::submit`]
+    /// plus a post-condition: the new tx hash must differ from
+    /// `original_hash`. A matching hash means the caller forgot to
+    /// bump and the replacement was a no-op; surface it as
+    /// [`SubmitError::RpcRejected`] rather than silently logging a
+    /// "successful" replacement that is actually the same tx.
+    /// Increments
+    /// `charon_submit_replacements_total{chain, reason}` with the
+    /// caller-supplied reason (`"ttl_expired"` / `"fee_spike"` / …).
+    pub async fn replace(
+        &self,
+        raw: Bytes,
+        original_hash: TxHash,
+        chain: &str,
+        reason: &str,
+    ) -> Result<TxHash, SubmitError> {
+        let new_hash = self.submit(raw).await?;
+        if new_hash == original_hash {
+            warn!(
+                endpoint = %self.endpoint_label,
+                %original_hash,
+                "submit_replace: returned the same hash — caller did not bump fees"
+            );
+            return Err(SubmitError::RpcRejected(format!(
+                "replacement returned the same hash {original_hash}; bump max_fee + priority_fee by ≥ {REPLACEMENT_BUMP_PCT}% before retrying"
+            )));
+        }
+        info!(
+            endpoint = %self.endpoint_label,
+            %original_hash,
+            %new_hash,
+            chain,
+            reason,
+            "tx replacement broadcast"
+        );
+        charon_metrics::record_submit_replacement(chain, reason);
+        Ok(new_hash)
+    }
+
     /// Submit raw signed transaction bytes. Single attempt, no retry.
     ///
     /// The submitter is deliberately single-shot. Whether a timed-out
     /// broadcast is still worth re-sending (same price, same health
     /// factor, same gas ceiling) is a pipeline-level decision owned
-    /// by the caller along with the opportunity queue TTL.
+    /// by the caller along with the opportunity queue TTL. For an
+    /// explicit nonce-preserving re-broadcast with bumped fees, see
+    /// [`Submitter::replace`] (#364).
     ///
     /// Error mapping:
     /// - elapsed deadline -> [`SubmitError::Timeout`]
@@ -501,6 +568,88 @@ mod tests {
             }
             other => panic!("expected RpcRejected, got {other:?}"),
         }
+    }
+
+    /// `replace` rejects the case where the new tx hash matches the
+    /// original — a no-op replacement (caller forgot to bump fees)
+    /// must surface as a typed error rather than a silent "OK".
+    #[tokio::test]
+    async fn replace_rejects_matching_hash_as_no_bump() {
+        let server = MockServer::start_async().await;
+        let original =
+            "0x1111111111111111111111111111111111111111111111111111111111111111".to_string();
+        let _m = server
+            .mock_async(|when, then| {
+                when.method(POST).path("/");
+                then.status(200)
+                    .header("content-type", "application/json")
+                    .body(format!(r#"{{"jsonrpc":"2.0","id":0,"result":"{original}"}}"#));
+            })
+            .await;
+
+        let submitter = build_test_submitter(&server.url("/"), DEFAULT_SUBMIT_TIMEOUT);
+        let original_hash = original.parse::<TxHash>().expect("hash parse");
+        let err = submitter
+            .replace(
+                Bytes::from_static(&[0x02, 0xc0]),
+                original_hash,
+                "bnb",
+                "ttl_expired",
+            )
+            .await
+            .expect_err("matching hash must reject");
+        match err {
+            SubmitError::RpcRejected(msg) => {
+                assert!(
+                    msg.contains("same hash"),
+                    "expected matching-hash diagnostic, got: {msg}"
+                );
+            }
+            other => panic!("expected RpcRejected, got {other:?}"),
+        }
+    }
+
+    /// Happy-path replacement: the mock returns a different hash, so
+    /// `replace` returns it and bumps the metric counter.
+    #[tokio::test]
+    async fn replace_returns_new_hash_on_distinct_response() {
+        let server = MockServer::start_async().await;
+        let new_hash =
+            "0x2222222222222222222222222222222222222222222222222222222222222222".to_string();
+        let _m = server
+            .mock_async(|when, then| {
+                when.method(POST).path("/");
+                then.status(200)
+                    .header("content-type", "application/json")
+                    .body(format!(r#"{{"jsonrpc":"2.0","id":0,"result":"{new_hash}"}}"#));
+            })
+            .await;
+
+        let submitter = build_test_submitter(&server.url("/"), DEFAULT_SUBMIT_TIMEOUT);
+        let original_hash =
+            "0x1111111111111111111111111111111111111111111111111111111111111111"
+                .parse::<TxHash>()
+                .expect("hash parse");
+        let returned = submitter
+            .replace(
+                Bytes::from_static(&[0x02, 0xc0]),
+                original_hash,
+                "bnb",
+                "ttl_expired",
+            )
+            .await
+            .expect("distinct hash must succeed");
+        assert_eq!(format!("{returned:?}"), new_hash);
+    }
+
+    /// Pin the public RBF constants. Dashboards / runbooks reference
+    /// these directly, so a future change should be a deliberate
+    /// schema bump rather than a silent typo.
+    #[test]
+    fn rbf_constants_have_expected_values() {
+        assert_eq!(REPLACE_AFTER_BLOCKS, 3);
+        assert_eq!(MAX_REPLACEMENTS_PER_NONCE, 3);
+        assert_eq!(REPLACEMENT_BUMP_PCT, 12);
     }
 
     #[tokio::test(flavor = "current_thread", start_paused = true)]
