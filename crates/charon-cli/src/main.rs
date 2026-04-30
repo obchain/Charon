@@ -57,6 +57,8 @@ use alloy::rpc::types::{BlockTransactionsKind, TransactionRequest};
 use alloy::signers::local::PrivateKeySigner;
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
+use futures_util::StreamExt;
+use futures_util::stream::FuturesUnordered;
 use charon_core::{
     Config, FlashLoanQuote, LendingProtocol, LiquidationOpportunity, LiquidationParams,
     OpportunityQueue, Position, Price, ProfitInputs, calculate_profit,
@@ -1553,14 +1555,43 @@ async fn run_block_pipeline(
 
     // Walk each liquidatable position through the e2e pipeline. Only
     // opportunities that pass the simulation gate reach the queue.
+    //
+    // Per-position work is independent (each position has its own
+    // borrower / debt token / gas cost). The shared mutable state —
+    // OpportunityQueue and NonceManager — is already serialised
+    // internally, so a bounded fan-out is safe. Cap is set to balance
+    // (a) overlapping the slowest stage (eth_call simulation, ~80–
+    // 200 ms on BSC) across the bucket so a 5–8 position bucket
+    // finishes inside one block, against (b) RPC budget — 8 in-flight
+    // calls is well under any private-RPC's per-IP rate limit and
+    // leaves headroom for the scanner / mempool monitor sharing the
+    // same upstream.
+    const PER_BLOCK_PARALLELISM: usize = 8;
     let liquidatable = pipeline.scanner.liquidatable();
     let mut queued = 0usize;
+    let semaphore = Arc::new(tokio::sync::Semaphore::new(PER_BLOCK_PARALLELISM));
+    let mut futs = FuturesUnordered::new();
     for pos in liquidatable {
-        match process_opportunity(pipeline.clone(), &pos, block, signer_key).await {
+        let pipe = pipeline.clone();
+        let sem = semaphore.clone();
+        let pos_for_log = pos.borrower;
+        futs.push(async move {
+            // `acquire_owned` only fails when the semaphore is closed,
+            // which never happens for one we own — `expect` is fine.
+            let _permit = sem
+                .acquire_owned()
+                .await
+                .expect("per-block semaphore is never closed");
+            let res = process_opportunity(pipe, &pos, block, signer_key).await;
+            (pos_for_log, res)
+        });
+    }
+    while let Some((borrower, res)) = futs.next().await {
+        match res {
             Ok(true) => queued += 1,
             Ok(false) => {}
             Err(err) => debug!(
-                borrower = %pos.borrower,
+                %borrower,
                 error = ?err,
                 "opportunity dropped"
             ),
