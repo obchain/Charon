@@ -858,9 +858,7 @@ async fn run_listen(
                                 "aave_v3_bsc",
                             )
                             .await
-                            .context(
-                                "aave v3: pool address mismatch — refusing to start",
-                            )?;
+                            .context("aave v3: pool address mismatch — refusing to start")?;
                         }
                     }
                     let aave = Arc::new(
