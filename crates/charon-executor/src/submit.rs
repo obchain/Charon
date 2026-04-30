@@ -94,6 +94,19 @@ pub enum SubmitError {
     /// characters that cannot appear in an HTTP header.
     #[error("invalid endpoint configuration: {0}")]
     InvalidEndpoint(String),
+
+    /// Connect-time `eth_chainId` probe failed (timeout, RPC rejection,
+    /// transport error). The endpoint is unusable; the caller must
+    /// abort startup rather than start signing into a black hole.
+    #[error("connect probe failed: {0}")]
+    ConnectFailed(String),
+
+    /// Connect-time chain id probe returned a value that does not
+    /// match the chain the bot is configured for. Refusing to start
+    /// avoids broadcasting BSC-signed liquidations into a different
+    /// chain id.
+    #[error("chain id mismatch: expected {expected}, endpoint reports {actual}")]
+    ChainIdMismatch { expected: u64, actual: u64 },
 }
 
 /// One of the two underlying transports the submitter can hold.
@@ -132,6 +145,15 @@ impl Submitter {
     /// - `auth` is an optional bearer token. When provided, every HTTP
     ///   request carries `Authorization: Bearer <token>`. For WSS the
     ///   header is attached during the handshake via [`WsConnect`].
+    /// - `expected_chain_id` is the chain id this submitter is bound
+    ///   to. After the transport is built, `connect` issues one
+    ///   `eth_chainId` probe (2 s timeout). On failure the endpoint is
+    ///   considered unusable and the function returns
+    ///   [`SubmitError::ConnectFailed`]; on a value that does not
+    ///   match `expected_chain_id` it returns
+    ///   [`SubmitError::ChainIdMismatch`]. The probe surfaces a dead /
+    ///   misconfigured / cross-chain endpoint at startup rather than
+    ///   inside the first opportunity broadcast (#358).
     /// - `timeout` bounds a single submission attempt.
     ///
     /// The URL stays inside the `SecretString` the caller owns; this
@@ -140,6 +162,7 @@ impl Submitter {
     pub async fn connect(
         url: &SecretString,
         auth: Option<&SecretString>,
+        expected_chain_id: u64,
         timeout: Duration,
     ) -> Result<Self, SubmitError> {
         let raw = url.expose_secret();
@@ -185,10 +208,13 @@ impl Submitter {
             other => return Err(SubmitError::InsecureScheme(other.to_string())),
         };
 
+        let actual_chain_id = probe_chain_id(&inner, &endpoint_label, expected_chain_id).await?;
+
         info!(
             endpoint = %endpoint_label,
             timeout_secs = timeout.as_secs(),
             auth = auth.is_some(),
+            chain_id = actual_chain_id,
             "submitter ready"
         );
         Ok(Self {
@@ -345,6 +371,50 @@ impl Submitter {
     }
 }
 
+/// 2 s budget for the connect-time `eth_chainId` probe. More than
+/// enough for any healthy endpoint; bounded so a hung TCP cannot
+/// block startup indefinitely.
+const CONNECT_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Run the connect-time `eth_chainId` probe against either transport
+/// and assert the result matches `expected_chain_id`. Split out from
+/// [`Submitter::connect`] so unit tests can exercise the probe path
+/// without standing up the full transport pipeline (and httpmock,
+/// which serves plain HTTP that the public `connect` rejects by
+/// design).
+async fn probe_chain_id(
+    inner: &Inner,
+    endpoint_label: &str,
+    expected_chain_id: u64,
+) -> Result<u64, SubmitError> {
+    let probe = async {
+        match inner {
+            Inner::Http(p) => p.get_chain_id().await,
+            Inner::Ws(p) => p.get_chain_id().await,
+        }
+    };
+    let actual_chain_id = match tokio::time::timeout(CONNECT_PROBE_TIMEOUT, probe).await {
+        Ok(Ok(id)) => id,
+        Ok(Err(err)) => {
+            return Err(SubmitError::ConnectFailed(format!(
+                "eth_chainId probe rejected at {endpoint_label}: {err}"
+            )));
+        }
+        Err(_) => {
+            return Err(SubmitError::ConnectFailed(format!(
+                "eth_chainId probe timed out after {CONNECT_PROBE_TIMEOUT:?} at {endpoint_label}"
+            )));
+        }
+    };
+    if actual_chain_id != expected_chain_id {
+        return Err(SubmitError::ChainIdMismatch {
+            expected: expected_chain_id,
+            actual: actual_chain_id,
+        });
+    }
+    Ok(actual_chain_id)
+}
+
 /// Build a reqwest client that attaches `Authorization: Bearer <token>`
 /// to every request when `auth` is `Some`. The `HeaderValue` is marked
 /// sensitive so reqwest / hyper omit it from their own debug output.
@@ -410,23 +480,33 @@ mod tests {
 
     #[tokio::test]
     async fn connect_rejects_plain_http_scheme() {
-        let err = Submitter::connect(&sec("http://example.com/rpc"), None, DEFAULT_SUBMIT_TIMEOUT)
-            .await
-            .expect_err("http:// must be rejected");
+        let err = Submitter::connect(
+            &sec("http://example.com/rpc"),
+            None,
+            56,
+            DEFAULT_SUBMIT_TIMEOUT,
+        )
+        .await
+        .expect_err("http:// must be rejected");
         assert!(matches!(err, SubmitError::InsecureScheme(ref s) if s == "http"));
     }
 
     #[tokio::test]
     async fn connect_rejects_plain_ws_scheme() {
-        let err = Submitter::connect(&sec("ws://example.com/rpc"), None, DEFAULT_SUBMIT_TIMEOUT)
-            .await
-            .expect_err("ws:// must be rejected");
+        let err = Submitter::connect(
+            &sec("ws://example.com/rpc"),
+            None,
+            56,
+            DEFAULT_SUBMIT_TIMEOUT,
+        )
+        .await
+        .expect_err("ws:// must be rejected");
         assert!(matches!(err, SubmitError::InsecureScheme(ref s) if s == "ws"));
     }
 
     #[tokio::test]
     async fn connect_rejects_exotic_scheme() {
-        let err = Submitter::connect(&sec("ftp://example.com/"), None, DEFAULT_SUBMIT_TIMEOUT)
+        let err = Submitter::connect(&sec("ftp://example.com/"), None, 56, DEFAULT_SUBMIT_TIMEOUT)
             .await
             .expect_err("ftp must be rejected");
         assert!(matches!(err, SubmitError::InsecureScheme(ref s) if s == "ftp"));
@@ -434,7 +514,7 @@ mod tests {
 
     #[tokio::test]
     async fn connect_rejects_missing_scheme() {
-        let err = Submitter::connect(&sec("example.com/rpc"), None, DEFAULT_SUBMIT_TIMEOUT)
+        let err = Submitter::connect(&sec("example.com/rpc"), None, 56, DEFAULT_SUBMIT_TIMEOUT)
             .await
             .expect_err("missing scheme must be rejected");
         // url::Url::parse either fails outright (InvalidEndpoint) or
@@ -493,6 +573,77 @@ mod tests {
             endpoint_label: url.to_string(),
             timeout,
         }
+    }
+
+    /// Mock returns chain id 1; probe expects 56 → typed mismatch.
+    #[tokio::test]
+    async fn probe_chain_id_returns_mismatch_when_endpoint_disagrees() {
+        let server = MockServer::start_async().await;
+        let _m = server
+            .mock_async(|when, then| {
+                when.method(POST).path("/");
+                then.status(200)
+                    .header("content-type", "application/json")
+                    .body(r#"{"jsonrpc":"2.0","id":0,"result":"0x1"}"#);
+            })
+            .await;
+
+        let inner = Inner::Http(boxed_http_provider(&server.url("/")));
+        let err = probe_chain_id(&inner, "http://test", 56)
+            .await
+            .expect_err("mismatch must surface");
+        match err {
+            SubmitError::ChainIdMismatch { expected, actual } => {
+                assert_eq!(expected, 56);
+                assert_eq!(actual, 1);
+            }
+            other => panic!("expected ChainIdMismatch, got {other:?}"),
+        }
+    }
+
+    /// Mock returns chain id 56; probe expects 56 → ok.
+    #[tokio::test]
+    async fn probe_chain_id_returns_ok_when_endpoint_matches() {
+        let server = MockServer::start_async().await;
+        let _m = server
+            .mock_async(|when, then| {
+                when.method(POST).path("/");
+                then.status(200)
+                    .header("content-type", "application/json")
+                    .body(r#"{"jsonrpc":"2.0","id":0,"result":"0x38"}"#);
+            })
+            .await;
+
+        let inner = Inner::Http(boxed_http_provider(&server.url("/")));
+        let id = probe_chain_id(&inner, "http://test", 56)
+            .await
+            .expect("matching chain id must pass");
+        assert_eq!(id, 56);
+    }
+
+    /// Mock returns a JSON-RPC error → typed ConnectFailed.
+    #[tokio::test]
+    async fn probe_chain_id_maps_rpc_error_to_connect_failed() {
+        let server = MockServer::start_async().await;
+        let _m = server
+            .mock_async(|when, then| {
+                when.method(POST).path("/");
+                then.status(200)
+                    .header("content-type", "application/json")
+                    .body(
+                        r#"{"jsonrpc":"2.0","id":0,"error":{"code":-32601,"message":"method not found"}}"#,
+                    );
+            })
+            .await;
+
+        let inner = Inner::Http(boxed_http_provider(&server.url("/")));
+        let err = probe_chain_id(&inner, "http://test", 56)
+            .await
+            .expect_err("rpc-level error must surface as ConnectFailed");
+        assert!(
+            matches!(err, SubmitError::ConnectFailed(ref msg) if msg.contains("method not found")),
+            "expected ConnectFailed mentioning the upstream message, got {err:?}"
+        );
     }
 
     #[tokio::test]

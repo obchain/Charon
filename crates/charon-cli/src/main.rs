@@ -900,6 +900,7 @@ async fn run_listen(
                         let submitter = Submitter::connect(
                             private_url,
                             chain_cfg.private_rpc_auth.as_ref(),
+                            chain_cfg.chain_id,
                             DEFAULT_SUBMIT_TIMEOUT,
                         )
                         .await
