@@ -125,20 +125,12 @@ const NATIVE_FEED_SYMBOL: &str = "BNB";
 /// `liquidateBorrow` + PancakeSwap V3 swap round-trip.
 const SIMULATION_GAS_LIMIT: u64 = 2_000_000;
 
-/// Conservative debt-token-wei floor baked into
-/// `SwapRoute.min_amount_out` on top of the flash-loan repayment.
-/// Combined with the gas floor below it gives the on-chain
-/// `CharonLiquidator.executeLiquidation` revert-guard a lower bound
-/// independent of the off-chain profit math. Placeholder until the
-/// per-token USD → wei conversion (#148) lands.
-const STATIC_GAS_FLOOR_DEBT_WEI: u128 = 3_000_000_000_000_000_000;
-
-/// Minimum-profit floor in debt-token smallest units, also baked into
-/// `SwapRoute.min_amount_out`. Forces the DEX leg to return strictly
-/// more than repay + fee + gas floor so a zero-net liquidation cannot
-/// slip past the on-chain backstop. Replaced by a configured value
-/// once USD → token pricing lands (#148).
-const MIN_PROFIT_FLOOR_DEBT_WEI: u128 = 1_000_000_000_000_000_000;
+// `STATIC_GAS_FLOOR_DEBT_WEI` and `MIN_PROFIT_FLOOR_DEBT_WEI` were
+// removed in #351 — both floors are now derived live at the call
+// site from `gas_cost_in_debt_wei(...)` × the broadcast buffer and
+// from `min_profit_usd_1e6` × `1e2` × `10^decimals` / `debt_price_1e8`
+// respectively. Comment retained so a future reader doesn't go
+// looking for the constants by their old names.
 
 /// Wall-clock deadline for one per-block pipeline pass. If the
 /// adapter, router, or simulator stalls beyond this we abandon the
@@ -1948,8 +1940,27 @@ async fn process_opportunity(
     //    or negative-net result on-chain. Today both floors are
     //    constants in debt-token smallest units; live gas-oracle +
     //    USD → token conversion (#148) replaces them.
-    let gas_floor = U256::from(STATIC_GAS_FLOOR_DEBT_WEI);
-    let profit_floor = U256::from(MIN_PROFIT_FLOOR_DEBT_WEI);
+    // Gas + profit floors are now derived live (#351). Both used to be
+    // 1-token-wei constants assuming 18-decimal stable debt — fine for
+    // USDT, but a 3000 USD overhead on WBNB at $1k/BNB and a
+    // 45_000 USD overhead on BTCB. Compute them from the same gas /
+    // chainlink / decimals inputs already in scope so the floor scales
+    // with the actual debt token and BSC's live gas market.
+    //
+    // gas_floor: gas_cost_debt_wei × broadcast buffer (130%) — matches
+    // the buffer applied to gas_limit at broadcast time so the on-chain
+    // backstop does not undershoot the worst-case fee the tx will pay.
+    let gas_floor = gas_cost_debt_wei
+        .saturating_mul(U256::from(BROADCAST_GAS_BUFFER_NUM))
+        .checked_div(U256::from(BROADCAST_GAS_BUFFER_DEN))
+        .unwrap_or(gas_cost_debt_wei);
+    // profit_floor in debt-token wei from the configured USD profit
+    // gate (see profit_floor_debt_wei() docs for the derivation).
+    let profit_floor = profit_floor_debt_wei(
+        pipeline.min_profit_usd_1e6,
+        debt_price_1e8,
+        debt_meta.decimals,
+    );
     let min_amount_out = quote
         .amount
         .saturating_add(quote.fee)
@@ -2256,6 +2267,36 @@ fn gas_cost_in_debt_wei(
     usd_scaled / U256::from(debt_price_1e8)
 }
 
+/// On-chain backstop profit floor in debt-token wei (#351).
+///
+/// Replaces the legacy `MIN_PROFIT_FLOOR_DEBT_WEI = 1e18` constant
+/// (which assumed an 18-decimal stable). Derived from the configured
+/// USD profit gate plus the live debt token price + decimals so the
+/// floor scales correctly across stables, WBNB, BTCB, etc.
+///
+/// ```text
+///   USD            = min_profit_usd_1e6 / 1e6
+///   token_price    = debt_price_1e8 / 1e8       (USD per token)
+///   token_amount   = USD / token_price
+///                  = (min_profit_usd_1e6 * 1e2) / debt_price_1e8
+///   token_wei      = token_amount * 10^debt_decimals
+///                  = (min_profit_usd_1e6 * 1e2 * 10^decimals) / debt_price_1e8
+/// ```
+///
+/// All arithmetic is `U256` with `saturating_*`; a zero / pathological
+/// `debt_price_1e8` is caller-gated so the divisor is never zero in
+/// practice (we still defend with an early `0` return).
+fn profit_floor_debt_wei(min_profit_usd_1e6: u64, debt_price_1e8: u64, debt_decimals: u8) -> U256 {
+    if debt_price_1e8 == 0 {
+        return U256::ZERO;
+    }
+    let scale = U256::from(10u64).pow(U256::from(debt_decimals));
+    let numerator = U256::from(min_profit_usd_1e6)
+        .saturating_mul(U256::from(100u64))
+        .saturating_mul(scale);
+    numerator / U256::from(debt_price_1e8)
+}
+
 #[cfg(test)]
 #[allow(clippy::items_after_test_module)]
 mod gas_cost_in_debt_wei_tests {
@@ -2310,6 +2351,42 @@ mod gas_cost_in_debt_wei_tests {
     fn zero_debt_price_returns_zero_not_panic() {
         let got = gas_cost_in_debt_wei(100_000, 10_000_000_000u128, 60_000_000_000u64, 0, 18, 18);
         assert_eq!(got, U256::ZERO);
+    }
+
+    /// USDT-as-debt path (18-dec stable, $1) yields a `profit_floor`
+    /// equal to `min_profit_usd_1e6` token-wei within rounding —
+    /// $5 → 5_000_000 × 100 / 1e8 × 10^18 = 5e18.
+    #[test]
+    fn profit_floor_for_usdt_at_one_dollar() {
+        let got = profit_floor_debt_wei(5_000_000, 100_000_000, 18);
+        assert_eq!(got, U256::from(5_000_000_000_000_000_000u128));
+    }
+
+    /// WBNB-as-debt path: at $600/BNB, a $5 profit gate → ~0.00833 BNB
+    /// (≈8.33e15 wei). Comfortably under the 0.1 BNB ceiling the
+    /// issue requires. (5e6 × 100 × 1e18 / 6e10 = 5e26 / 6e10 ≈ 8.33e15.)
+    #[test]
+    fn profit_floor_for_wbnb_at_600_dollars_under_one_tenth_bnb() {
+        let got = profit_floor_debt_wei(5_000_000, 60_000_000_000, 18);
+        // 5e26 / 6e10 = 8_333_333_333_333_333 (integer division).
+        assert_eq!(got, U256::from(8_333_333_333_333_333u128));
+        assert!(
+            got < U256::from(100_000_000_000_000_000u128),
+            "WBNB profit floor must stay under 0.1 BNB"
+        );
+    }
+
+    /// Six-decimal USDT (`decimals == 6`): $5 gate → 5e6 token wei.
+    #[test]
+    fn profit_floor_for_six_dec_usdt() {
+        let got = profit_floor_debt_wei(5_000_000, 100_000_000, 6);
+        assert_eq!(got, U256::from(5_000_000u64));
+    }
+
+    /// Zero debt price returns zero rather than panicking on divide.
+    #[test]
+    fn profit_floor_zero_debt_price_returns_zero() {
+        assert_eq!(profit_floor_debt_wei(5_000_000, 0, 18), U256::ZERO);
     }
 }
 
