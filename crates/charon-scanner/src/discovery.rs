@@ -197,7 +197,10 @@ impl BorrowerSet {
     /// set to disk without holding a `DashMap` reference across an
     /// IO call.
     pub fn entries(&self) -> Vec<(Address, BorrowerInfo)> {
-        self.inner.iter().map(|kv| (*kv.key(), *kv.value())).collect()
+        self.inner
+            .iter()
+            .map(|kv| (*kv.key(), *kv.value()))
+            .collect()
     }
 }
 

@@ -619,9 +619,9 @@ async fn run_listen(
             // through to the legacy `head - DEFAULT_BACKFILL_BLOCKS`
             // path so default operator behaviour is unchanged.
             let state_dir_env = std::env::var("CHARON_STATE_DIR").ok();
-            let checkpoint_path_opt = state_dir_env
-                .as_deref()
-                .map(|d| charon_scanner::checkpoint_path(std::path::Path::new(d), chain_name.as_str()));
+            let checkpoint_path_opt = state_dir_env.as_deref().map(|d| {
+                charon_scanner::checkpoint_path(std::path::Path::new(d), chain_name.as_str())
+            });
             let persisted_max_block: u64 = match checkpoint_path_opt.as_ref() {
                 Some(path) => match charon_scanner::load_into(path, &discovery) {
                     Ok(max) => {

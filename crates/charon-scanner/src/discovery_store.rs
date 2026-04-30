@@ -177,13 +177,8 @@ pub fn save_atomic(path: &Path, set: &BorrowerSet) -> Result<usize> {
     w.flush()
         .with_context(|| format!("flush tmp checkpoint {}", tmp.display()))?;
     drop(w);
-    std::fs::rename(&tmp, path).with_context(|| {
-        format!(
-            "atomic rename {} -> {}",
-            tmp.display(),
-            path.display()
-        )
-    })?;
+    std::fs::rename(&tmp, path)
+        .with_context(|| format!("atomic rename {} -> {}", tmp.display(), path.display()))?;
     debug!(path = %path.display(), count, "borrower checkpoint flushed");
     Ok(count)
 }
@@ -292,7 +287,10 @@ mod tests {
             set.upsert(Address::from_slice(&[i; 20]), 100);
         }
         save_atomic(&path, &set).expect("first save");
-        let first_lines = std::fs::read_to_string(&path).expect("read").lines().count();
+        let first_lines = std::fs::read_to_string(&path)
+            .expect("read")
+            .lines()
+            .count();
         assert_eq!(first_lines, 10);
 
         // Shrink the in-memory set and re-save — the on-disk file must
