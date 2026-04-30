@@ -175,6 +175,13 @@ pub mod names {
     /// cap and the bot is shedding load to protect its RPC budget.
     pub const MEMPOOL_DROPPED_TOTAL: &str = "charon_mempool_dropped_total";
 
+    /// Total rows written to the borrower-set checkpoint file (#349).
+    /// Increments on every successful flush — a stalled value points
+    /// at a flush task crash or a permission problem on the state
+    /// directory.
+    pub const DISCOVERY_BORROWERS_PERSISTED_TOTAL: &str =
+        "charon_discovery_borrowers_persisted_total";
+
     // Gas oracle (issue #301). Latest EIP-1559 base fee, priority
     // fee used on the last submission attempt, and resulting
     // maxFeePerGas — plus a counter for opportunities dropped
@@ -661,6 +668,17 @@ pub fn record_mempool_dropped(chain: &str, reason: &str) {
     .increment(1);
 }
 
+/// Record one borrower-set checkpoint flush (#349). `count` is the
+/// number of rows persisted, used to drive the histogram of file
+/// sizes downstream.
+pub fn record_discovery_borrowers_persisted(chain: &str, count: u64) {
+    counter!(
+        names::DISCOVERY_BORROWERS_PERSISTED_TOTAL,
+        "chain" => chain.to_owned(),
+    )
+    .increment(count);
+}
+
 pub fn record_mempool_drained(chain: &str, drained: u64) {
     counter!(
         names::MEMPOOL_DRAINED_TOTAL,
@@ -989,6 +1007,9 @@ mod tests {
         // RBF replacements (#364)
         record_submit_replacement("bnb", "ttl_expired");
         record_submit_replacement("bnb", "fee_spike");
+
+        // Borrower-set persistence (#349)
+        record_discovery_borrowers_persisted("bnb", 42);
 
         // Gas (#301)
         set_gas_base_fee_wei("bnb", 3_000_000_000);

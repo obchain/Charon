@@ -5,6 +5,7 @@
 #![cfg_attr(test, allow(clippy::unwrap_used))]
 
 pub mod discovery;
+pub mod discovery_store;
 pub mod listener;
 pub mod mempool;
 pub mod oracle;
@@ -16,6 +17,9 @@ pub use discovery::{
     BORROW_TOPIC0, BorrowerInfo, BorrowerSet, DEFAULT_BACKFILL_BLOCKS, DISCOVERY_CHANNEL_CAPACITY,
     MAX_LOG_CHUNK_BLOCKS, backfill_borrowers, backfill_borrowers_with_config,
     decode_borrow_borrower, run_discovery_live_once, run_discovery_live_with_reconnect,
+};
+pub use discovery_store::{
+    DEFAULT_FLUSH_EVERY, checkpoint_path, load_into, save_atomic, spawn_flush_task,
 };
 pub use listener::{BlockListener, ChainEvent};
 pub use mempool::{
