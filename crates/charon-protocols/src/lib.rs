@@ -9,6 +9,8 @@
 //! For v0.1 only the Venus adapter is wired up; Aave / Compound / Morpho
 //! adapters land in later milestones.
 
+pub mod multicall;
 pub mod venus;
 
+pub use multicall::{InnerCall, InnerResult, MAX_CALLS_PER_BATCH, MULTICALL3_ADDRESS, chunk_calls};
 pub use venus::VenusAdapter;
