@@ -255,11 +255,7 @@ impl NonceManager {
     ///
     /// `tolerance` is in nonces, not blocks — a sensible default is
     /// `2`, matching the typical mempool TTL.
-    pub async fn check_gap<P, T>(
-        &self,
-        provider: &P,
-        tolerance: u64,
-    ) -> Result<(), NonceError>
+    pub async fn check_gap<P, T>(&self, provider: &P, tolerance: u64) -> Result<(), NonceError>
     where
         P: Provider<T>,
         T: alloy::transports::Transport + Clone,

@@ -62,8 +62,7 @@ use charon_core::{
     OpportunityQueue, Position, Price, ProfitInputs, calculate_profit,
 };
 use charon_executor::{
-    DEFAULT_SUBMIT_TIMEOUT, GasDecision, GasOracle, NonceManager, Simulator,
-    Submitter, TxBuilder,
+    DEFAULT_SUBMIT_TIMEOUT, GasDecision, GasOracle, NonceManager, Simulator, Submitter, TxBuilder,
 };
 use charon_flashloan::{AaveFlashLoan, FlashLoanRouter};
 use charon_metrics::{bucket, drop_reason, drop_stage, sim_result};
