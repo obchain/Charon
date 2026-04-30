@@ -208,8 +208,7 @@ impl Submitter {
             other => return Err(SubmitError::InsecureScheme(other.to_string())),
         };
 
-        let actual_chain_id =
-            probe_chain_id(&inner, &endpoint_label, expected_chain_id).await?;
+        let actual_chain_id = probe_chain_id(&inner, &endpoint_label, expected_chain_id).await?;
 
         info!(
             endpoint = %endpoint_label,
@@ -481,17 +480,27 @@ mod tests {
 
     #[tokio::test]
     async fn connect_rejects_plain_http_scheme() {
-        let err = Submitter::connect(&sec("http://example.com/rpc"), None, 56, DEFAULT_SUBMIT_TIMEOUT)
-            .await
-            .expect_err("http:// must be rejected");
+        let err = Submitter::connect(
+            &sec("http://example.com/rpc"),
+            None,
+            56,
+            DEFAULT_SUBMIT_TIMEOUT,
+        )
+        .await
+        .expect_err("http:// must be rejected");
         assert!(matches!(err, SubmitError::InsecureScheme(ref s) if s == "http"));
     }
 
     #[tokio::test]
     async fn connect_rejects_plain_ws_scheme() {
-        let err = Submitter::connect(&sec("ws://example.com/rpc"), None, 56, DEFAULT_SUBMIT_TIMEOUT)
-            .await
-            .expect_err("ws:// must be rejected");
+        let err = Submitter::connect(
+            &sec("ws://example.com/rpc"),
+            None,
+            56,
+            DEFAULT_SUBMIT_TIMEOUT,
+        )
+        .await
+        .expect_err("ws:// must be rejected");
         assert!(matches!(err, SubmitError::InsecureScheme(ref s) if s == "ws"));
     }
 
