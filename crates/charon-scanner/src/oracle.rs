@@ -20,6 +20,8 @@ use alloy::pubsub::PubSubFrontend;
 use alloy::sol;
 use anyhow::{Context, Result};
 use dashmap::DashMap;
+use futures_util::StreamExt;
+use futures_util::stream::FuturesUnordered;
 use tracing::{debug, warn};
 
 /// Default freshness window: 10 minutes. Used only for feeds that do not
@@ -216,11 +218,28 @@ impl PriceCache {
         Ok(cached)
     }
 
-    /// Refresh every configured feed. Individual failures are logged
-    /// and do not abort the batch.
+    /// Refresh every configured feed concurrently (#357). Individual
+    /// failures are logged and do not abort the batch — a single bad
+    /// feed must not poison the rest of the round.
+    ///
+    /// `FuturesUnordered` lets the slowest feed bound the wall-clock
+    /// (each feed is two RPC trips), instead of the previous
+    /// for-loop's serialised RTT × n. Cardinality is small (~10–14
+    /// feeds in production configs) so no semaphore is needed.
     pub async fn refresh_all(&self) {
-        for symbol in self.feeds.keys() {
-            if let Err(err) = self.refresh(symbol).await {
+        let mut futs: FuturesUnordered<_> = self
+            .feeds
+            .keys()
+            .map(|s| {
+                let symbol = s.clone();
+                async move {
+                    let res = self.refresh(&symbol).await;
+                    (symbol, res)
+                }
+            })
+            .collect();
+        while let Some((symbol, res)) = futs.next().await {
+            if let Err(err) = res {
                 warn!(symbol = %symbol, ?err, "chainlink refresh failed");
             }
         }
