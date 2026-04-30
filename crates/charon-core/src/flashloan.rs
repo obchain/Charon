@@ -133,6 +133,24 @@ pub trait FlashLoanProvider: Send + Sync {
     /// Balancer / Maker flash mint. See module docs.
     fn fee_rate_millionths(&self) -> u32;
 
+    /// Effective fee in millionths for a *specific* `(token, amount,
+    /// liquidity)` borrow — including utilisation-driven slippage on
+    /// the source pool itself, not just the static fee tier.
+    ///
+    /// Default impl ignores `amount` / `liquidity` and returns
+    /// [`fee_rate_millionths`] so existing adapters (and the
+    /// single-provider Aave-only configuration) keep working
+    /// unchanged. Adapters with a meaningful slippage penalty
+    /// (Aave V3 utilisation curve, Balancer pool depth, …) override.
+    ///
+    /// Why a default: the trait is `#[non_exhaustive]`-friendly via
+    /// the default method, so a future provider that does *not*
+    /// model utilisation does not have to invent a fake penalty.
+    fn effective_fee_millionths(&self, _token: Address, amount: U256, liquidity: U256) -> u32 {
+        let _ = (amount, liquidity);
+        self.fee_rate_millionths()
+    }
+
     /// Roll `available_liquidity` + `fee_rate_millionths` into a ready
     /// quote for the requested borrow, or `None` when the source
     /// cannot cover the amount on this chain/token.

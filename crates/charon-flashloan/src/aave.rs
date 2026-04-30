@@ -353,6 +353,28 @@ impl FlashLoanProvider for AaveFlashLoan {
         self.fee_rate_millionths
     }
 
+    /// Aave V3 utilisation-aware effective fee (#352).
+    ///
+    /// On top of the static premium, charge a slippage penalty of
+    /// `amount * 1_000_000 / liquidity` (millionths) so a borrow that
+    /// drains a meaningful slice of the pool ranks worse than a
+    /// shallow-pool source it would otherwise tie. Saturates if the
+    /// borrow exceeds liquidity (the router still tries `quote` and
+    /// will fall through naturally if it fails).
+    ///
+    /// `liquidity == U256::MAX` is the "RPC probe failed" sentinel
+    /// the router uses to keep a provider in the rank without
+    /// disqualifying it; treat as "no penalty" so the static fee
+    /// drives the decision.
+    fn effective_fee_millionths(&self, _token: Address, amount: U256, liquidity: U256) -> u32 {
+        if liquidity.is_zero() || liquidity == U256::MAX {
+            return self.fee_rate_millionths;
+        }
+        let penalty = amount.saturating_mul(U256::from(1_000_000u64)) / liquidity;
+        let penalty_u32 = u32::try_from(penalty).unwrap_or(u32::MAX);
+        self.fee_rate_millionths.saturating_add(penalty_u32)
+    }
+
     async fn available_liquidity(&self, token: Address) -> Result<U256, FlashLoanError> {
         self.assert_reserve_open(token).await?;
         let Some(atoken) = self.atoken_for(token).await? else {
