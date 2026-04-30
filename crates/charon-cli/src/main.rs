@@ -619,6 +619,7 @@ async fn run_listen(
                     let set = discovery.clone();
                     let vtokens = vtokens_for_discovery.clone();
                     let chain = chain_name.clone();
+                    let discovery_cfg = chain_cfg.discovery.clone();
                     discovery_tasks.push(tokio::spawn(async move {
                         let head = match provider.get_block_number().await {
                             Ok(h) => h,
@@ -631,13 +632,14 @@ async fn run_listen(
                                 return;
                             }
                         };
-                        let from = head.saturating_sub(charon_scanner::DEFAULT_BACKFILL_BLOCKS);
-                        if let Err(err) = charon_scanner::backfill_borrowers(
+                        let from = head.saturating_sub(discovery_cfg.backfill_blocks);
+                        if let Err(err) = charon_scanner::backfill_borrowers_with_config(
                             provider.as_ref(),
                             vtokens,
                             &set,
                             from,
                             head,
+                            &discovery_cfg,
                         )
                         .await
                         {

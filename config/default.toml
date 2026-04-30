@@ -47,6 +47,21 @@ private_rpc_auth   = "${CHARON_BSC_PRIVATE_RPC_AUTH}"
 # public mempool is a guaranteed front-run.
 allow_public_mempool = false
 
+# Discovery / backfill cadence. Defaults reproduce the previous
+# free-tier-friendly source-level constants exactly. Operators on a
+# paid RPC (Quicknode / Alchemy / Ankr Premium) typically widen
+# log_chunk_blocks to 100_000 and zero inter_chunk_pacing_ms to cut
+# cold-start time from minutes to seconds. Hard upper bound on
+# log_chunk_blocks is 100_000 (Config::validate rejects anything
+# higher).
+[chain.bnb.discovery]
+backfill_blocks         = 200000
+log_chunk_blocks        = 9500
+inter_chunk_pacing_ms   = 50
+chunk_max_attempts      = 4
+chunk_initial_backoff_ms = 500
+chunk_max_backoff_ms    = 5000
+
 # ── Lending protocols ─────────────────────────────────────────────────────
 [protocol.venus]
 chain       = "bnb"

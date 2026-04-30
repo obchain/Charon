@@ -438,6 +438,12 @@ pub struct ChainConfig {
     /// guaranteed front-run. NEVER enable on mainnet.
     #[serde(default)]
     pub allow_public_mempool: bool,
+
+    /// Discovery backfill / chunk-pacing knobs. `#[serde(default)]`
+    /// so older configs without the section keep working with the
+    /// pre-existing source-level constants.
+    #[serde(default)]
+    pub discovery: DiscoveryConfig,
 }
 
 fn default_priority_fee_gwei() -> u64 {
@@ -481,6 +487,80 @@ pub struct ProtocolConfig {
     /// Protocol's main entry point (e.g. Venus Unitroller / Comptroller).
     pub comptroller: Address,
 }
+
+/// Discovery / backfill cadence config exposed under
+/// `[chain.<name>.discovery]`. Every field defaults to the
+/// pre-existing source-level constants so older config files keep
+/// working unchanged. Operators on paid RPCs will typically widen
+/// `log_chunk_blocks` and zero `inter_chunk_pacing_ms` to cut cold
+/// starts from minutes to seconds; free-tier dRPC / public-dataseed
+/// users keep the defaults.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DiscoveryConfig {
+    /// Number of historical blocks to scan at startup. Default
+    /// 200_000 ≈ 7 days at BSC ~3s block time.
+    #[serde(default = "default_backfill_blocks")]
+    pub backfill_blocks: u64,
+    /// Maximum span per `eth_getLogs` chunk. Free-tier BSC RPCs cap
+    /// this around 9_500–10_000; paid RPCs accept 100_000+. Hard
+    /// upper bound (`MAX_LOG_CHUNK_BLOCKS_VALIDATION`) enforced by
+    /// `Config::validate`.
+    #[serde(default = "default_log_chunk_blocks")]
+    pub log_chunk_blocks: u64,
+    /// Pause between `eth_getLogs` chunks. 0 = no pacing.
+    #[serde(default = "default_inter_chunk_pacing_ms")]
+    pub inter_chunk_pacing_ms: u64,
+    /// Per-chunk retry budget on transient upstream failure.
+    #[serde(default = "default_chunk_max_attempts")]
+    pub chunk_max_attempts: u32,
+    /// Initial backoff between chunk retries; doubles up to the
+    /// max below.
+    #[serde(default = "default_chunk_initial_backoff_ms")]
+    pub chunk_initial_backoff_ms: u64,
+    /// Backoff cap between chunk retries.
+    #[serde(default = "default_chunk_max_backoff_ms")]
+    pub chunk_max_backoff_ms: u64,
+}
+
+impl Default for DiscoveryConfig {
+    fn default() -> Self {
+        Self {
+            backfill_blocks: default_backfill_blocks(),
+            log_chunk_blocks: default_log_chunk_blocks(),
+            inter_chunk_pacing_ms: default_inter_chunk_pacing_ms(),
+            chunk_max_attempts: default_chunk_max_attempts(),
+            chunk_initial_backoff_ms: default_chunk_initial_backoff_ms(),
+            chunk_max_backoff_ms: default_chunk_max_backoff_ms(),
+        }
+    }
+}
+
+fn default_backfill_blocks() -> u64 {
+    200_000
+}
+fn default_log_chunk_blocks() -> u64 {
+    9_500
+}
+fn default_inter_chunk_pacing_ms() -> u64 {
+    50
+}
+fn default_chunk_max_attempts() -> u32 {
+    4
+}
+fn default_chunk_initial_backoff_ms() -> u64 {
+    500
+}
+fn default_chunk_max_backoff_ms() -> u64 {
+    5_000
+}
+
+/// Hard upper bound on `discovery.log_chunk_blocks`. Anything above
+/// this is rejected at startup so a typo (`100000_0`) does not start
+/// the bot against an RPC that will reject every chunk with `code:
+/// 35`. Distinct from `charon_scanner::MAX_LOG_CHUNK_BLOCKS`, which is
+/// the *default* chunk size for free-tier BSC RPCs.
+pub const MAX_LOG_CHUNK_BLOCKS_VALIDATION: u64 = 100_000;
 
 /// A flash-loan source available on a given chain.
 #[derive(Debug, Clone, Deserialize)]
@@ -670,6 +750,26 @@ impl Config {
             return Err(ConfigError::Validation(
                 "hot/warm/cold_scan_blocks must all be > 0".into(),
             ));
+        }
+        for (name, c) in &self.chain {
+            if c.discovery.backfill_blocks == 0 {
+                return Err(ConfigError::Validation(format!(
+                    "chain `{name}`: discovery.backfill_blocks must be > 0"
+                )));
+            }
+            if c.discovery.log_chunk_blocks == 0
+                || c.discovery.log_chunk_blocks > MAX_LOG_CHUNK_BLOCKS_VALIDATION
+            {
+                return Err(ConfigError::Validation(format!(
+                    "chain `{name}`: discovery.log_chunk_blocks ({}) must be in 1..={MAX_LOG_CHUNK_BLOCKS_VALIDATION}",
+                    c.discovery.log_chunk_blocks
+                )));
+            }
+            if c.discovery.chunk_max_attempts == 0 {
+                return Err(ConfigError::Validation(format!(
+                    "chain `{name}`: discovery.chunk_max_attempts must be > 0"
+                )));
+            }
         }
         for (name, p) in &self.protocol {
             if !self.chain.contains_key(&p.chain) {
@@ -1103,6 +1203,7 @@ mod private_rpc_tests {
             private_rpc_url: private_rpc.map(|s| SecretString::from(s.to_string())),
             private_rpc_auth: None,
             allow_public_mempool: allow_public,
+            discovery: DiscoveryConfig::default(),
         }
     }
 
@@ -1358,6 +1459,7 @@ mod fork_profile_tests {
             private_rpc_url: None,
             private_rpc_auth: None,
             allow_public_mempool: false,
+            discovery: DiscoveryConfig::default(),
         }
     }
 
@@ -1676,5 +1778,133 @@ mod env_substitution_tests {
         let toml = "rpc_url = \"https://example.com/path#section\"\nnext = 2\n";
         let out = substitute_env_vars(toml).expect("URL fragment preserved");
         assert_eq!(out, toml);
+    }
+
+    /// `DiscoveryConfig::default` reproduces the pre-#365 source-level
+    /// constants verbatim — older configs without a `[discovery]`
+    /// section keep working unchanged.
+    #[test]
+    fn discovery_config_default_matches_legacy_constants() {
+        let d = DiscoveryConfig::default();
+        assert_eq!(d.backfill_blocks, 200_000);
+        assert_eq!(d.log_chunk_blocks, 9_500);
+        assert_eq!(d.inter_chunk_pacing_ms, 50);
+        assert_eq!(d.chunk_max_attempts, 4);
+        assert_eq!(d.chunk_initial_backoff_ms, 500);
+        assert_eq!(d.chunk_max_backoff_ms, 5_000);
+    }
+
+    /// A chain block parses with an explicit `[chain.<n>.discovery]`
+    /// table, keeping the override values verbatim, and an absent
+    /// table parses to `DiscoveryConfig::default()`.
+    #[test]
+    fn chain_config_round_trips_discovery_overrides_and_defaults() {
+        let with_overrides = r#"
+chain_id = 56
+ws_url = "ws://127.0.0.1:8545"
+http_url = "http://127.0.0.1:8545"
+allow_public_mempool = true
+[discovery]
+backfill_blocks = 50_000
+log_chunk_blocks = 100_000
+inter_chunk_pacing_ms = 0
+chunk_max_attempts = 6
+chunk_initial_backoff_ms = 250
+chunk_max_backoff_ms = 8_000
+"#;
+        let parsed: ChainConfig =
+            toml::from_str(with_overrides).expect("ChainConfig with [discovery] overrides parses");
+        assert_eq!(parsed.discovery.backfill_blocks, 50_000);
+        assert_eq!(parsed.discovery.log_chunk_blocks, 100_000);
+        assert_eq!(parsed.discovery.inter_chunk_pacing_ms, 0);
+        assert_eq!(parsed.discovery.chunk_max_attempts, 6);
+        assert_eq!(parsed.discovery.chunk_initial_backoff_ms, 250);
+        assert_eq!(parsed.discovery.chunk_max_backoff_ms, 8_000);
+
+        let no_section = r#"
+chain_id = 56
+ws_url = "ws://127.0.0.1:8545"
+http_url = "http://127.0.0.1:8545"
+allow_public_mempool = true
+"#;
+        let parsed: ChainConfig =
+            toml::from_str(no_section).expect("ChainConfig without [discovery] parses");
+        let default = DiscoveryConfig::default();
+        assert_eq!(parsed.discovery.backfill_blocks, default.backfill_blocks);
+        assert_eq!(parsed.discovery.log_chunk_blocks, default.log_chunk_blocks);
+    }
+
+    /// `Config::validate` rejects out-of-range discovery values rather
+    /// than letting the bot start against an RPC that will reject every
+    /// chunk with `code: 35` or never make progress on a 0-block
+    /// backfill window.
+    #[test]
+    fn validate_rejects_zero_backfill_and_oversize_log_chunk() {
+        fn cfg_with_discovery(d: DiscoveryConfig) -> Config {
+            let mut chain = HashMap::new();
+            chain.insert(
+                "bnb".to_string(),
+                ChainConfig {
+                    chain_id: 56,
+                    ws_url: "ws://127.0.0.1:8545".into(),
+                    http_url: "http://127.0.0.1:8545".into(),
+                    priority_fee_gwei: 1,
+                    private_rpc_url: None,
+                    private_rpc_auth: None,
+                    allow_public_mempool: true,
+                    discovery: d,
+                },
+            );
+            Config {
+                bot: BotConfig {
+                    min_profit_usd_1e6: 1,
+                    max_gas_wei: U256::from(1u64),
+                    scan_interval_ms: 1,
+                    liquidatable_threshold_bps: 10_000,
+                    near_liq_threshold_bps: 10_500,
+                    hot_scan_blocks: 1,
+                    warm_scan_blocks: 10,
+                    cold_scan_blocks: 100,
+                    heartbeat_blocks: 50,
+                    signer_key: None,
+                    profile_tag: None,
+                },
+                chain,
+                protocol: HashMap::new(),
+                flashloan: HashMap::new(),
+                liquidator: HashMap::new(),
+                metrics: MetricsConfig {
+                    enabled: false,
+                    bind: "127.0.0.1:9091".parse().expect("hardcoded bind parses"),
+                    auth_token: None,
+                },
+                chainlink: HashMap::new(),
+                chainlink_max_age_secs: HashMap::new(),
+            }
+        }
+
+        let bad = DiscoveryConfig {
+            backfill_blocks: 0,
+            ..DiscoveryConfig::default()
+        };
+        let err = cfg_with_discovery(bad)
+            .validate()
+            .expect_err("backfill_blocks == 0 must reject");
+        match err {
+            ConfigError::Validation(m) => assert!(m.contains("backfill_blocks"), "{m}"),
+            other => panic!("wrong variant: {other:?}"),
+        }
+
+        let bad = DiscoveryConfig {
+            log_chunk_blocks: 200_000,
+            ..DiscoveryConfig::default()
+        };
+        let err = cfg_with_discovery(bad)
+            .validate()
+            .expect_err("log_chunk_blocks > 100_000 must reject");
+        match err {
+            ConfigError::Validation(m) => assert!(m.contains("log_chunk_blocks"), "{m}"),
+            other => panic!("wrong variant: {other:?}"),
+        }
     }
 }

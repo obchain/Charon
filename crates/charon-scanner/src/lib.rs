@@ -14,8 +14,8 @@ pub mod token_meta;
 
 pub use discovery::{
     BORROW_TOPIC0, BorrowerInfo, BorrowerSet, DEFAULT_BACKFILL_BLOCKS, DISCOVERY_CHANNEL_CAPACITY,
-    MAX_LOG_CHUNK_BLOCKS, backfill_borrowers, decode_borrow_borrower, run_discovery_live_once,
-    run_discovery_live_with_reconnect,
+    MAX_LOG_CHUNK_BLOCKS, backfill_borrowers, backfill_borrowers_with_config,
+    decode_borrow_borrower, run_discovery_live_once, run_discovery_live_with_reconnect,
 };
 pub use listener::{BlockListener, ChainEvent};
 pub use mempool::{
