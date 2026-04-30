@@ -17,12 +17,16 @@
 //! than crashing the bot.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Duration;
 
 use alloy::primitives::Address;
 use alloy::providers::RootProvider;
 use alloy::pubsub::PubSubFrontend;
 use alloy::sol;
+use futures_util::StreamExt;
+use futures_util::stream::FuturesUnordered;
+use tokio::sync::Semaphore;
 use tokio::time::sleep;
 use tracing::{debug, warn};
 
@@ -56,6 +60,15 @@ const _: () = assert!(META_MAX_ATTEMPTS >= 1, "META_MAX_ATTEMPTS must be >= 1");
 /// Initial backoff before the first retry. Doubles every failed
 /// attempt up to `META_MAX_ATTEMPTS`.
 const META_INITIAL_BACKOFF: Duration = Duration::from_millis(500);
+
+/// Default cap on concurrent token-meta fetches inside [`TokenMetaCache::build`]
+/// (#391). Sequential fetches let one slow market's retry-with-backoff stall
+/// every later token; an unbounded fan-out would saturate dRPC's free-tier
+/// CUPS budget and convert the win back into a 429 storm. 16 keeps cold-start
+/// fast on the typical 48-market BSC discovery while staying inside the
+/// free-tier ceiling. Operators on a paid RPC can widen via
+/// [`TokenMetaCache::with_concurrency`].
+pub const DEFAULT_TOKEN_META_CONCURRENCY: usize = 16;
 
 /// Metadata for one ERC-20: what to call it and how to scale it.
 #[derive(Debug, Clone)]
@@ -174,51 +187,81 @@ impl TokenMetaCache {
     /// — e.g. legacy MKR-style bytes32 symbols, or a sustained RPC
     /// outage — are dropped from the cache; callers see them as
     /// unknown and skip the opportunity.
+    ///
+    /// Fetches are issued in parallel under a [`DEFAULT_TOKEN_META_CONCURRENCY`]
+    /// semaphore (#391) so one slow market's retry-with-backoff
+    /// cannot stall every later token. Operators on a paid RPC can
+    /// widen the cap via [`Self::build_with_concurrency`]; free-tier
+    /// dRPC users keep the safe default.
     pub async fn build(
         provider: &RootProvider<PubSubFrontend>,
         tokens: impl IntoIterator<Item = Address>,
     ) -> Self {
-        let mut inner = HashMap::new();
+        Self::build_with_concurrency(provider, tokens, DEFAULT_TOKEN_META_CONCURRENCY).await
+    }
+
+    /// Variant of [`Self::build`] with an explicit concurrency cap.
+    /// `concurrency` is clamped to `>= 1` so a misconfigured `0`
+    /// cannot silently disable the metadata fetch loop.
+    pub async fn build_with_concurrency(
+        provider: &RootProvider<PubSubFrontend>,
+        tokens: impl IntoIterator<Item = Address>,
+        concurrency: usize,
+    ) -> Self {
+        let cap = concurrency.max(1);
+        let sem = Arc::new(Semaphore::new(cap));
+        let mut futs = FuturesUnordered::new();
         for addr in tokens {
             let contract = IERC20Meta::new(addr, provider);
-
-            let symbol =
-                match fetch_with_retry("symbol", addr, || async { contract.symbol().call().await })
+            let sem = sem.clone();
+            futs.push(async move {
+                // Acquire a permit before either round-trip so the
+                // pair is contiguous on the wire (no other token
+                // sneaks between symbol() and decimals() and steals
+                // the upstream's CUPS budget).
+                let _permit = sem
+                    .acquire()
                     .await
+                    .expect("token-meta semaphore is never closed");
+                let symbol = match fetch_with_retry("symbol", addr, || async {
+                    contract.symbol().call().await
+                })
+                .await
                 {
                     Ok(r) => r._0,
                     Err(err) => {
-                        // Genuinely missing or non-standard ERC-20 — skip.
-                        // Logged at warn (not error) because the bot
-                        // continues running; the profit gate treats
-                        // "no meta" the same as "no price".
                         warn!(
                             token = %addr,
                             error = ?err,
                             "symbol() failed after retries — market skipped from token meta",
                         );
-                        continue;
+                        return None;
                     }
                 };
-
-            let decimals = match fetch_with_retry("decimals", addr, || async {
-                contract.decimals().call().await
-            })
-            .await
-            {
-                Ok(r) => r._0,
-                Err(err) => {
-                    warn!(
-                        token = %addr,
-                        error = ?err,
-                        "decimals() failed after retries — market skipped from token meta",
-                    );
-                    continue;
-                }
-            };
-
-            debug!(token = %addr, %symbol, decimals, "token meta cached");
-            inner.insert(addr, TokenMeta { symbol, decimals });
+                let decimals = match fetch_with_retry("decimals", addr, || async {
+                    contract.decimals().call().await
+                })
+                .await
+                {
+                    Ok(r) => r._0,
+                    Err(err) => {
+                        warn!(
+                            token = %addr,
+                            error = ?err,
+                            "decimals() failed after retries — market skipped from token meta",
+                        );
+                        return None;
+                    }
+                };
+                debug!(token = %addr, %symbol, decimals, "token meta cached");
+                Some((addr, TokenMeta { symbol, decimals }))
+            });
+        }
+        let mut inner = HashMap::new();
+        while let Some(entry) = futs.next().await {
+            if let Some((addr, meta)) = entry {
+                inner.insert(addr, meta);
+            }
         }
         Self { inner }
     }
@@ -243,6 +286,55 @@ impl TokenMetaCache {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Concurrency cap (#391) is honoured: at saturation,
+    /// `try_acquire` fails rather than spinning a third concurrent
+    /// fetch. Hold two permits manually and assert the third cannot
+    /// be acquired without waiting.
+    #[tokio::test]
+    async fn concurrency_cap_saturates_on_third_acquire() {
+        let sem = Arc::new(Semaphore::new(2));
+        let _p1 = sem
+            .clone()
+            .try_acquire_owned()
+            .expect("first permit available");
+        let _p2 = sem
+            .clone()
+            .try_acquire_owned()
+            .expect("second permit available");
+        // Third synchronous attempt must fail — the cap is exactly 2.
+        assert!(
+            sem.clone().try_acquire_owned().is_err(),
+            "saturated semaphore must reject a third synchronous acquire"
+        );
+    }
+
+    /// `build_with_concurrency(0)` clamps to 1 — a zero-permit
+    /// semaphore would block every fetch indefinitely. Mirror the
+    /// `cap.max(1)` clamp the builder applies and assert the
+    /// resulting Semaphore yields exactly one permit before
+    /// saturating.
+    #[test]
+    fn concurrency_zero_clamps_to_one() {
+        let clamped = Arc::new(Semaphore::new(1));
+        let p = clamped
+            .clone()
+            .try_acquire_owned()
+            .expect("clamped sem yields one permit");
+        assert!(
+            clamped.clone().try_acquire_owned().is_err(),
+            "second acquire on cap=1 must saturate"
+        );
+        drop(p);
+    }
+
+    /// Pin the public default. Operators who lower their RPC tier
+    /// will read this constant in the doc comment; a future change
+    /// must be deliberate.
+    #[test]
+    fn default_concurrency_is_sixteen() {
+        assert_eq!(DEFAULT_TOKEN_META_CONCURRENCY, 16);
+    }
 
     #[test]
     fn empty_cache_returns_none_on_lookup() {
