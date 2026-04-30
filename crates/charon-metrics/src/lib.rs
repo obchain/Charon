@@ -149,6 +149,12 @@ pub mod names {
     pub const MEMPOOL_PENDING_ORACLE_UPDATES: &str = "charon_mempool_pending_oracle_updates";
     pub const MEMPOOL_DRAINED_TOTAL: &str = "charon_mempool_drained_total";
     pub const MEMPOOL_WS_RECONNECTS_TOTAL: &str = "charon_mempool_websocket_reconnects_total";
+    /// Per-(selector, kind) counter of decoded Venus oracle writes
+    /// observed in the mempool (#350). Surfaces "which selector is
+    /// active right now" so a ResilientOracle migration that retires
+    /// `updatePrice` and ships a replacement is visible at a glance.
+    pub const MEMPOOL_VENUS_ORACLE_WRITES_TOTAL: &str =
+        "charon_mempool_venus_oracle_writes_total";
 
     // Gas oracle (issue #301). Latest EIP-1559 base fee, priority
     // fee used on the last submission attempt, and resulting
@@ -548,6 +554,22 @@ pub fn set_mempool_pending_oracle_updates(chain: &str, count: u64) {
 /// cache at a block boundary. Zero-valued drains are a legitimate
 /// signal (nothing to do this block) so the call site records
 /// unconditionally — Prometheus handles zero-delta increments.
+/// Record one decoded Venus oracle write observed in the mempool
+/// (#350). `selector` is the lowercase 8-hex selector
+/// (e.g. `"0x4d8275ed"`), `kind` is the `OracleUpdate::kind()` accessor
+/// (e.g. `"refresh"` / `"direct"`). Tagging on both axes lets a
+/// dashboard split "what's in flight on Venus" by both surface (which
+/// function) and effect (refresh vs direct overwrite).
+pub fn record_mempool_oracle_write(chain: &str, selector: &str, kind: &str) {
+    counter!(
+        names::MEMPOOL_VENUS_ORACLE_WRITES_TOTAL,
+        "chain" => chain.to_owned(),
+        "selector" => selector.to_owned(),
+        "kind" => kind.to_owned(),
+    )
+    .increment(1);
+}
+
 pub fn record_mempool_drained(chain: &str, drained: u64) {
     counter!(
         names::MEMPOOL_DRAINED_TOTAL,
@@ -829,6 +851,9 @@ mod tests {
         record_mempool_drained("bnb", 3);
         record_mempool_drained("bnb", 0);
         record_mempool_ws_reconnect("bnb");
+        // Mempool oracle writes (#350)
+        record_mempool_oracle_write("bnb", "0x4d8275ed", "refresh");
+        record_mempool_oracle_write("bnb", "0xb13a8aaf", "direct");
 
         // Gas (#301)
         set_gas_base_fee_wei("bnb", 3_000_000_000);

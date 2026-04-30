@@ -849,13 +849,19 @@ impl MempoolMonitor {
             return Ok(true);
         };
 
-        // TODO(charon-metrics): bump a Prometheus counter labelled
-        // with the selector + update.kind() here once the metrics
-        // crate merges in rebase.
+        let selector_label = format_selector(update.selector());
+        // Per-(selector, kind) counter so a ResilientOracle migration
+        // that retires `updatePrice` and ships a replacement is
+        // visible on the dashboard rather than only in `debug` logs.
+        charon_metrics::record_mempool_oracle_write(
+            self.cache.chain(),
+            &selector_label,
+            update.kind(),
+        );
         debug!(
             %hash,
             asset = %update.asset(),
-            selector = %format_selector(update.selector()),
+            selector = %selector_label,
             kind = update.kind(),
             "venus oracle update seen in mempool"
         );
