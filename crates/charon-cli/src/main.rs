@@ -722,8 +722,7 @@ async fn run_listen(
                 .cold_scan_blocks
                 .max(config.bot.warm_scan_blocks)
                 .max(config.bot.hot_scan_blocks);
-            let phase_offset =
-                charon_scanner::derive_phase_offset(&phase_seed, phase_period_max);
+            let phase_offset = charon_scanner::derive_phase_offset(&phase_seed, phase_period_max);
             info!(
                 chain = %chain_name,
                 phase_offset,
