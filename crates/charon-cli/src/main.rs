@@ -66,7 +66,7 @@ use charon_executor::{
     Submitter, TxBuilder,
 };
 use charon_flashloan::{AaveFlashLoan, FlashLoanRouter};
-use charon_metrics::{bucket, drop_stage, sim_result};
+use charon_metrics::{bucket, drop_reason, drop_stage, sim_result};
 use charon_protocols::VenusAdapter;
 use charon_scanner::{
     BlockListener, ChainEvent, ChainProvider, DEFAULT_MAX_AGE, HealthScanner, MempoolMonitor,
@@ -1584,10 +1584,19 @@ async fn process_opportunity(
 
     let chain = pipeline.chain_name.as_str();
 
+    // Top-level "opportunities seen" counter (#368). Bumped before
+    // any drop gate so the dropped-by-reason ratios denominate
+    // against the same population.
+    charon_metrics::record_opportunity_seen(chain);
+
     // b. Router: pick cheapest flash-loan source for (debt token,
     //    repay amount).
     let Some(quote) = pipeline.router.route(pos.debt_token, repay).await else {
         charon_metrics::record_opportunity_dropped(chain, drop_stage::ROUTER);
+        charon_metrics::record_opportunity_dropped_reason(
+            chain,
+            drop_reason::NO_FLASHLOAN_SOURCE,
+        );
         return Ok(false);
     };
 
@@ -1599,6 +1608,7 @@ async fn process_opportunity(
     //    produced against fallback values.
     let Some(debt_meta) = pipeline.token_meta.get(&pos.debt_token) else {
         charon_metrics::record_opportunity_dropped(chain, drop_stage::PROFIT);
+        charon_metrics::record_opportunity_dropped_reason(chain, drop_reason::UNPROFITABLE);
         debug!(
             borrower = %pos.borrower,
             debt_token = %pos.debt_token,
@@ -1608,6 +1618,7 @@ async fn process_opportunity(
     };
     let Some(debt_cached) = pipeline.prices.get(&debt_meta.symbol) else {
         charon_metrics::record_opportunity_dropped(chain, drop_stage::PROFIT);
+        charon_metrics::record_opportunity_dropped_reason(chain, drop_reason::UNPROFITABLE);
         debug!(
             borrower = %pos.borrower,
             symbol = %debt_meta.symbol,
@@ -1617,6 +1628,7 @@ async fn process_opportunity(
     };
     let Some(native_cached) = pipeline.prices.get(NATIVE_FEED_SYMBOL) else {
         charon_metrics::record_opportunity_dropped(chain, drop_stage::PROFIT);
+        charon_metrics::record_opportunity_dropped_reason(chain, drop_reason::UNPROFITABLE);
         debug!(
             borrower = %pos.borrower,
             "no native/USD price (or stale) — dropped"
@@ -1632,6 +1644,7 @@ async fn process_opportunity(
         Ok(v) if v > 0 => v,
         _ => {
             charon_metrics::record_opportunity_dropped(chain, drop_stage::PROFIT);
+            charon_metrics::record_opportunity_dropped_reason(chain, drop_reason::UNPROFITABLE);
             debug!(
                 borrower = %pos.borrower,
                 symbol = %debt_meta.symbol,
@@ -1644,6 +1657,7 @@ async fn process_opportunity(
         Ok(v) if v > 0 => v,
         _ => {
             charon_metrics::record_opportunity_dropped(chain, drop_stage::PROFIT);
+            charon_metrics::record_opportunity_dropped_reason(chain, drop_reason::UNPROFITABLE);
             debug!(
                 borrower = %pos.borrower,
                 "native price out of u64 range or zero — dropped"
@@ -1655,6 +1669,7 @@ async fn process_opportunity(
         Ok(p) => p,
         Err(err) => {
             charon_metrics::record_opportunity_dropped(chain, drop_stage::PROFIT);
+            charon_metrics::record_opportunity_dropped_reason(chain, drop_reason::UNPROFITABLE);
             debug!(borrower = %pos.borrower, error = ?err, "debt Price rejected");
             return Ok(false);
         }
@@ -1679,6 +1694,7 @@ async fn process_opportunity(
         Ok(d) => d,
         Err(err) => {
             charon_metrics::record_opportunity_dropped(chain, drop_stage::PROFIT);
+            charon_metrics::record_opportunity_dropped_reason(chain, drop_reason::UNPROFITABLE);
             debug!(
                 borrower = %pos.borrower,
                 error = ?err,
@@ -1694,6 +1710,7 @@ async fn process_opportunity(
             ceiling_wei,
         } => {
             charon_metrics::record_opportunity_dropped(chain, drop_stage::PROFIT);
+            charon_metrics::record_opportunity_dropped_reason(chain, drop_reason::GAS_CEILING);
             debug!(
                 borrower = %pos.borrower,
                 %max_fee_wei,
@@ -1706,6 +1723,7 @@ async fn process_opportunity(
         // variant must fail closed rather than silently proceed.
         _ => {
             charon_metrics::record_opportunity_dropped(chain, drop_stage::PROFIT);
+            charon_metrics::record_opportunity_dropped_reason(chain, drop_reason::UNPROFITABLE);
             debug!(
                 borrower = %pos.borrower,
                 "unrecognised GasDecision variant — dropped"
@@ -1735,6 +1753,7 @@ async fn process_opportunity(
         Ok(i) => i,
         Err(err) => {
             charon_metrics::record_opportunity_dropped(chain, drop_stage::PROFIT);
+            charon_metrics::record_opportunity_dropped_reason(chain, drop_reason::UNPROFITABLE);
             debug!(borrower = %pos.borrower, error = ?err, "profit inputs rejected");
             return Ok(false);
         }
@@ -1743,6 +1762,7 @@ async fn process_opportunity(
         Ok(n) => n,
         Err(err) => {
             charon_metrics::record_opportunity_dropped(chain, drop_stage::PROFIT);
+            charon_metrics::record_opportunity_dropped_reason(chain, drop_reason::UNPROFITABLE);
             debug!(borrower = %pos.borrower, error = ?err, "profit gate dropped");
             return Ok(false);
         }
@@ -1793,6 +1813,7 @@ async fn process_opportunity(
         // as a simulation-stage drop so dashboards surface scan-only
         // runs without hiding them under router/profit gates.
         charon_metrics::record_opportunity_dropped(chain, drop_stage::SIMULATION);
+        charon_metrics::record_opportunity_dropped_reason(chain, drop_reason::SIM_REVERT);
         debug!(
             borrower = %pos.borrower,
             "simulation skipped — no signer configured; opportunity not enqueued"
@@ -1808,6 +1829,7 @@ async fn process_opportunity(
     if let Err(err) = gate.encode_and_simulate(&opp, &params).await {
         charon_metrics::record_simulation(chain, sim_result::REVERT);
         charon_metrics::record_opportunity_dropped(chain, drop_stage::SIMULATION);
+        charon_metrics::record_opportunity_dropped_reason(chain, drop_reason::SIM_REVERT);
         debug!(borrower = %pos.borrower, error = ?err, "simulation gate dropped");
         return Ok(false);
     }
@@ -1844,6 +1866,11 @@ async fn process_opportunity(
                 );
             }
             Err(err) => {
+                charon_metrics::record_opportunity_dropped(chain, drop_stage::BUILD);
+                charon_metrics::record_opportunity_dropped_reason(
+                    chain,
+                    drop_reason::SUBMIT_FAILED,
+                );
                 warn!(
                     chain = %pipeline.chain_name,
                     borrower = %pos.borrower,
