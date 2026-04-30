@@ -32,6 +32,17 @@ use crate::token_meta::is_transient;
 pub const BORROW_TOPIC0: B256 =
     b256!("13ed6866d4e1ee6da46f845c46d7e54120883d75c5ea9a2dacc1c4ca8984ab80");
 
+/// `keccak256("RepayBorrow(address,address,uint256,uint256,uint256)")` —
+/// Compound / Venus `RepayBorrow` emitted on every (partial or full)
+/// repay. `accountBorrows == 0` means the borrower is fully closed and
+/// can be pruned from the active scan set.
+///
+/// Layout: `data` = [payer, borrower, repayAmount, accountBorrows,
+/// totalBorrows], each 32-byte word (no indexed fields on the
+/// Compound-fork event).
+pub const REPAY_BORROW_TOPIC0: B256 =
+    b256!("1a2a22cb034d26d1854bdc6666a5b91fe25efbbb5dcad3b0355478d6f5c362a1");
+
 /// Default backfill window — last 7 days at BSC's ~3s block time ≈ 200_000 blocks.
 pub const DEFAULT_BACKFILL_BLOCKS: u64 = 200_000;
 
@@ -62,8 +73,17 @@ const DISCOVERY_RECONNECT_MAX_BACKOFF: Duration = Duration::from_secs(30);
 /// Per-borrower book-keeping carried alongside the address set.
 #[derive(Debug, Clone, Copy)]
 pub struct BorrowerInfo {
-    /// Last block at which this borrower emitted a `Borrow` event.
+    /// Last block at which this borrower emitted a `Borrow` or
+    /// `RepayBorrow` event.
     pub last_seen_block: u64,
+    /// Whether the borrower currently holds an active position. Set
+    /// to `false` by [`BorrowerSet::mark_inactive`] when a
+    /// `RepayBorrow` event reports `accountBorrows == 0`. Re-set to
+    /// `true` by a subsequent `Borrow` upsert. Inactive entries stay
+    /// in the map (so a re-borrow is a cheap upsert) but are
+    /// excluded from [`BorrowerSet::snapshot`] and
+    /// `fetch_positions`.
+    pub active: bool,
 }
 
 /// Append-only borrower set populated by both the backfill and the live tail.
@@ -80,7 +100,9 @@ impl BorrowerSet {
         Self::default()
     }
 
-    /// Insert or refresh an entry. Returns `true` when the address was new.
+    /// Insert or refresh an entry, marking it active. Returns `true`
+    /// when the address was new. A `Borrow` event also re-activates
+    /// a previously-inactive entry (re-borrow after full repay).
     pub fn upsert(&self, addr: Address, block: u64) -> bool {
         let mut inserted = false;
         self.inner
@@ -89,22 +111,69 @@ impl BorrowerSet {
                 if block > existing.last_seen_block {
                     existing.last_seen_block = block;
                 }
+                existing.active = true;
             })
             .or_insert_with(|| {
                 inserted = true;
                 BorrowerInfo {
                     last_seen_block: block,
+                    active: true,
                 }
             });
         inserted
     }
 
-    pub fn snapshot(&self) -> Vec<Address> {
-        self.inner.iter().map(|kv| *kv.key()).collect()
+    /// Mark an existing entry inactive (Compound `RepayBorrow` with
+    /// `accountBorrows == 0`). Idempotent: re-marking an already
+    /// inactive entry is a no-op. Marking an unseen address inserts
+    /// a fresh inactive record so a later `Borrow` upsert fills in
+    /// the right state without losing the seen-at block. Always
+    /// updates `last_seen_block` if the supplied `block` is newer
+    /// than the stored one — a same-block borrow → repay sequence
+    /// tracks correctly.
+    pub fn mark_inactive(&self, addr: Address, block: u64) {
+        self.inner
+            .entry(addr)
+            .and_modify(|existing| {
+                if block > existing.last_seen_block {
+                    existing.last_seen_block = block;
+                }
+                existing.active = false;
+            })
+            .or_insert(BorrowerInfo {
+                last_seen_block: block,
+                active: false,
+            });
     }
 
+    /// Snapshot of currently-active borrowers (excluding any pruned
+    /// by [`mark_inactive`]). The scanner consumes this to drive the
+    /// next round of position fetches.
+    pub fn snapshot(&self) -> Vec<Address> {
+        self.inner
+            .iter()
+            .filter(|kv| kv.value().active)
+            .map(|kv| *kv.key())
+            .collect()
+    }
+
+    /// Total tracked entries (active + inactive). Sticks with the
+    /// historical name so existing call sites stay simple; for
+    /// active-only counts use [`active_len`].
     pub fn len(&self) -> usize {
         self.inner.len()
+    }
+
+    /// Number of currently-active borrowers (those that pass the
+    /// [`snapshot`] filter).
+    pub fn active_len(&self) -> usize {
+        self.inner.iter().filter(|kv| kv.value().active).count()
+    }
+
+    /// Number of currently-inactive borrowers (RepayBorrow with
+    /// `accountBorrows == 0` observed, no subsequent `Borrow`).
+    pub fn inactive_len(&self) -> usize {
+        self.inner.iter().filter(|kv| !kv.value().active).count()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -113,6 +182,14 @@ impl BorrowerSet {
 
     pub fn contains(&self, addr: &Address) -> bool {
         self.inner.contains_key(addr)
+    }
+
+    /// Diagnostic: returns the stored `active` flag for an address,
+    /// `None` when the address is not tracked. Used by tests to
+    /// assert the borrow → repay → borrow cycle leaves the entry
+    /// active.
+    pub fn is_active(&self, addr: &Address) -> Option<bool> {
+        self.inner.get(addr).map(|e| e.active)
     }
 }
 
@@ -127,6 +204,22 @@ pub fn decode_borrow_borrower(log: &Log) -> Option<Address> {
         return None;
     }
     Some(Address::from_slice(&data[12..32]))
+}
+
+/// Decode `(borrower, accountBorrows)` from a Compound `RepayBorrow`
+/// log. Layout (no indexed fields):
+/// `data = [payer, borrower, repayAmount, accountBorrows, totalBorrows]`,
+/// each a 32-byte word. Returns `None` for a short / malformed log so
+/// a single bad upstream record cannot abort the discovery loop.
+pub fn decode_repay_borrow(log: &Log) -> Option<(Address, alloy::primitives::U256)> {
+    let data = log.data().data.as_ref();
+    // 5 × 32 bytes minimum.
+    if data.len() < 160 {
+        return None;
+    }
+    let borrower = Address::from_slice(&data[32 + 12..64]);
+    let account_borrows = alloy::primitives::U256::from_be_slice(&data[96..128]);
+    Some((borrower, account_borrows))
 }
 
 /// `eth_getLogs` wrapper with bounded exponential-backoff retry on
@@ -217,7 +310,8 @@ pub async fn backfill_borrowers_with_config(
     let chunk_span = cfg.log_chunk_blocks.max(1);
     let pacing = Duration::from_millis(cfg.inter_chunk_pacing_ms);
     let mut new_count: usize = 0;
-    let topic = FixedBytes::<32>::from(BORROW_TOPIC0.0);
+    let topic_borrow = FixedBytes::<32>::from(BORROW_TOPIC0.0);
+    let topic_repay = FixedBytes::<32>::from(REPAY_BORROW_TOPIC0.0);
     let mut cursor = from_block;
     while cursor <= to_block {
         // Saturating arithmetic — the chunk window is bounded by
@@ -229,11 +323,15 @@ pub async fn backfill_borrowers_with_config(
             .saturating_add(chunk_span)
             .saturating_sub(1)
             .min(to_block);
+        // Single eth_getLogs per chunk with a topic OR-set: Borrow
+        // + RepayBorrow. eth_getLogs returns logs in (block,
+        // log_index) order, so applying them in sequence keeps a
+        // same-block borrow → repay → borrow cycle correct.
         let filter = Filter::new()
             .from_block(cursor)
             .to_block(chunk_end)
             .address(vtokens.clone())
-            .event_signature(topic);
+            .event_signature(vec![topic_borrow, topic_repay]);
         let logs = get_logs_with_retry(provider, &filter, cursor, chunk_end, cfg)
             .await
             .with_context(|| format!("eth_getLogs {}..{}", cursor, chunk_end))?;
@@ -244,10 +342,23 @@ pub async fn backfill_borrowers_with_config(
             "discovery backfill chunk"
         );
         for log in &logs {
-            if let Some(borrower) = decode_borrow_borrower(log) {
-                let block = log.block_number.unwrap_or(chunk_end);
-                if set.upsert(borrower, block) {
-                    new_count = new_count.saturating_add(1);
+            let Some(topic0) = log.topics().first() else {
+                continue;
+            };
+            let block = log.block_number.unwrap_or(chunk_end);
+            if topic0.0 == BORROW_TOPIC0.0 {
+                if let Some(borrower) = decode_borrow_borrower(log) {
+                    if set.upsert(borrower, block) {
+                        new_count = new_count.saturating_add(1);
+                    }
+                }
+            } else if topic0.0 == REPAY_BORROW_TOPIC0.0 {
+                if let Some((borrower, account_borrows)) = decode_repay_borrow(log) {
+                    if account_borrows.is_zero() {
+                        set.mark_inactive(borrower, block);
+                    }
+                    // accountBorrows > 0 means partial repay — keep
+                    // the entry active.
                 }
             }
         }
@@ -288,24 +399,38 @@ pub async fn run_discovery_live_once(
         warn!("discovery: no vTokens supplied — live subscription is a no-op");
         return Ok(());
     }
-    let topic = FixedBytes::<32>::from(BORROW_TOPIC0.0);
-    let filter = Filter::new().address(vtokens).event_signature(topic);
+    let topic_borrow = FixedBytes::<32>::from(BORROW_TOPIC0.0);
+    let topic_repay = FixedBytes::<32>::from(REPAY_BORROW_TOPIC0.0);
+    let filter = Filter::new()
+        .address(vtokens)
+        .event_signature(vec![topic_borrow, topic_repay]);
     let sub = provider
         .subscribe_logs(&filter)
         .await
-        .context("subscribe_logs(Borrow) failed")?;
+        .context("subscribe_logs(Borrow|RepayBorrow) failed")?;
     let mut stream = sub.into_stream();
     info!("discovery live subscription established");
     while let Some(log) = stream.next().await {
-        let Some(borrower) = decode_borrow_borrower(&log) else {
+        let Some(topic0) = log.topics().first() else {
             continue;
         };
         let block = log.block_number.unwrap_or(0);
-        if set.upsert(borrower, block) {
-            // best-effort send — if the consumer is slow we'd rather drop
-            // a notification than back-pressure the log stream and risk
-            // upstream subscription drop.
-            let _ = sink.try_send(borrower);
+        if topic0.0 == BORROW_TOPIC0.0 {
+            let Some(borrower) = decode_borrow_borrower(&log) else {
+                continue;
+            };
+            if set.upsert(borrower, block) {
+                // best-effort send — if the consumer is slow we'd rather drop
+                // a notification than back-pressure the log stream and risk
+                // upstream subscription drop.
+                let _ = sink.try_send(borrower);
+            }
+        } else if topic0.0 == REPAY_BORROW_TOPIC0.0 {
+            if let Some((borrower, account_borrows)) = decode_repay_borrow(&log) {
+                if account_borrows.is_zero() {
+                    set.mark_inactive(borrower, block);
+                }
+            }
         }
     }
     Ok(())
@@ -430,11 +555,134 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_lists_all_addresses() {
+    fn snapshot_lists_only_active_addresses() {
         let set = BorrowerSet::new();
         for i in 0..5u8 {
             set.upsert(Address::from_slice(&[i; 20]), 1);
         }
-        assert_eq!(set.snapshot().len(), 5);
+        // Mark one inactive — snapshot must skip it but len() retains.
+        set.mark_inactive(Address::from_slice(&[0u8; 20]), 2);
+        assert_eq!(set.snapshot().len(), 4);
+        assert_eq!(set.len(), 5);
+        assert_eq!(set.active_len(), 4);
+        assert_eq!(set.inactive_len(), 1);
+    }
+
+    fn make_repay_log(
+        payer: Address,
+        borrower: Address,
+        repay: alloy::primitives::U256,
+        account_borrows: alloy::primitives::U256,
+        total: alloy::primitives::U256,
+        block: u64,
+    ) -> Log {
+        let mut data = Vec::with_capacity(32 * 5);
+        let mut word = [0u8; 32];
+        word[12..32].copy_from_slice(payer.as_slice());
+        data.extend_from_slice(&word);
+        let mut word = [0u8; 32];
+        word[12..32].copy_from_slice(borrower.as_slice());
+        data.extend_from_slice(&word);
+        data.extend_from_slice(&repay.to_be_bytes::<32>());
+        data.extend_from_slice(&account_borrows.to_be_bytes::<32>());
+        data.extend_from_slice(&total.to_be_bytes::<32>());
+        Log {
+            inner: alloy::primitives::Log {
+                address: Address::ZERO,
+                data: LogData::new_unchecked(
+                    vec![FixedBytes::<32>::from(REPAY_BORROW_TOPIC0.0)],
+                    Bytes::from(data),
+                ),
+            },
+            block_hash: None,
+            block_number: Some(block),
+            block_timestamp: None,
+            transaction_hash: None,
+            transaction_index: None,
+            log_index: None,
+            removed: false,
+        }
+    }
+
+    /// Borrow then full repay leaves the entry tracked but inactive,
+    /// excluded from the snapshot.
+    #[test]
+    fn borrow_then_full_repay_marks_inactive() {
+        let set = BorrowerSet::new();
+        let b = Address::from_slice(&[0xBB; 20]);
+        set.upsert(b, 100);
+        assert_eq!(set.is_active(&b), Some(true));
+
+        let log = make_repay_log(
+            Address::ZERO,
+            b,
+            alloy::primitives::U256::from(50u64),
+            alloy::primitives::U256::ZERO,
+            alloy::primitives::U256::ZERO,
+            101,
+        );
+        let (decoded_b, account) = decode_repay_borrow(&log).expect("decode");
+        assert_eq!(decoded_b, b);
+        assert!(account.is_zero());
+        set.mark_inactive(decoded_b, 101);
+
+        assert_eq!(set.is_active(&b), Some(false));
+        assert!(!set.snapshot().contains(&b));
+    }
+
+    /// Borrow → full repay → borrow ends active. Same-block ordering
+    /// is preserved by the get_logs iteration order in the backfill.
+    #[test]
+    fn borrow_repay_borrow_ends_active() {
+        let set = BorrowerSet::new();
+        let b = Address::from_slice(&[0xCC; 20]);
+        set.upsert(b, 100);
+        set.mark_inactive(b, 100); // same-block repay
+        assert_eq!(set.is_active(&b), Some(false));
+        // Subsequent re-borrow flips active back on.
+        set.upsert(b, 100);
+        assert_eq!(set.is_active(&b), Some(true));
+        assert!(set.snapshot().contains(&b));
+    }
+
+    /// Partial repay (`accountBorrows > 0`) must leave the borrower
+    /// active — only `accountBorrows == 0` triggers the prune.
+    #[test]
+    fn partial_repay_keeps_borrower_active() {
+        let set = BorrowerSet::new();
+        let b = Address::from_slice(&[0xDD; 20]);
+        set.upsert(b, 100);
+
+        let log = make_repay_log(
+            Address::ZERO,
+            b,
+            alloy::primitives::U256::from(40u64),
+            alloy::primitives::U256::from(60u64), // still owes 60
+            alloy::primitives::U256::from(60u64),
+            101,
+        );
+        let (_, account) = decode_repay_borrow(&log).expect("decode");
+        assert!(!account.is_zero());
+        // Backfill / live-tail logic: only mark_inactive when
+        // accountBorrows is zero. Partial repay path is a no-op.
+        // Assert the entry remains active.
+        assert_eq!(set.is_active(&b), Some(true));
+        assert!(set.snapshot().contains(&b));
+    }
+
+    /// `mark_inactive` is idempotent and copes with an unseen address
+    /// — the inserted record carries `active = false` so a later
+    /// `Borrow` upsert flips the right state.
+    #[test]
+    fn mark_inactive_is_idempotent_and_handles_unseen() {
+        let set = BorrowerSet::new();
+        let b = Address::from_slice(&[0xEE; 20]);
+        set.mark_inactive(b, 100);
+        set.mark_inactive(b, 100);
+        assert_eq!(set.is_active(&b), Some(false));
+        // Subsequent re-borrow promotes the entry to active without
+        // a second insert path.
+        set.upsert(b, 200);
+        assert_eq!(set.is_active(&b), Some(true));
     }
 }
