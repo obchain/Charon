@@ -164,6 +164,11 @@ pub mod names {
     /// `updatePrice` and ships a replacement is visible at a glance.
     pub const MEMPOOL_VENUS_ORACLE_WRITES_TOTAL: &str = "charon_mempool_venus_oracle_writes_total";
 
+    /// Replacement broadcasts (#364). Counts every successful RBF
+    /// re-submission so dashboards can split fee-spike windows from
+    /// vendor-side latency without log greppinng.
+    pub const SUBMIT_REPLACEMENTS_TOTAL: &str = "charon_submit_replacements_total";
+
     // Gas oracle (issue #301). Latest EIP-1559 base fee, priority
     // fee used on the last submission attempt, and resulting
     // maxFeePerGas — plus a counter for opportunities dropped
@@ -645,6 +650,18 @@ pub fn record_mempool_drained(chain: &str, drained: u64) {
     .increment(drained);
 }
 
+/// Record one RBF replacement broadcast (#364). `reason` is the
+/// caller-supplied label (`"ttl_expired"`, `"fee_spike"`, …) so a
+/// future dashboard can split causes without changing call sites.
+pub fn record_submit_replacement(chain: &str, reason: &str) {
+    counter!(
+        names::SUBMIT_REPLACEMENTS_TOTAL,
+        "chain" => chain.to_owned(),
+        "reason" => reason.to_owned(),
+    )
+    .increment(1);
+}
+
 /// Record one websocket reconnect attempt against the pending-tx
 /// subscription. Emitted every time the monitor loop falls through
 /// to its backoff branch — a high rate here is the operator's cue
@@ -949,6 +966,10 @@ mod tests {
         // Mempool oracle writes (#350)
         record_mempool_oracle_write("bnb", "0x4d8275ed", "refresh");
         record_mempool_oracle_write("bnb", "0xb13a8aaf", "direct");
+
+        // RBF replacements (#364)
+        record_submit_replacement("bnb", "ttl_expired");
+        record_submit_replacement("bnb", "fee_spike");
 
         // Gas (#301)
         set_gas_base_fee_wei("bnb", 3_000_000_000);
