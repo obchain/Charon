@@ -692,11 +692,51 @@ async fn run_listen(
                 config.bot.liquidatable_threshold_bps,
                 config.bot.near_liq_threshold_bps,
             )?);
+            // Per-bot phase offset so two bots in the same swarm don't
+            // burst public RPCs in lockstep on every cold-bucket
+            // boundary (#366). Derive the seed from the signer address
+            // (public, stable per-bot) plus the chain id; falls back to
+            // zeroes when no signer key is configured (scan-only run),
+            // which is fine because there is no swarm of scan-only bots
+            // to collide with. The largest cadence period bounds the
+            // offset so a single offset value works across hot / warm /
+            // cold buckets.
+            let signer_address_for_offset: Option<Address> = config
+                .bot
+                .signer_key
+                .as_ref()
+                .and_then(|k| k.expose_secret().parse::<PrivateKeySigner>().ok())
+                .map(|s| s.address());
+            let phase_seed = {
+                let mut buf = Vec::with_capacity(20 + 8);
+                buf.extend_from_slice(
+                    signer_address_for_offset
+                        .unwrap_or(Address::ZERO)
+                        .as_slice(),
+                );
+                buf.extend_from_slice(&chain_cfg.chain_id.to_be_bytes());
+                buf
+            };
+            let phase_period_max = config
+                .bot
+                .cold_scan_blocks
+                .max(config.bot.warm_scan_blocks)
+                .max(config.bot.hot_scan_blocks);
+            let phase_offset =
+                charon_scanner::derive_phase_offset(&phase_seed, phase_period_max);
+            info!(
+                chain = %chain_name,
+                phase_offset,
+                phase_period_max,
+                signer_present = signer_address_for_offset.is_some(),
+                "scan scheduler phase offset derived"
+            );
             let scheduler = ScanScheduler::new(
                 config.bot.hot_scan_blocks,
                 config.bot.warm_scan_blocks,
                 config.bot.cold_scan_blocks,
-            );
+            )
+            .with_phase_offset(phase_offset);
 
             // Chainlink price cache. Empty map = no feeds configured,
             // cache stays idle and downstream stages fall back to the

@@ -25,5 +25,8 @@ pub use mempool::{
 };
 pub use oracle::{CachedPrice, DEFAULT_MAX_AGE, PriceCache};
 pub use provider::{ChainProvider, ChainProviderT, MockChainProvider};
-pub use scanner::{BucketCounts, BucketedPosition, HealthScanner, PositionBucket, ScanScheduler};
+pub use scanner::{
+    BucketCounts, BucketedPosition, HealthScanner, PositionBucket, ScanScheduler,
+    derive_phase_offset,
+};
 pub use token_meta::{TokenMeta, TokenMetaCache};
