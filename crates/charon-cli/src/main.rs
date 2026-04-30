@@ -62,8 +62,7 @@ use charon_core::{
     OpportunityQueue, Position, Price, ProfitInputs, calculate_profit,
 };
 use charon_executor::{
-    DEFAULT_SUBMIT_TIMEOUT, GasDecision, GasOracle, NonceManager, Simulator, SubmitError,
-    Submitter, TxBuilder,
+    DEFAULT_SUBMIT_TIMEOUT, GasDecision, GasOracle, NonceManager, Simulator, Submitter, TxBuilder,
 };
 use charon_flashloan::{AaveFlashLoan, FlashLoanRouter};
 use charon_metrics::{bucket, drop_reason, drop_stage, sim_result};
@@ -2121,8 +2120,13 @@ async fn broadcast_opportunity(
     let gas_limit = gas_units.saturating_mul(BROADCAST_GAS_BUFFER_NUM) / BROADCAST_GAS_BUFFER_DEN;
 
     // 3. Claim a nonce locally — atomic, no race with a parallel
-    //    opportunity in the same block.
-    let nonce = harness.nonce_manager.next();
+    //    opportunity in the same block. The lease holds the nonce;
+    //    every error path returns it to the manager's free-list on
+    //    drop so a sign/submit failure does not burn the slot. The
+    //    nonce only becomes permanently consumed after `commit()` on
+    //    a successful submit.
+    let lease = harness.nonce_manager.next();
+    let nonce = lease.nonce();
 
     // 4. Build + sign.
     let tx = builder
@@ -2137,38 +2141,29 @@ async fn broadcast_opportunity(
     let raw = match builder.sign(tx).await {
         Ok(bytes) => bytes,
         Err(err) => {
-            // Nonce consumed but no tx hit the wire — resync so the
-            // counter doesn't leave a permanent gap.
-            if let Err(resync_err) = harness
-                .nonce_manager
-                .resync(pipeline.provider.as_ref())
-                .await
-            {
-                warn!(
-                    error = %format!("{resync_err:#}"),
-                    "nonce resync failed after sign error"
-                );
-            }
+            // Lease drop returns the nonce to the free-list; the next
+            // `next()` call will reuse it. No resync needed because
+            // the local pointer is no longer ahead of the chain.
+            drop(lease);
             return Err(anyhow::Error::new(err).context("broadcast: sign failed"));
         }
     };
 
     // 5. Submit.
     match harness.submitter.submit(raw).await {
-        Ok(hash) => Ok(hash),
+        Ok(hash) => {
+            lease.commit();
+            Ok(hash)
+        }
         Err(err) => {
-            if matches!(err, SubmitError::RpcRejected(_)) {
-                if let Err(resync_err) = harness
-                    .nonce_manager
-                    .resync(pipeline.provider.as_ref())
-                    .await
-                {
-                    warn!(
-                        error = %format!("{resync_err:#}"),
-                        "nonce resync failed after RPC rejection"
-                    );
-                }
-            }
+            // Drop returns the nonce to the free-list — no resync
+            // needed for `RpcRejected` either, since the lease handled
+            // the local pointer. `Timeout` / `ConnectionLost` are also
+            // safe to release: if the tx still lands later the chain
+            // nonce will move past it and the resurrected free-list
+            // entry will be pruned on the next `resync` (`fl.retain`
+            // drops anything below `on_chain`).
+            drop(lease);
             Err(anyhow::Error::new(err).context("broadcast: submit failed"))
         }
     }
