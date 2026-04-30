@@ -57,8 +57,6 @@ use alloy::rpc::types::{BlockTransactionsKind, TransactionRequest};
 use alloy::signers::local::PrivateKeySigner;
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
-use futures_util::StreamExt;
-use futures_util::stream::FuturesUnordered;
 use charon_core::{
     Config, FlashLoanQuote, LendingProtocol, LiquidationOpportunity, LiquidationParams,
     OpportunityQueue, Position, Price, ProfitInputs, calculate_profit,
@@ -75,6 +73,8 @@ use charon_scanner::{
     TokenMetaCache,
 };
 use clap::{Parser, Subcommand};
+use futures_util::StreamExt;
+use futures_util::stream::FuturesUnordered;
 use secrecy::ExposeSecret;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
