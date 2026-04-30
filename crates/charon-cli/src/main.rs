@@ -76,7 +76,7 @@ use charon_scanner::{
 use clap::{Parser, Subcommand};
 use secrecy::ExposeSecret;
 use tokio::sync::mpsc;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 use tracing_subscriber::EnvFilter;
 
 /// Buffer size for the mempool's `OracleUpdate` channel. Sized so a
@@ -822,6 +822,47 @@ async fn run_listen(
                             "flashloan 'aave_v3_bsc': missing data_provider for chain '{chain_name}'"
                         )
                     })?;
+                    // Cross-check `pool` against
+                    // `IPoolAddressesProvider.getPool()` before standing up
+                    // the adapter. Skipped on fork profile so a local anvil
+                    // can run with a forked pool (the registry call works
+                    // there too, but skipping keeps the fork resilient to
+                    // anvil quirks). On mainnet RPCs this is a one-shot
+                    // round-trip per startup that catches a stale `pool`
+                    // address before the bot burns budget on reverts.
+                    if let Some(addresses_provider) = fl_cfg.addresses_provider {
+                        if config.bot.profile_tag.as_deref() == Some("fork") {
+                            let url_hint = chain_cfg.http_url.as_str();
+                            let looks_mainnet = ["bsc-dataseed", "binance.org", "quiknode.pro"]
+                                .iter()
+                                .any(|s| url_hint.contains(s));
+                            if looks_mainnet {
+                                error!(
+                                    chain = %chain_name,
+                                    rpc = url_hint,
+                                    "fork profile bypassed Aave AddressesProvider check against \
+                                     a URL that looks like mainnet — verify config/fork.toml is \
+                                     pointed at loopback before continuing"
+                                );
+                            } else {
+                                info!(
+                                    chain = %chain_name,
+                                    "skipping Aave AddressesProvider check (fork profile)"
+                                );
+                            }
+                        } else {
+                            AaveFlashLoan::validate_against_addresses_provider(
+                                provider.clone(),
+                                addresses_provider,
+                                fl_cfg.pool,
+                                "aave_v3_bsc",
+                            )
+                            .await
+                            .context(
+                                "aave v3: pool address mismatch — refusing to start",
+                            )?;
+                        }
+                    }
                     let aave = Arc::new(
                         AaveFlashLoan::connect(
                             provider.clone(),

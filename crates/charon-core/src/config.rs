@@ -71,6 +71,27 @@ pub enum ConfigError {
         /// sees exactly what to fix in the TOML.
         url: String,
     },
+
+    /// The `pool` configured for an Aave V3 flash-loan source does not
+    /// match what `IPoolAddressesProvider.getPool()` returns on-chain.
+    /// Refusing to start avoids burning a day's RPC budget on a stale
+    /// pool that will revert every flashLoanSimple call.
+    #[error(
+        "flashloan '{key}': configured pool {configured} does not match \
+         IPoolAddressesProvider({provider}).getPool() = {on_chain}. \
+         Update [flashloan.{key}].pool — see Aave governance for the \
+         canonical AddressesProvider for this chain."
+    )]
+    AaveAddressMismatch {
+        /// Flash-loan section key (e.g. `aave_v3_bsc`).
+        key: String,
+        /// Address configured under `[flashloan.<key>].pool`.
+        configured: Address,
+        /// Address returned by `IPoolAddressesProvider.getPool()`.
+        on_chain: Address,
+        /// AddressesProvider the on-chain value was read from.
+        provider: Address,
+    },
 }
 
 /// Shorthand `Result`.
@@ -474,6 +495,14 @@ pub struct FlashLoanConfig {
     /// for sources that don't need one (Balancer, Uniswap).
     #[serde(default)]
     pub data_provider: Option<Address>,
+    /// Optional `IPoolAddressesProvider` address for Aave V3.
+    /// When set, the CLI calls `getPool()` at startup and refuses
+    /// to start if the result does not match `pool` — guards against
+    /// shipping a stale / wrong pool address that would burn RPC
+    /// budget on every reverted `flashLoanSimple`. `None` for sources
+    /// that don't have an addresses provider (Balancer, Uniswap).
+    #[serde(default)]
+    pub addresses_provider: Option<Address>,
 }
 
 /// Address of the deployed `CharonLiquidator` contract on a chain.

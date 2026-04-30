@@ -61,6 +61,10 @@ pool  = "0x6807dc923806fe8fd134338eabca509979a7e0cb"
 # Aave V3 PoolDataProvider on BSC — resolves aTokens and reserve
 # configuration bitmaps (paused / frozen flags) for the adapter.
 data_provider = "0x41393e5e337606dc3821075Af65AeE84D7688CBD"
+# Aave V3 IPoolAddressesProvider on BSC — `getPool()` is called at
+# startup and the result is compared against `pool` above. Mismatch
+# fails the boot before the bot can burn RPC budget on a stale pool.
+addresses_provider = "0xff75B6da14FfbbfD355Daf7a2731456b3562Ba6D"
 
 # ── Deployed liquidator contracts ─────────────────────────────────────────
 # Populated once CharonLiquidator.sol is deployed on BSC mainnet. Do not

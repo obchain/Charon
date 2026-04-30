@@ -21,7 +21,9 @@ use alloy::sol;
 use alloy::sol_types::SolCall;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
-use charon_core::{FlashLoanError, FlashLoanProvider, FlashLoanQuote, FlashLoanSource};
+use charon_core::{
+    ConfigError, FlashLoanError, FlashLoanProvider, FlashLoanQuote, FlashLoanSource,
+};
 use tracing::{debug, info};
 
 /// BSC mainnet chain id. The adapter refuses to connect to anything
@@ -46,6 +48,16 @@ const RESERVE_FROZEN_BIT: u32 = 57;
 const RESERVE_PAUSED_BIT: u32 = 60;
 
 sol! {
+    /// Aave V3 `IPoolAddressesProvider` — canonical registry that
+    /// resolves the live `Pool` address. Aave governance migrates
+    /// pool implementations periodically; reading this at startup
+    /// catches a stale `pool` address in `[flashloan.aave_v3_*]`
+    /// before the bot burns RPC budget on a dead deploy.
+    #[sol(rpc)]
+    interface IPoolAddressesProvider {
+        function getPool() external view returns (address);
+    }
+
     /// Aave V3 Pool — flash-loan entry point.
     #[sol(rpc)]
     interface IAaveV3Pool {
@@ -203,6 +215,41 @@ impl AaveFlashLoan {
         })
     }
 
+    /// Cross-check the configured `pool` against
+    /// `IPoolAddressesProvider.getPool()`. On mismatch, surface a
+    /// typed [`ConfigError::AaveAddressMismatch`] so the CLI can fail
+    /// fast at startup rather than discover the stale address one
+    /// reverted flashLoanSimple at a time.
+    ///
+    /// `key` is the `[flashloan.<key>]` section name (e.g.
+    /// `aave_v3_bsc`) used in error messages so operators can locate
+    /// the offending TOML field at a glance.
+    pub async fn validate_against_addresses_provider(
+        provider: Arc<RootProvider<PubSubFrontend>>,
+        addresses_provider: Address,
+        configured_pool: Address,
+        key: &str,
+    ) -> Result<(), ConfigError> {
+        let ap = IPoolAddressesProvider::new(addresses_provider, provider);
+        let on_chain = ap
+            .getPool()
+            .call()
+            .await
+            .map_err(|e| {
+                ConfigError::Validation(format!(
+                    "flashloan '{key}': IPoolAddressesProvider.getPool() rpc failed: {e}"
+                ))
+            })?
+            ._0;
+        assert_pool_matches(key, configured_pool, on_chain, addresses_provider)?;
+        info!(
+            %addresses_provider,
+            %configured_pool,
+            "Aave V3 pool address validated against IPoolAddressesProvider"
+        );
+        Ok(())
+    }
+
     /// Return the aToken address for `asset`. Falls back to `None` when
     /// Aave does not list the asset on this chain (call reverts or
     /// returns the zero address).
@@ -269,6 +316,27 @@ pub fn bitmap_says_paused(bitmap: U256) -> bool {
 /// [`bitmap_says_paused`]; same rationale.
 pub fn bitmap_says_frozen(bitmap: U256) -> bool {
     bit_is_set(bitmap, RESERVE_FROZEN_BIT)
+}
+
+/// Pure comparison helper: emit `ConfigError::AaveAddressMismatch` if
+/// the on-chain pool does not match the configured one. Split out so
+/// unit tests can exercise the comparison + error shape without
+/// standing up a live `RootProvider`.
+fn assert_pool_matches(
+    key: &str,
+    configured: Address,
+    on_chain: Address,
+    provider: Address,
+) -> Result<(), ConfigError> {
+    if configured == on_chain {
+        return Ok(());
+    }
+    Err(ConfigError::AaveAddressMismatch {
+        key: key.to_string(),
+        configured,
+        on_chain,
+        provider,
+    })
 }
 
 #[async_trait]
@@ -380,6 +448,54 @@ mod tests {
             &IAaveV3Pool::flashLoanSimpleCall::SELECTOR,
             "selector mismatch — check flashLoanSimple arg order"
         );
+    }
+
+    #[test]
+    fn assert_pool_matches_returns_ok_on_equal_addresses() {
+        let a = address!("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        let provider = address!("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+        assert_pool_matches("aave_v3_bsc", a, a, provider).expect("equal addresses must pass");
+    }
+
+    #[test]
+    fn assert_pool_matches_returns_typed_mismatch_on_drift() {
+        let configured = address!("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        let on_chain = address!("cccccccccccccccccccccccccccccccccccccccc");
+        let provider = address!("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+        let err = assert_pool_matches("aave_v3_bsc", configured, on_chain, provider)
+            .expect_err("mismatch must surface");
+        match err {
+            ConfigError::AaveAddressMismatch {
+                key,
+                configured: c,
+                on_chain: o,
+                provider: p,
+            } => {
+                assert_eq!(key, "aave_v3_bsc");
+                assert_eq!(c, configured);
+                assert_eq!(o, on_chain);
+                assert_eq!(p, provider);
+            }
+            other => panic!("expected AaveAddressMismatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn aave_address_mismatch_display_names_section_and_addresses() {
+        let configured = address!("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        let on_chain = address!("cccccccccccccccccccccccccccccccccccccccc");
+        let provider = address!("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+        let err = ConfigError::AaveAddressMismatch {
+            key: "aave_v3_bsc".to_string(),
+            configured,
+            on_chain,
+            provider,
+        };
+        let s = format!("{err}");
+        assert!(s.contains("aave_v3_bsc"), "{s}");
+        assert!(s.contains(&format!("{configured}")), "{s}");
+        assert!(s.contains(&format!("{on_chain}")), "{s}");
+        assert!(s.contains(&format!("{provider}")), "{s}");
     }
 
     #[test]
