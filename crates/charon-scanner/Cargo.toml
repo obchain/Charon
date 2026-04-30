@@ -25,11 +25,16 @@ rand = { workspace = true }
 metrics = { workspace = true }
 clap = { workspace = true }
 dotenvy = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
 
 [dev-dependencies]
 # test-util enables `tokio::test(start_paused = true)` so backoff
 # loops exercise without burning real wall-clock seconds.
 tokio = { workspace = true, features = ["test-util"] }
+# tempfile drives the borrower-checkpoint round-trip / corruption
+# tests (#349) — keeps the assertions hermetic on CI.
+tempfile = { workspace = true }
 
 [lints]
 workspace = true

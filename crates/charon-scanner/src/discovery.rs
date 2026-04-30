@@ -191,6 +191,14 @@ impl BorrowerSet {
     pub fn is_active(&self, addr: &Address) -> Option<bool> {
         self.inner.get(addr).map(|e| e.active)
     }
+
+    /// Materialise every (address, info) pair as a `Vec` snapshot.
+    /// Used by the persistence layer (#349) to write the borrower
+    /// set to disk without holding a `DashMap` reference across an
+    /// IO call.
+    pub fn entries(&self) -> Vec<(Address, BorrowerInfo)> {
+        self.inner.iter().map(|kv| (*kv.key(), *kv.value())).collect()
+    }
 }
 
 /// Decode the `borrower` address from a Venus `Borrow` log.

@@ -62,6 +62,15 @@ rand = "0.8"
 # Prometheus-style metrics recorder facade
 metrics = "0.24"
 
+# JSON encode/decode — currently used for the borrower checkpoint
+# format (#349). Pulled at workspace level so the encoder choice is
+# consistent across crates if a second consumer lands.
+serde_json = "1"
+
+# Temp-dir factory for unit tests that exercise atomic-replace
+# semantics (#349).
+tempfile = "3"
+
 # Prometheus HTTP exporter — feat/22 #222 wires this into charon-metrics
 # and the supervised CLI task. `default-features = false` drops the
 # built-in tokio runtime hint so the workspace stays on our chosen

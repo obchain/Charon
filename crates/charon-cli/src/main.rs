@@ -613,6 +613,50 @@ async fn run_listen(
             // the SIGINT/SIGTERM path can abort them cleanly — see the
             // shutdown branches at the bottom of this function.
             let discovery = charon_scanner::BorrowerSet::new();
+            // On-disk borrower-set checkpoint (#349). When
+            // CHARON_STATE_DIR is set, load any prior snapshot and cap
+            // the backfill at `persisted_max + 1`; otherwise fall
+            // through to the legacy `head - DEFAULT_BACKFILL_BLOCKS`
+            // path so default operator behaviour is unchanged.
+            let state_dir_env = std::env::var("CHARON_STATE_DIR").ok();
+            let checkpoint_path_opt = state_dir_env
+                .as_deref()
+                .map(|d| charon_scanner::checkpoint_path(std::path::Path::new(d), chain_name.as_str()));
+            let persisted_max_block: u64 = match checkpoint_path_opt.as_ref() {
+                Some(path) => match charon_scanner::load_into(path, &discovery) {
+                    Ok(max) => {
+                        info!(
+                            chain = %chain_name,
+                            persisted_max = max,
+                            tracked = discovery.len(),
+                            "loaded borrower checkpoint"
+                        );
+                        max
+                    }
+                    Err(err) => {
+                        warn!(
+                            chain = %chain_name,
+                            error = %format!("{err:#}"),
+                            "borrower checkpoint load failed — falling back to full backfill"
+                        );
+                        0
+                    }
+                },
+                None => 0,
+            };
+            // Background flush task (60 s default). The handle is
+            // pushed onto `discovery_tasks` for the same shutdown
+            // discipline as the backfill / live tail.
+            if let Some(path) = checkpoint_path_opt.clone() {
+                let set = discovery.clone();
+                let chain = chain_name.clone();
+                discovery_tasks.push(charon_scanner::spawn_flush_task(
+                    path,
+                    set,
+                    chain,
+                    charon_scanner::DEFAULT_FLUSH_EVERY,
+                ));
+            }
             let vtokens_for_discovery = adapter.markets().await;
             if vtokens_for_discovery.is_empty() {
                 warn!(
@@ -638,7 +682,19 @@ async fn run_listen(
                                 return;
                             }
                         };
-                        let from = head.saturating_sub(discovery_cfg.backfill_blocks);
+                        // Cap the lookback when we have a checkpoint:
+                        // start at `persisted_max + 1` if newer than
+                        // `head - discovery_cfg.backfill_blocks`, otherwise
+                        // honour the cold-start ceiling so a long
+                        // downtime does not blow the chunk budget. The
+                        // ceiling now comes from `[chain.<n>.discovery]`
+                        // (#365) instead of the source-level constant.
+                        let cold_floor = head.saturating_sub(discovery_cfg.backfill_blocks);
+                        let from = if persisted_max_block == 0 {
+                            cold_floor
+                        } else {
+                            persisted_max_block.saturating_add(1).max(cold_floor)
+                        };
                         if let Err(err) = charon_scanner::backfill_borrowers_with_config(
                             provider.as_ref(),
                             vtokens,
