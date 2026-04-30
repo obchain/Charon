@@ -169,6 +169,12 @@ pub mod names {
     /// vendor-side latency without log greppinng.
     pub const SUBMIT_REPLACEMENTS_TOTAL: &str = "charon_submit_replacements_total";
 
+    /// Pending tx hashes the mempool monitor dropped because the
+    /// per-hash lookup-concurrency semaphore was saturated (#359).
+    /// A non-zero rate means the upstream feed exceeds the configured
+    /// cap and the bot is shedding load to protect its RPC budget.
+    pub const MEMPOOL_DROPPED_TOTAL: &str = "charon_mempool_dropped_total";
+
     // Gas oracle (issue #301). Latest EIP-1559 base fee, priority
     // fee used on the last submission attempt, and resulting
     // maxFeePerGas — plus a counter for opportunities dropped
@@ -638,6 +644,19 @@ pub fn record_mempool_oracle_write(chain: &str, selector: &str, kind: &str) {
         "chain" => chain.to_owned(),
         "selector" => selector.to_owned(),
         "kind" => kind.to_owned(),
+    )
+    .increment(1);
+}
+
+/// Record one pending tx hash dropped because the mempool monitor's
+/// per-hash lookup-concurrency cap was saturated. The caller passes a
+/// short reason label so dashboards can split future drop classes
+/// (current callers use `"lookup_saturated"`).
+pub fn record_mempool_dropped(chain: &str, reason: &str) {
+    counter!(
+        names::MEMPOOL_DROPPED_TOTAL,
+        "chain" => chain.to_owned(),
+        "reason" => reason.to_owned(),
     )
     .increment(1);
 }

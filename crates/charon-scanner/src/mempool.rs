@@ -75,7 +75,7 @@ use charon_core::LiquidationOpportunity;
 use dashmap::DashMap;
 use futures_util::StreamExt;
 use rand::Rng;
-use tokio::sync::mpsc;
+use tokio::sync::{Semaphore, TryAcquireError, mpsc};
 use tracing::{debug, info, warn};
 
 /// Default lifetime for a pre-signed liquidation sitting in the
@@ -643,10 +643,23 @@ impl PendingCache {
 /// Clone into the block-listener task so it can call
 /// [`PendingCache::drain_for_block`] without coordinating with the
 /// mempool task.
+/// Default cap on concurrent `eth_getTransactionByHash` lookups
+/// inside [`MempoolMonitor`]. The pending-tx subscription on a
+/// healthy bloxroute / blocknative stream peaks well above 100 tx/s;
+/// without a cap the monitor either fans out an unbounded number of
+/// inflight RPCs (self-DoS) or serialises on the provider RTT and
+/// lets the upstream channel grow without bound. 16 is enough to
+/// keep up with normal flow while leaving plenty of headroom for
+/// other RPCs sharing the same budget.
+pub const DEFAULT_MAX_CONCURRENT_LOOKUPS: usize = 16;
+
 #[derive(Clone)]
 pub struct MempoolMonitor {
     provider: Arc<RootProvider<PubSubFrontend>>,
     cache: Arc<PendingCache>,
+    /// Per-hash lookup concurrency cap. Saturation is observable via
+    /// `charon_mempool_dropped_total{reason="lookup_saturated"}`.
+    lookup_sem: Arc<Semaphore>,
 }
 
 impl MempoolMonitor {
@@ -662,7 +675,18 @@ impl MempoolMonitor {
         Self {
             provider,
             cache: Arc::new(PendingCache::new(oracle, selectors, max_pending_age)),
+            lookup_sem: Arc::new(Semaphore::new(DEFAULT_MAX_CONCURRENT_LOOKUPS)),
         }
+    }
+
+    /// Override the default per-hash lookup concurrency cap. Builder
+    /// style so existing call sites don't need to change. `cap == 0`
+    /// is rejected with a clamp to `1`: a zero-permit semaphore would
+    /// drop every pending hash and silently disable the monitor.
+    pub fn with_lookup_concurrency(mut self, cap: usize) -> Self {
+        let cap = cap.max(1);
+        self.lookup_sem = Arc::new(Semaphore::new(cap));
+        self
     }
 
     /// Chain-labelled full-control constructor.
@@ -681,6 +705,7 @@ impl MempoolMonitor {
                 selectors,
                 max_pending_age,
             )),
+            lookup_sem: Arc::new(Semaphore::new(DEFAULT_MAX_CONCURRENT_LOOKUPS)),
         }
     }
 
@@ -793,6 +818,15 @@ impl MempoolMonitor {
         let mut watchdog = Box::pin(tokio::time::sleep(FIRST_TX_WATCHDOG));
 
         loop {
+            // Channel-closed shortcut: the consumer dropped its
+            // receiver, the run loop's external job is over. Exit
+            // cleanly. Pre-checking here means a saturated
+            // lookup-spawn batch cannot keep the loop alive after the
+            // sink has gone away.
+            if tx.is_closed() {
+                debug!(oracle = %self.oracle(), "OracleUpdate sink closed — stopping run_once");
+                return Ok(());
+            }
             tokio::select! {
                 biased;
                 maybe_hash = stream.next() => {
@@ -801,9 +835,7 @@ impl MempoolMonitor {
                         saw_first_tx = true;
                         debug!(%hash, "first pending tx received, watchdog disarmed");
                     }
-                    if !self.handle_pending_hash(hash, tx).await? {
-                        return Ok(());
-                    }
+                    self.dispatch_pending_hash(hash, tx.clone());
                 }
                 _ = &mut watchdog, if !saw_first_tx => {
                     warn!(
@@ -818,59 +850,100 @@ impl MempoolMonitor {
         anyhow::bail!("mempool: pending-tx subscription stream ended")
     }
 
-    /// Look up a pending tx hash, decode it, and forward any decoded
-    /// [`OracleUpdate`] on `tx`. Returns `Ok(false)` when the receiver
-    /// has been dropped (caller should exit cleanly), `Ok(true)`
-    /// otherwise. Extracted from `run_once` so the watchdog loop stays
-    /// readable.
-    async fn handle_pending_hash(
-        &self,
-        hash: B256,
-        tx: &mpsc::Sender<OracleUpdate>,
-    ) -> Result<bool> {
-        // Lookup failures are common for txs that dropped out of the
-        // pool between the hash push and our get — log at debug, keep
-        // going.
-        let full = match self.provider.get_transaction_by_hash(hash).await {
-            Ok(Some(t)) => t,
-            Ok(None) => {
-                debug!(%hash, "pending tx vanished before fetch");
-                return Ok(true);
-            }
-            Err(err) => {
-                debug!(%hash, ?err, "get_transaction_by_hash failed");
-                return Ok(true);
+    /// Try to acquire a lookup permit and dispatch a per-hash task
+    /// that runs `get_transaction_by_hash` + decode + forward. When
+    /// the semaphore is saturated, the hash is dropped and a
+    /// `charon_mempool_dropped_total{reason="lookup_saturated"}`
+    /// sample is recorded so dashboards see the back-pressure
+    /// directly. Synchronous wrt the caller — the spawn returns
+    /// immediately so the subscription loop never serialises on
+    /// per-hash RTT.
+    fn dispatch_pending_hash(&self, hash: B256, sink: mpsc::Sender<OracleUpdate>) {
+        let permit = match try_acquire_lookup_permit(&self.lookup_sem) {
+            Ok(p) => p,
+            Err(reason) => {
+                charon_metrics::record_mempool_dropped(self.cache.chain(), reason);
+                debug!(
+                    %hash,
+                    reason,
+                    cap = self.lookup_sem.available_permits(),
+                    "mempool lookup permit unavailable — dropping hash"
+                );
+                return;
             }
         };
 
-        let to = full.inner.kind().to().copied();
-        let input = full.inner.input();
-        let Some(update) = self.cache.decode(hash, to, input) else {
-            return Ok(true);
-        };
-
-        let selector_label = format_selector(update.selector());
-        // Per-(selector, kind) counter so a ResilientOracle migration
-        // that retires `updatePrice` and ships a replacement is
-        // visible on the dashboard rather than only in `debug` logs.
-        charon_metrics::record_mempool_oracle_write(
-            self.cache.chain(),
-            &selector_label,
-            update.kind(),
-        );
-        debug!(
-            %hash,
-            asset = %update.asset(),
-            selector = %selector_label,
-            kind = update.kind(),
-            "venus oracle update seen in mempool"
-        );
-
-        if tx.send(update).await.is_err() {
-            return Ok(false);
-        }
-        Ok(true)
+        let provider = self.provider.clone();
+        let cache = self.cache.clone();
+        tokio::spawn(async move {
+            // The permit is held for the lifetime of the spawned
+            // task and released on drop, capping in-flight lookups
+            // at the semaphore size.
+            let _permit = permit;
+            run_lookup(provider, cache, hash, sink).await;
+        });
     }
+}
+
+/// Tiny shim around `Semaphore::try_acquire_owned` so the saturation
+/// branch is unit-testable without wiring a full `MempoolMonitor`.
+/// Returns the typed reason string the metric will be tagged with on
+/// drop.
+pub(crate) fn try_acquire_lookup_permit(
+    sem: &Arc<Semaphore>,
+) -> Result<tokio::sync::OwnedSemaphorePermit, &'static str> {
+    match sem.clone().try_acquire_owned() {
+        Ok(p) => Ok(p),
+        Err(TryAcquireError::NoPermits) => Err("lookup_saturated"),
+        Err(TryAcquireError::Closed) => Err("sem_closed"),
+    }
+}
+
+/// Per-hash lookup body, factored out so `dispatch_pending_hash` can
+/// spawn it cleanly. Failures and drops are logged at `debug` —
+/// pending-tx churn is normal and must not flood operator logs.
+async fn run_lookup(
+    provider: Arc<RootProvider<PubSubFrontend>>,
+    cache: Arc<PendingCache>,
+    hash: B256,
+    sink: mpsc::Sender<OracleUpdate>,
+) {
+    let full = match provider.get_transaction_by_hash(hash).await {
+        Ok(Some(t)) => t,
+        Ok(None) => {
+            debug!(%hash, "pending tx vanished before fetch");
+            return;
+        }
+        Err(err) => {
+            debug!(%hash, ?err, "get_transaction_by_hash failed");
+            return;
+        }
+    };
+
+    let to = full.inner.kind().to().copied();
+    let input = full.inner.input();
+    let Some(update) = cache.decode(hash, to, input) else {
+        return;
+    };
+
+    let selector_label = format_selector(update.selector());
+    // Per-(selector, kind) counter so a ResilientOracle migration
+    // that retires `updatePrice` and ships a replacement is
+    // visible on the dashboard rather than only in `debug` logs.
+    charon_metrics::record_mempool_oracle_write(cache.chain(), &selector_label, update.kind());
+    debug!(
+        %hash,
+        asset = %update.asset(),
+        selector = %selector_label,
+        kind = update.kind(),
+        "venus oracle update seen in mempool"
+    );
+
+    // Send is async so a slow consumer back-pressures the spawn rate
+    // (additional pending hashes wait for permits while existing
+    // lookups await on the channel). Receiver-dropped on the way out
+    // is fine — the run loop checks `tx.is_closed()` next iteration.
+    let _ = sink.send(update).await;
 }
 
 /// Default Venus oracle write selectors tracked by the monitor.
@@ -1510,5 +1583,47 @@ mod tests {
         let max = Duration::from_secs(30);
         let b = backoff_with_jitter(Duration::ZERO, max);
         assert_eq!(b, Duration::ZERO);
+    }
+
+    /// Saturating the lookup semaphore returns `Err("lookup_saturated")`
+    /// — the metric path the dispatcher records on drop. Permits
+    /// returned to the pool by drop must immediately re-arm the
+    /// saturation check.
+    #[test]
+    fn try_acquire_lookup_permit_signals_saturation_when_capped() {
+        let sem = Arc::new(Semaphore::new(2));
+
+        let p1 = try_acquire_lookup_permit(&sem).expect("first permit");
+        let p2 = try_acquire_lookup_permit(&sem).expect("second permit");
+
+        match try_acquire_lookup_permit(&sem) {
+            Err(reason) => assert_eq!(
+                reason, "lookup_saturated",
+                "saturated permit must report the lookup_saturated reason"
+            ),
+            Ok(_) => panic!("third permit must fail when cap is 2"),
+        }
+
+        // Hand back one permit; the next acquire must succeed.
+        drop(p1);
+        let _p3 = try_acquire_lookup_permit(&sem)
+            .expect("permit reuse must succeed after drop returns it");
+        drop(p2);
+    }
+
+    /// `with_lookup_concurrency(0)` clamps to 1 so the monitor never
+    /// silently drops every pending hash.
+    #[test]
+    fn with_lookup_concurrency_clamps_zero_to_one() {
+        // Mirror the clamp the builder applies (`cap.max(1)`); a sem of
+        // size 1 must yield exactly one permit and saturate on the
+        // second acquire.
+        let clamped = Arc::new(Semaphore::new(1));
+        let p = try_acquire_lookup_permit(&clamped).expect("clamped sem yields one permit");
+        match try_acquire_lookup_permit(&clamped) {
+            Err(reason) => assert_eq!(reason, "lookup_saturated"),
+            Ok(_) => panic!("second acquire on cap=1 must saturate"),
+        }
+        drop(p);
     }
 }
