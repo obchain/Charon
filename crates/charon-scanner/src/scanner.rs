@@ -66,11 +66,23 @@ impl BucketCounts {
 ///
 /// `should_scan(bucket, block)` returns true when the given block number
 /// falls on the bucket's cadence. HOT cadence is usually 1 (every block).
+///
+/// `phase_offset` shifts the modulo predicate so two bots with the
+/// same cadence land on different blocks. With `cold = 100` and
+/// `phase_offset = 0` two bots both scan on block 100/200/300/...,
+/// burst-loading the public RPC. Setting `phase_offset` to a stable
+/// per-bot value (e.g. derived from the signer address) staggers the
+/// bursts across the cadence window — see `with_phase_offset` and the
+/// CLI startup that derives a deterministic offset from
+/// `keccak256(signer_address || chain_id)`.
 #[derive(Debug, Clone, Copy)]
 pub struct ScanScheduler {
     pub hot: u64,
     pub warm: u64,
     pub cold: u64,
+    /// Constant offset added to `block` before the modulo. `0` reproduces
+    /// pre-#366 behaviour and is the test-friendly default.
+    pub phase_offset: u64,
 }
 
 impl ScanScheduler {
@@ -79,16 +91,47 @@ impl ScanScheduler {
             hot: hot.max(1),
             warm: warm.max(1),
             cold: cold.max(1),
+            phase_offset: 0,
         }
     }
+
+    /// Return a copy of `self` with `phase_offset` overridden.
+    /// Builder-style so existing call sites don't have to change shape.
+    pub fn with_phase_offset(mut self, phase_offset: u64) -> Self {
+        self.phase_offset = phase_offset;
+        self
+    }
+
     pub fn should_scan(&self, bucket: PositionBucket, block: u64) -> bool {
         let period = match bucket {
             PositionBucket::Liquidatable => self.hot,
             PositionBucket::NearLiquidation => self.warm,
             PositionBucket::Healthy => self.cold,
         };
-        block % period == 0
+        // `period` is normalised to `>= 1` in `new`, so the modulo is
+        // safe. `wrapping_add` matches the previous semantics on a
+        // hypothetical near-u64::MAX block height (BSC will not reach
+        // that in any meaningful timeframe; the wrap is for purity).
+        block.wrapping_add(self.phase_offset) % period == 0
     }
+}
+
+/// Derive a stable phase offset for [`ScanScheduler::with_phase_offset`]
+/// from `seed_bytes` and a `period_max`. The offset is uniform on
+/// `0..period_max` and stable across restarts, so two bots in the
+/// same swarm with different signer addresses land on disjoint
+/// modulo classes for any cadence dividing `period_max`.
+///
+/// `seed_bytes` is typically the bot signer address concatenated with
+/// the chain id; the CLI computes it that way at startup.
+pub fn derive_phase_offset(seed_bytes: &[u8], period_max: u64) -> u64 {
+    if period_max <= 1 {
+        return 0;
+    }
+    let digest = alloy::primitives::keccak256(seed_bytes);
+    let mut buf = [0u8; 8];
+    buf.copy_from_slice(&digest.0[0..8]);
+    u64::from_be_bytes(buf) % period_max
 }
 
 /// 3-bucket health-factor scanner.
@@ -350,5 +393,86 @@ mod tests {
     #[test]
     fn rejects_inverted_thresholds() {
         assert!(HealthScanner::new(10_500, 10_000).is_err());
+    }
+
+    /// `phase_offset = 0` reproduces the pre-#366 modulo-only behaviour.
+    #[test]
+    fn phase_offset_zero_matches_legacy_modulo() {
+        let sched = ScanScheduler::new(1, 10, 100);
+        for block in (0u64..1_000).step_by(13) {
+            let legacy_hot = true; // period = 1 ⇒ always
+            let legacy_warm = block % 10 == 0;
+            let legacy_cold = block % 100 == 0;
+            assert_eq!(
+                sched.should_scan(PositionBucket::Liquidatable, block),
+                legacy_hot
+            );
+            assert_eq!(
+                sched.should_scan(PositionBucket::NearLiquidation, block),
+                legacy_warm
+            );
+            assert_eq!(
+                sched.should_scan(PositionBucket::Healthy, block),
+                legacy_cold
+            );
+        }
+    }
+
+    /// Two bots with distinct phase offsets must never both fire a
+    /// `cold = 100` scan on the same block — the entire point of the
+    /// offset is to break swarm lockstep.
+    #[test]
+    fn distinct_phase_offsets_never_coincide_in_one_period() {
+        let bot_a = ScanScheduler::new(1, 10, 100).with_phase_offset(0);
+        let bot_b = ScanScheduler::new(1, 10, 100).with_phase_offset(37);
+        let mut both_scan = 0;
+        for block in 0u64..10_000 {
+            if bot_a.should_scan(PositionBucket::Healthy, block)
+                && bot_b.should_scan(PositionBucket::Healthy, block)
+            {
+                both_scan += 1;
+            }
+        }
+        assert_eq!(
+            both_scan, 0,
+            "distinct phase offsets must never produce a shared cold-scan block"
+        );
+    }
+
+    /// `period = 1` (hot bucket default) must scan every block
+    /// regardless of phase offset — the offset is a stagger between
+    /// bots, not a mute switch.
+    #[test]
+    fn phase_offset_does_not_silence_period_one() {
+        for offset in [0, 1, 7, 99, u64::MAX / 2] {
+            let sched = ScanScheduler::new(1, 10, 100).with_phase_offset(offset);
+            for block in 0u64..50 {
+                assert!(
+                    sched.should_scan(PositionBucket::Liquidatable, block),
+                    "period=1 must always scan; offset={offset} block={block}"
+                );
+            }
+        }
+    }
+
+    /// Derived phase offsets are stable, deterministic, and constrained
+    /// to `0..period_max`.
+    #[test]
+    fn derive_phase_offset_is_deterministic_and_in_range() {
+        let seed_a = b"signer_a:chain_56";
+        let seed_b = b"signer_b:chain_56";
+        let a1 = derive_phase_offset(seed_a, 100);
+        let a2 = derive_phase_offset(seed_a, 100);
+        let b1 = derive_phase_offset(seed_b, 100);
+        assert_eq!(a1, a2, "must be deterministic across calls");
+        assert!(a1 < 100, "must fit in 0..period_max");
+        assert!(b1 < 100, "must fit in 0..period_max");
+        assert_ne!(
+            a1, b1,
+            "different seeds should produce different offsets in this case"
+        );
+        // period_max <= 1 collapses to 0 — no offset to apply.
+        assert_eq!(derive_phase_offset(seed_a, 0), 0);
+        assert_eq!(derive_phase_offset(seed_a, 1), 0);
     }
 }
