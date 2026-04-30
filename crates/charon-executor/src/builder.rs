@@ -17,7 +17,7 @@ use std::fmt;
 
 use alloy::eips::eip2718::Encodable2718;
 use alloy::network::{EthereumWallet, TransactionBuilder};
-use alloy::primitives::{Address, Bytes};
+use alloy::primitives::{Address, Bytes, aliases::U24};
 use alloy::rpc::types::TransactionRequest;
 use alloy::signers::local::PrivateKeySigner;
 use alloy::sol;
@@ -40,6 +40,7 @@ sol! {
         address collateralVToken;
         uint256 repayAmount;
         uint256 minSwapOut;
+        uint24 swapPoolFee;
     }
 
     /// Surface of `CharonLiquidator.sol` consumed by the builder.
@@ -97,6 +98,13 @@ pub enum BuilderError {
     /// the executor has been taught to emit its calldata.
     #[error("unsupported liquidation protocol: {0}")]
     UnsupportedProtocol(String),
+
+    /// The opportunity's `SwapRoute::pool_fee` is `None` or zero.
+    /// On-chain `_swap` enforces `require(p.swapPoolFee > 0, "!swapPoolFee")`,
+    /// so a zero fee tier would deterministically revert. Reject before
+    /// signing.
+    #[error("missing or zero swap pool fee on opportunity")]
+    MissingSwapPoolFee,
 }
 
 /// Builder bound to one bot signer + one liquidator deployment.
@@ -183,6 +191,11 @@ impl TxBuilder {
             }
         };
 
+        let pool_fee = opp.swap_route.pool_fee.unwrap_or(0);
+        if pool_fee == 0 {
+            return Err(BuilderError::MissingSwapPoolFee);
+        }
+
         let sol_params = CharonLiquidationParams {
             protocolId: PROTOCOL_VENUS,
             borrower: *borrower,
@@ -192,6 +205,7 @@ impl TxBuilder {
             collateralVToken: *collateral_vtoken,
             repayAmount: *repay_amount,
             minSwapOut: opp.swap_route.min_amount_out,
+            swapPoolFee: U24::from(pool_fee),
         };
 
         let call = ICharonLiquidator::executeLiquidationCall { params: sol_params };
@@ -328,6 +342,12 @@ mod tests {
         }
     }
 
+    /// Pinned hex literal of `keccak256("executeLiquidation((uint8,address,address,address,address,address,uint256,uint256,uint24))")[..4]`.
+    /// Independent of the alloy-generated `SELECTOR` constant so a drift in
+    /// `CharonLiquidationParams` shape (extra/missing/reordered field) trips
+    /// this test instead of silently moving in lockstep with the bug.
+    const EXECUTE_LIQUIDATION_SELECTOR: [u8; 4] = [0xc8, 0xea, 0xaf, 0xd4];
+
     #[test]
     fn encode_calldata_pins_execute_liquidation_selector() {
         let builder = TxBuilder::new(
@@ -339,18 +359,92 @@ mod tests {
             .encode_calldata(&mk_opportunity(), &mk_params())
             .expect("encode");
 
-        // Selector pinned against alloy's generated SELECTOR constant
-        // — catches accidental changes to argument order or
-        // CharonLiquidationParams shape (which would break lockstep
-        // with the Solidity struct).
         assert_eq!(
-            &bytes[..4],
-            &ICharonLiquidator::executeLiquidationCall::SELECTOR,
-            "calldata selector drifted from executeLiquidation"
+            bytes[..4],
+            EXECUTE_LIQUIDATION_SELECTOR,
+            "calldata selector drifted from canonical 9-field executeLiquidation signature"
         );
-        // selector + at least the eight struct field slots; alloy may
-        // also emit a leading offset word, so use `>=` not `>`.
-        assert!(bytes.len() >= 4 + 32 * 8);
+        // Cross-check the alloy-generated constant matches the hex pin —
+        // if these disagree, the sol! struct has drifted from the on-chain
+        // ABI even if neither side matches the canonical signature.
+        assert_eq!(
+            ICharonLiquidator::executeLiquidationCall::SELECTOR,
+            EXECUTE_LIQUIDATION_SELECTOR,
+            "alloy-generated selector disagrees with canonical 9-field signature"
+        );
+        // selector + nine struct field slots; alloy may also emit a leading
+        // offset word, so use `>=` not `>`.
+        assert!(bytes.len() >= 4 + 32 * 9);
+    }
+
+    /// Round-trips encoded calldata back through the alloy-generated
+    /// decoder and asserts every field — in particular `swapPoolFee` —
+    /// survives. Catches drift in struct field order/shape that a
+    /// selector check alone could miss when the keccak preimage and
+    /// the Rust struct happen to coincidentally match.
+    #[test]
+    fn encode_calldata_round_trips_swap_pool_fee() {
+        let builder = TxBuilder::new(
+            mk_signer(),
+            56,
+            address!("ffffffffffffffffffffffffffffffffffffffff"),
+        );
+        let bytes = builder
+            .encode_calldata(&mk_opportunity(), &mk_params())
+            .expect("encode");
+
+        let decoded = ICharonLiquidator::executeLiquidationCall::abi_decode(&bytes, true)
+            .expect("abi-decode");
+        let p = decoded.params;
+        assert_eq!(p.protocolId, PROTOCOL_VENUS);
+        assert_eq!(
+            p.borrower,
+            address!("1111111111111111111111111111111111111111")
+        );
+        assert_eq!(
+            p.debtToken,
+            address!("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
+        );
+        assert_eq!(
+            p.collateralToken,
+            address!("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+        );
+        assert_eq!(
+            p.debtVToken,
+            address!("dddddddddddddddddddddddddddddddddddddddd")
+        );
+        assert_eq!(
+            p.collateralVToken,
+            address!("cccccccccccccccccccccccccccccccccccccccc")
+        );
+        assert_eq!(p.repayAmount, U256::from(250u64));
+        assert_eq!(p.minSwapOut, U256::from(260u64));
+        assert_eq!(p.swapPoolFee, U24::from(3_000u32));
+    }
+
+    /// `pool_fee == None` (or `Some(0)`) must surface as `MissingSwapPoolFee`,
+    /// not silently encode as 0 — the on-chain `_swap` enforces
+    /// `require(p.swapPoolFee > 0, "!swapPoolFee")` and would deterministically
+    /// revert. Reject before signing so a burned nonce never happens.
+    #[test]
+    fn encode_calldata_rejects_missing_pool_fee() {
+        let builder = TxBuilder::new(
+            mk_signer(),
+            56,
+            address!("ffffffffffffffffffffffffffffffffffffffff"),
+        );
+        let mut opp = mk_opportunity();
+        opp.swap_route.pool_fee = None;
+        let err = builder
+            .encode_calldata(&opp, &mk_params())
+            .expect_err("must reject None pool_fee");
+        assert!(matches!(err, BuilderError::MissingSwapPoolFee));
+
+        opp.swap_route.pool_fee = Some(0);
+        let err = builder
+            .encode_calldata(&opp, &mk_params())
+            .expect_err("must reject Some(0) pool_fee");
+        assert!(matches!(err, BuilderError::MissingSwapPoolFee));
     }
 
     #[test]
