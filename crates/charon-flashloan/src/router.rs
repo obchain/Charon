@@ -78,19 +78,64 @@ impl FlashLoanRouter {
 
     /// Pick the cheapest provider that can cover `amount` of `token`.
     ///
-    /// Per-provider failures (RPC error, insufficient liquidity, paused
-    /// reserve) are logged and the walk continues — one dark source
-    /// shouldn't block liquidation if a cheaper one can't cover but a
-    /// pricier one can.
+    /// Per-request ranking: each provider is asked once for
+    /// `available_liquidity(token)`; the result feeds
+    /// [`FlashLoanProvider::effective_fee_millionths`] to compute an
+    /// amount-aware effective fee that reflects the source's
+    /// utilisation curve (Aave V3 adapter overrides with a
+    /// `amount * 1e6 / liquidity` penalty). Providers are then sorted
+    /// by effective fee ascending; ties break on the static
+    /// `fee_rate_millionths` and finally on advertised liquidity
+    /// descending.
+    ///
+    /// Liquidity-probe failures used to be silently coerced to zero,
+    /// which masked a transient RPC blip as "the pool is empty" and
+    /// dropped the borrow. They now surface as a `warn` and the
+    /// provider is pushed to the back of the rank with `liquidity =
+    /// U256::MAX` for the static-fee fallback so the router still
+    /// tries to quote against it; the `quote` call itself enforces
+    /// the real coverage check.
+    ///
+    /// Per-provider quote failures (RPC error, insufficient liquidity,
+    /// paused reserve) are logged and the walk continues — one dark
+    /// source shouldn't block liquidation if a cheaper one can't
+    /// cover but a pricier one can.
     pub async fn route(&self, token: Address, amount: U256) -> Option<FlashLoanQuote> {
+        // Per-request liquidity probe + effective-fee ranking.
+        let mut ranked: Vec<(Arc<dyn FlashLoanProvider>, u32, u32, U256)> =
+            Vec::with_capacity(self.providers.len());
         for provider in &self.providers {
+            let liquidity = match provider.available_liquidity(token).await {
+                Ok(l) => l,
+                Err(err) => {
+                    warn!(
+                        source = ?provider.source(),
+                        token = %token,
+                        ?err,
+                        "available_liquidity failed — provider kept in rank with U256::MAX so a transient blip does not silently disqualify it"
+                    );
+                    U256::MAX
+                }
+            };
+            let effective = provider.effective_fee_millionths(token, amount, liquidity);
+            let static_fee = provider.fee_rate_millionths();
+            ranked.push((provider.clone(), effective, static_fee, liquidity));
+        }
+        // Sort: effective fee ASC, static fee ASC, liquidity DESC.
+        ranked.sort_by(|a, b| {
+            a.1.cmp(&b.1)
+                .then_with(|| a.2.cmp(&b.2))
+                .then_with(|| b.3.cmp(&a.3))
+        });
+
+        for (provider, effective, static_fee, _liquidity) in ranked {
             let source = provider.source();
-            let fee_rate_millionths = provider.fee_rate_millionths();
             match provider.quote(token, amount).await {
                 Ok(Some(quote)) => {
                     info!(
                         source = ?source,
-                        fee_rate_millionths,
+                        effective_fee_millionths = effective,
+                        fee_rate_millionths = static_fee,
                         token = %token,
                         amount = %amount,
                         "flash-loan source selected"
@@ -100,7 +145,8 @@ impl FlashLoanRouter {
                 Ok(None) => {
                     debug!(
                         source = ?source,
-                        fee_rate_millionths,
+                        effective_fee_millionths = effective,
+                        fee_rate_millionths = static_fee,
                         token = %token,
                         amount = %amount,
                         "source skipped: insufficient liquidity"
@@ -109,7 +155,8 @@ impl FlashLoanRouter {
                 Err(err) => {
                     warn!(
                         source = ?source,
-                        fee_rate_millionths,
+                        effective_fee_millionths = effective,
+                        fee_rate_millionths = static_fee,
                         token = %token,
                         ?err,
                         "source skipped: quote failed"
@@ -140,6 +187,29 @@ mod tests {
         fee_rate_millionths: u32,
         liquidity: U256,
         chain: u64,
+        /// When `true`, `available_liquidity` returns
+        /// [`FlashLoanError::Rpc`] so the router tests can exercise
+        /// the transient-blip fall-through.
+        liquidity_errors: bool,
+        /// Optional utilisation penalty: when `Some(num)`, override
+        /// `effective_fee_millionths` with `fee_rate +
+        /// amount * num / liquidity`. Lets a single test pick which
+        /// provider models slippage without dragging in the Aave
+        /// adapter for unit coverage.
+        utilisation_num: Option<u64>,
+    }
+
+    impl Default for StubProvider {
+        fn default() -> Self {
+            Self {
+                source: FlashLoanSource::AaveV3,
+                fee_rate_millionths: 0,
+                liquidity: U256::ZERO,
+                chain: 56,
+                liquidity_errors: false,
+                utilisation_num: None,
+            }
+        }
     }
 
     #[async_trait]
@@ -153,7 +223,20 @@ mod tests {
         fn fee_rate_millionths(&self) -> u32 {
             self.fee_rate_millionths
         }
+        fn effective_fee_millionths(&self, _token: Address, amount: U256, liquidity: U256) -> u32 {
+            match self.utilisation_num {
+                Some(num) if !liquidity.is_zero() && liquidity != U256::MAX => {
+                    let penalty = amount.saturating_mul(U256::from(num)) / liquidity;
+                    let penalty_u32 = u32::try_from(penalty).unwrap_or(u32::MAX);
+                    self.fee_rate_millionths.saturating_add(penalty_u32)
+                }
+                _ => self.fee_rate_millionths,
+            }
+        }
         async fn available_liquidity(&self, _t: Address) -> Result<U256, FlashLoanError> {
+            if self.liquidity_errors {
+                return Err(FlashLoanError::rpc("simulated transient blip"));
+            }
             Ok(self.liquidity)
         }
         async fn quote(
@@ -199,6 +282,7 @@ mod tests {
             fee_rate_millionths: 500,
             liquidity: U256::from(1_000u64),
             chain: 56,
+            ..StubProvider::default()
         });
         // Pricier source: PancakeSwap V3 at the 25 bps pool tier (2500 millionths).
         let pancake = Arc::new(StubProvider {
@@ -206,6 +290,7 @@ mod tests {
             fee_rate_millionths: 2500,
             liquidity: U256::from(1_000_000u64),
             chain: 56,
+            ..StubProvider::default()
         });
 
         // Pass them in reverse order; router should sort internally.
@@ -226,6 +311,7 @@ mod tests {
             fee_rate_millionths: 500,
             liquidity: U256::from(10u64), // too small
             chain: 56,
+            ..StubProvider::default()
         });
         // Pricier fallback (PancakeSwap V3 at 25 bps) has deep liquidity.
         let pancake = Arc::new(StubProvider {
@@ -233,6 +319,7 @@ mod tests {
             fee_rate_millionths: 2500,
             liquidity: U256::from(1_000_000u64),
             chain: 56,
+            ..StubProvider::default()
         });
         let router = FlashLoanRouter::new(vec![aave, pancake]);
         let quote = router
@@ -249,12 +336,14 @@ mod tests {
             fee_rate_millionths: 500,
             liquidity: U256::ZERO,
             chain: 56,
+            ..StubProvider::default()
         });
         let pancake = Arc::new(StubProvider {
             source: FlashLoanSource::PancakeSwapV3,
             fee_rate_millionths: 2500,
             liquidity: U256::from(100u64),
             chain: 56,
+            ..StubProvider::default()
         });
         let router = FlashLoanRouter::new(vec![aave, pancake]);
         assert!(router.route(token(), U256::from(10_000u64)).await.is_none());
@@ -275,12 +364,14 @@ mod tests {
             fee_rate_millionths: 500,
             liquidity: U256::from(1_000u64),
             chain: 56,
+            ..StubProvider::default()
         });
         let deep = Arc::new(StubProvider {
             source: FlashLoanSource::PancakeSwapV3,
             fee_rate_millionths: 500,
             liquidity: U256::from(1_000_000u64),
             chain: 56,
+            ..StubProvider::default()
         });
         let router = FlashLoanRouter::with_liquidity_tiebreaker(vec![shallow, deep], token()).await;
         assert_eq!(
@@ -288,5 +379,68 @@ mod tests {
             FlashLoanSource::PancakeSwapV3
         );
         assert_eq!(router.providers()[1].source(), FlashLoanSource::AaveV3);
+    }
+
+    /// High-utilisation flip (#352): a low-fee but shallow source
+    /// loses to a slightly higher-fee but deep source when the
+    /// borrow drains a meaningful slice of the shallow pool.
+    #[tokio::test]
+    async fn high_utilisation_flips_selection_to_deeper_pool() {
+        // Aave-like: 5 bps (500 millionths), liquidity 1_000.
+        // Utilisation penalty num = 1_000_000 → at amount = 600 the
+        // effective fee becomes 500 + (600 * 1_000_000 / 1_000) =
+        // 500 + 600_000 = 600_500 millionths. Crushed.
+        let shallow = Arc::new(StubProvider {
+            source: FlashLoanSource::AaveV3,
+            fee_rate_millionths: 500,
+            liquidity: U256::from(1_000u64),
+            chain: 56,
+            utilisation_num: Some(1_000_000),
+            ..StubProvider::default()
+        });
+        // PancakeSwap-like: 25 bps (2_500 millionths), liquidity 1M.
+        // No utilisation penalty modelled; effective fee == 2_500.
+        let deep = Arc::new(StubProvider {
+            source: FlashLoanSource::PancakeSwapV3,
+            fee_rate_millionths: 2_500,
+            liquidity: U256::from(1_000_000u64),
+            chain: 56,
+            ..StubProvider::default()
+        });
+        let router = FlashLoanRouter::new(vec![shallow, deep]);
+        let quote = router
+            .route(token(), U256::from(600u64))
+            .await
+            .expect("route");
+        assert_eq!(
+            quote.source,
+            FlashLoanSource::PancakeSwapV3,
+            "deep pool must win when utilisation eats the shallow source"
+        );
+    }
+
+    /// Transient `available_liquidity` errors must not silently
+    /// disqualify the provider — the router should still try to
+    /// quote against it. Pre-fix the router coerced the error to
+    /// `0` and treated the provider as empty, dropping the borrow.
+    #[tokio::test]
+    async fn router_falls_through_when_liquidity_probe_errors() {
+        // Lone provider — its liquidity probe errors but its quote
+        // path succeeds (matching a real "RPC blip on read, but
+        // node accepts the eth_call" scenario).
+        let aave = Arc::new(StubProvider {
+            source: FlashLoanSource::AaveV3,
+            fee_rate_millionths: 500,
+            liquidity: U256::from(10_000u64),
+            chain: 56,
+            liquidity_errors: true,
+            ..StubProvider::default()
+        });
+        let router = FlashLoanRouter::new(vec![aave]);
+        let quote = router
+            .route(token(), U256::from(500u64))
+            .await
+            .expect("route still attempts quote despite probe error");
+        assert_eq!(quote.source, FlashLoanSource::AaveV3);
     }
 }
