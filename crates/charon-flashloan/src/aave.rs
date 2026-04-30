@@ -241,9 +241,7 @@ impl AaveFlashLoan {
             .call()
             .await
             .map_err(|e| FlashLoanError::rpc(format!("getReserveData: {e}")))?;
-        if bit_is_set(data.configuration, RESERVE_PAUSED_BIT)
-            || bit_is_set(data.configuration, RESERVE_FROZEN_BIT)
-        {
+        if bitmap_says_paused(data.configuration) || bitmap_says_frozen(data.configuration) {
             return Err(FlashLoanError::ReservePaused { asset });
         }
         Ok(())
@@ -254,6 +252,23 @@ impl AaveFlashLoan {
 /// configuration `U256`.
 fn bit_is_set(bitmap: U256, index: u32) -> bool {
     (bitmap >> index) & U256::from(1u8) == U256::from(1u8)
+}
+
+/// Pure extractor: is the `paused` flag set in an Aave V3 packed
+/// reserve configuration bitmap (bit 60). Split out so unit tests
+/// can exercise hand-crafted bitmaps without standing up a live RPC,
+/// and so a future Aave layout change (or a typo in the constant)
+/// trips a unit test instead of producing a silent revert in
+/// production. See `ReserveConfiguration.sol` in aave-v3-core.
+pub fn bitmap_says_paused(bitmap: U256) -> bool {
+    bit_is_set(bitmap, RESERVE_PAUSED_BIT)
+}
+
+/// Pure extractor: is the `frozen` flag set in an Aave V3 packed
+/// reserve configuration bitmap (bit 57). Companion to
+/// [`bitmap_says_paused`]; same rationale.
+pub fn bitmap_says_frozen(bitmap: U256) -> bool {
+    bit_is_set(bitmap, RESERVE_FROZEN_BIT)
 }
 
 #[async_trait]
@@ -377,5 +392,62 @@ mod tests {
         assert!(!bit_is_set(frozen, RESERVE_PAUSED_BIT));
         assert!(!bit_is_set(U256::ZERO, RESERVE_PAUSED_BIT));
         assert!(!bit_is_set(U256::ZERO, RESERVE_FROZEN_BIT));
+    }
+
+    /// Only bit 57 set → bitmap_says_frozen, not paused.
+    #[test]
+    fn bitmap_says_frozen_when_only_bit_57_set() {
+        let cfg = U256::from(1u64) << RESERVE_FROZEN_BIT;
+        assert!(bitmap_says_frozen(cfg), "frozen helper must trip on bit 57");
+        assert!(
+            !bitmap_says_paused(cfg),
+            "paused helper must NOT trip on the frozen bit"
+        );
+    }
+
+    /// Only bit 60 set → bitmap_says_paused, not frozen.
+    #[test]
+    fn bitmap_says_paused_when_only_bit_60_set() {
+        let cfg = U256::from(1u64) << RESERVE_PAUSED_BIT;
+        assert!(bitmap_says_paused(cfg), "paused helper must trip on bit 60");
+        assert!(
+            !bitmap_says_frozen(cfg),
+            "frozen helper must NOT trip on the paused bit"
+        );
+    }
+
+    /// Both bits clear → neither helper trips.
+    #[test]
+    fn bitmap_helpers_clear_when_both_bits_unset() {
+        let cfg = U256::ZERO;
+        assert!(!bitmap_says_paused(cfg));
+        assert!(!bitmap_says_frozen(cfg));
+
+        // Some unrelated bits set — must still report clear.
+        let mut other = U256::ZERO;
+        other |= U256::from(1u64) << 0;
+        other |= U256::from(1u64) << 16;
+        other |= U256::from(1u64) << 32;
+        assert!(!bitmap_says_paused(other));
+        assert!(!bitmap_says_frozen(other));
+    }
+
+    /// Off-by-one guard: bits 56, 58, 59, 61, 62 must NOT register as
+    /// frozen or paused. Catches a typo that would shift the constant
+    /// by one and silently reroute paused/frozen reserves through the
+    /// flash-loan path.
+    #[test]
+    fn bitmap_helpers_immune_to_off_by_one_bits() {
+        for bit in [56u32, 58, 59, 61, 62] {
+            let cfg = U256::from(1u64) << bit;
+            assert!(
+                !bitmap_says_paused(cfg),
+                "bit {bit} must NOT register as paused (paused = bit 60)"
+            );
+            assert!(
+                !bitmap_says_frozen(cfg),
+                "bit {bit} must NOT register as frozen (frozen = bit 57)"
+            );
+        }
     }
 }
