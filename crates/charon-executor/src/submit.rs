@@ -583,7 +583,9 @@ mod tests {
                 when.method(POST).path("/");
                 then.status(200)
                     .header("content-type", "application/json")
-                    .body(format!(r#"{{"jsonrpc":"2.0","id":0,"result":"{original}"}}"#));
+                    .body(format!(
+                        r#"{{"jsonrpc":"2.0","id":0,"result":"{original}"}}"#
+                    ));
             })
             .await;
 
@@ -621,15 +623,16 @@ mod tests {
                 when.method(POST).path("/");
                 then.status(200)
                     .header("content-type", "application/json")
-                    .body(format!(r#"{{"jsonrpc":"2.0","id":0,"result":"{new_hash}"}}"#));
+                    .body(format!(
+                        r#"{{"jsonrpc":"2.0","id":0,"result":"{new_hash}"}}"#
+                    ));
             })
             .await;
 
         let submitter = build_test_submitter(&server.url("/"), DEFAULT_SUBMIT_TIMEOUT);
-        let original_hash =
-            "0x1111111111111111111111111111111111111111111111111111111111111111"
-                .parse::<TxHash>()
-                .expect("hash parse");
+        let original_hash = "0x1111111111111111111111111111111111111111111111111111111111111111"
+            .parse::<TxHash>()
+            .expect("hash parse");
         let returned = submitter
             .replace(
                 Bytes::from_static(&[0x02, 0xc0]),
