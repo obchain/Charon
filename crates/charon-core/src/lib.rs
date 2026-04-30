@@ -9,6 +9,7 @@ pub mod types;
 
 pub use config::{
     Config, ConfigError, DiscoveryConfig, MAX_LOG_CHUNK_BLOCKS_VALIDATION, MetricsConfig,
+    PoolFeeConfig, VALID_PCS_V3_FEE_TIERS, pool_fee_pair_key,
 };
 pub use flashloan::{FlashLoanError, FlashLoanProvider, FlashLoanQuote};
 pub use profit::{NetProfit, Price, ProfitError, ProfitInputs, calculate_profit};

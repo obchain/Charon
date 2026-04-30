@@ -287,6 +287,12 @@ struct VenusPipeline {
     /// scanner has a real population to bucket without operator
     /// `--borrower` seeding.
     discovery: charon_scanner::BorrowerSet,
+    /// PancakeSwap V3 pool-fee policy resolved per-pair at every
+    /// opportunity (#355). Hardcoding `3_000` lost competitiveness
+    /// on stablecoin / blue-chip pairs whose deepest pool is `100`
+    /// or `500`; this is the config-driven minimum-viable fix until
+    /// on-chain factory resolution lands in a follow-up.
+    pool_fees: charon_core::PoolFeeConfig,
 }
 
 /// Bundle of executor components needed to broadcast a simulated
@@ -997,6 +1003,7 @@ async fn run_listen(
                         chain_id,
                         exec_harness,
                         discovery: discovery.clone(),
+                        pool_fees: chain_cfg.pool_fees.clone(),
                     }))
                 }
                 None => {
@@ -1779,7 +1786,7 @@ async fn process_opportunity(
         debt_meta.decimals,
     );
 
-    let opp_preview = preview_opportunity(pos, &quote, repay);
+    let opp_preview = preview_opportunity(pos, &quote, repay, &pipeline.pool_fees);
     let inputs = match ProfitInputs::from_opportunity(
         &opp_preview,
         opp_preview.expected_collateral_out,
@@ -1834,10 +1841,15 @@ async fn process_opportunity(
             token_out: pos.debt_token,
             amount_in: pos.collateral_amount,
             min_amount_out,
-            // PancakeSwap V3 hot-pair default. `None` is for
-            // fee-less routes (Balancer V2, Curve stable pool);
-            // PancakeSwap V3 uses 0.3% for BSC stablecoin pairs.
-            pool_fee: Some(3_000),
+            // Resolve the PancakeSwap V3 fee tier from the per-pair
+            // config map (#355). Falls back to `pool_fees.default`
+            // (3_000 unless the operator set it lower for stablecoin
+            // pairs) when no override exists.
+            pool_fee: Some(
+                pipeline
+                    .pool_fees
+                    .fee_for(pos.collateral_token, pos.debt_token),
+            ),
         },
         net,
     );
@@ -2190,6 +2202,7 @@ fn preview_opportunity(
     pos: &Position,
     quote: &FlashLoanQuote,
     repay: U256,
+    pool_fees: &charon_core::PoolFeeConfig,
 ) -> LiquidationOpportunity {
     LiquidationOpportunity {
         position: pos.clone(),
@@ -2207,7 +2220,7 @@ fn preview_opportunity(
             token_out: pos.debt_token,
             amount_in: pos.collateral_amount,
             min_amount_out: U256::ZERO,
-            pool_fee: Some(3_000),
+            pool_fee: Some(pool_fees.fee_for(pos.collateral_token, pos.debt_token)),
         },
         net_profit_wei: U256::ZERO,
     }
