@@ -64,6 +64,10 @@ pool  = "0x6807dc923806fe8fd134338eabca509979a7e0cb"
 # Aave V3 PoolDataProvider on BSC — matches default.toml. Resolves
 # aTokens and reserve configuration bitmaps for the adapter.
 data_provider = "0x41393e5e337606dc3821075Af65AeE84D7688CBD"
+# Aave V3 IPoolAddressesProvider — startup check is bypassed under
+# profile_tag = "fork" but kept here so the fork profile mirrors the
+# mainnet TOML structure 1:1.
+addresses_provider = "0xff75B6da14FfbbfD355Daf7a2731456b3562Ba6D"
 
 # ── Deployed liquidator contracts ─────────────────────────────────────────
 # `[liquidator.bnb]` is declared at the bottom of this file with the
