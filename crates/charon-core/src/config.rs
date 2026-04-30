@@ -444,11 +444,76 @@ pub struct ChainConfig {
     /// pre-existing source-level constants.
     #[serde(default)]
     pub discovery: DiscoveryConfig,
+
+    /// PancakeSwap V3 pool-fee tier policy for this chain. Operators
+    /// override per-pair tiers under `[chain.<name>.pool_fees]`;
+    /// pairs without an override use `default` (`3_000` for back-compat).
+    /// Hardcoding `3_000` lost competitiveness on stablecoin pairs
+    /// (whose deepest pool is `100` or `500`); a config-driven map
+    /// is the minimum viable fix until on-chain factory resolution
+    /// lands as a follow-up to #355.
+    #[serde(default)]
+    pub pool_fees: PoolFeeConfig,
 }
 
 fn default_priority_fee_gwei() -> u64 {
     1
 }
+
+/// PancakeSwap V3 pool-fee tier policy exposed under
+/// `[chain.<name>.pool_fees]`. The hot path needs a fee tier for the
+/// `(collateral, debt)` pair on every liquidation opportunity;
+/// hardcoding `3_000` (0.30 %) lost competitiveness on stablecoin /
+/// blue-chip pairs whose deepest pool is `100` or `500`. This config
+/// lets operators override tiers per pair until on-chain resolution
+/// lands as a follow-up to #355. `default` applies to every pair
+/// without an explicit override.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PoolFeeConfig {
+    /// Default fee tier (PancakeSwap V3 uses hundredths-of-a-bip, so
+    /// `3_000` = 0.30 %). 100 / 500 / 2_500 / 10_000 are also valid;
+    /// `Config::validate` rejects anything outside that set.
+    #[serde(default = "default_pool_fee")]
+    pub default: u32,
+    /// Per-pair overrides keyed by `"<addrA>/<addrB>"`. Addresses
+    /// must be lower-case hex, sorted ascending.
+    #[serde(default)]
+    pub overrides: HashMap<String, u32>,
+}
+
+impl Default for PoolFeeConfig {
+    fn default() -> Self {
+        Self {
+            default: default_pool_fee(),
+            overrides: HashMap::new(),
+        }
+    }
+}
+
+fn default_pool_fee() -> u32 {
+    3_000
+}
+
+/// Compose the canonical override-table key for a token pair.
+/// Lower-case hex, sorted ascending so callers don't have to
+/// remember swap direction.
+pub fn pool_fee_pair_key(a: Address, b: Address) -> String {
+    let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
+    format!("{lo:#x}/{hi:#x}")
+}
+
+impl PoolFeeConfig {
+    /// Resolve the fee tier for a `(token_a, token_b)` pair. Returns
+    /// the per-pair override when configured, otherwise `default`.
+    pub fn fee_for(&self, token_a: Address, token_b: Address) -> u32 {
+        let key = pool_fee_pair_key(token_a, token_b);
+        self.overrides.get(&key).copied().unwrap_or(self.default)
+    }
+}
+
+/// Valid PancakeSwap V3 fee tiers in hundredths-of-a-bip.
+pub const VALID_PCS_V3_FEE_TIERS: &[u32] = &[100, 500, 2_500, 3_000, 10_000];
 
 impl fmt::Debug for ChainConfig {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -769,6 +834,19 @@ impl Config {
                 return Err(ConfigError::Validation(format!(
                     "chain `{name}`: discovery.chunk_max_attempts must be > 0"
                 )));
+            }
+            if !VALID_PCS_V3_FEE_TIERS.contains(&c.pool_fees.default) {
+                return Err(ConfigError::Validation(format!(
+                    "chain `{name}`: pool_fees.default ({}) must be one of {VALID_PCS_V3_FEE_TIERS:?}",
+                    c.pool_fees.default
+                )));
+            }
+            for (key, fee) in &c.pool_fees.overrides {
+                if !VALID_PCS_V3_FEE_TIERS.contains(fee) {
+                    return Err(ConfigError::Validation(format!(
+                        "chain `{name}`: pool_fees.overrides['{key}'] = {fee} must be one of {VALID_PCS_V3_FEE_TIERS:?}"
+                    )));
+                }
             }
         }
         for (name, p) in &self.protocol {
@@ -1204,6 +1282,7 @@ mod private_rpc_tests {
             private_rpc_auth: None,
             allow_public_mempool: allow_public,
             discovery: DiscoveryConfig::default(),
+            pool_fees: PoolFeeConfig::default(),
         }
     }
 
@@ -1460,6 +1539,7 @@ mod fork_profile_tests {
             private_rpc_auth: None,
             allow_public_mempool: false,
             discovery: DiscoveryConfig::default(),
+            pool_fees: PoolFeeConfig::default(),
         }
     }
 
@@ -1853,6 +1933,7 @@ allow_public_mempool = true
                     private_rpc_auth: None,
                     allow_public_mempool: true,
                     discovery: d,
+                    pool_fees: PoolFeeConfig::default(),
                 },
             );
             Config {
@@ -1904,6 +1985,114 @@ allow_public_mempool = true
             .expect_err("log_chunk_blocks > 100_000 must reject");
         match err {
             ConfigError::Validation(m) => assert!(m.contains("log_chunk_blocks"), "{m}"),
+            other => panic!("wrong variant: {other:?}"),
+        }
+    }
+
+    /// `PoolFeeConfig::fee_for` returns the per-pair override when
+    /// configured and falls back to `default` otherwise. The key is
+    /// canonical-sorted so the call site doesn't have to remember
+    /// swap direction.
+    #[test]
+    fn pool_fee_config_overrides_per_pair() {
+        let a = Address::from_slice(&[0xaa; 20]);
+        let b = Address::from_slice(&[0xbb; 20]);
+        let c = Address::from_slice(&[0xcc; 20]);
+        let mut overrides = HashMap::new();
+        overrides.insert(pool_fee_pair_key(a, b), 100u32);
+        let cfg = PoolFeeConfig {
+            default: 3_000,
+            overrides,
+        };
+        assert_eq!(cfg.fee_for(a, b), 100);
+        // Order-independent — same pair in reverse still picks 100.
+        assert_eq!(cfg.fee_for(b, a), 100);
+        // Unconfigured pair falls back to default.
+        assert_eq!(cfg.fee_for(a, c), 3_000);
+    }
+
+    /// `Config::validate` rejects an out-of-band fee tier on either
+    /// the default or an override entry. Catches a typo (`30000`
+    /// instead of `3000`) before the bot signs anything against it.
+    #[test]
+    fn validate_rejects_invalid_pcs_v3_fee_tiers() {
+        fn cfg_with_pool_fees(p: PoolFeeConfig) -> Config {
+            let mut chain = HashMap::new();
+            chain.insert(
+                "bnb".to_string(),
+                ChainConfig {
+                    chain_id: 56,
+                    ws_url: "ws://127.0.0.1:8545".into(),
+                    http_url: "http://127.0.0.1:8545".into(),
+                    priority_fee_gwei: 1,
+                    private_rpc_url: None,
+                    private_rpc_auth: None,
+                    allow_public_mempool: true,
+                    discovery: DiscoveryConfig::default(),
+                    pool_fees: p,
+                },
+            );
+            Config {
+                bot: BotConfig {
+                    min_profit_usd_1e6: 1,
+                    max_gas_wei: U256::from(1u64),
+                    scan_interval_ms: 1,
+                    liquidatable_threshold_bps: 10_000,
+                    near_liq_threshold_bps: 10_500,
+                    hot_scan_blocks: 1,
+                    warm_scan_blocks: 10,
+                    cold_scan_blocks: 100,
+                    heartbeat_blocks: 50,
+                    signer_key: None,
+                    profile_tag: None,
+                },
+                chain,
+                protocol: HashMap::new(),
+                flashloan: HashMap::new(),
+                liquidator: HashMap::new(),
+                metrics: MetricsConfig {
+                    enabled: false,
+                    bind: "127.0.0.1:9091".parse().expect("hardcoded bind parses"),
+                    auth_token: None,
+                },
+                chainlink: HashMap::new(),
+                chainlink_max_age_secs: HashMap::new(),
+            }
+        }
+
+        // Valid default is fine.
+        cfg_with_pool_fees(PoolFeeConfig {
+            default: 500,
+            overrides: HashMap::new(),
+        })
+        .validate()
+        .expect("default 500 is valid");
+
+        // Invalid default (30_000) is rejected.
+        let err = cfg_with_pool_fees(PoolFeeConfig {
+            default: 30_000,
+            overrides: HashMap::new(),
+        })
+        .validate()
+        .expect_err("default 30_000 must be rejected");
+        match err {
+            ConfigError::Validation(m) => assert!(m.contains("pool_fees.default"), "{m}"),
+            other => panic!("wrong variant: {other:?}"),
+        }
+
+        // Invalid override is rejected.
+        let mut overrides = HashMap::new();
+        let a = Address::from_slice(&[0xaa; 20]);
+        let b = Address::from_slice(&[0xbb; 20]);
+        overrides.insert(pool_fee_pair_key(a, b), 999u32);
+        let err = cfg_with_pool_fees(PoolFeeConfig {
+            default: 3_000,
+            overrides,
+        })
+        .validate()
+        .expect_err("override 999 must be rejected");
+        match err {
+            ConfigError::Validation(m) => assert!(m.contains("pool_fees.overrides"), "{m}"),
             other => panic!("wrong variant: {other:?}"),
         }
     }
