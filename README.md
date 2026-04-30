@@ -203,6 +203,8 @@ If dRPC is throttling you can point at any other BSC **archive** RPC by exportin
 
 Wait until you see `Listening on 0.0.0.0:8545` followed by `dev-0 nonce reset to 0 …`. **Leave this pane running** — closing it kills the fork. `FORK_BLOCK=latest` tracks upstream head; pinned blocks need archive state at `fork_block - 6` and abort with `metadata is not found` on free tiers.
 
+> A `WARNING — installed version may not match the pin … nightly-…` line at the top of the fork script's output is expected on Foundry nightly toolchains. The check does not abort and the fork runs correctly.
+
 ### Step 6 — Wire up Prometheus + Grafana (one-time)
 
 The bot exports metrics on `127.0.0.1:9091`. In Pane C:
@@ -278,10 +280,12 @@ You should see this log sequence (in order):
 ```
 charon starting up
 config loaded chains=1 protocols=1 flashloan_sources=1 liquidators=1   # liquidators=1 is critical
-Venus adapter connected ... market_count=48 mapped_markets=47
+Venus adapter connected ... market_count=48 mapped_markets=46–47
+scan scheduler phase offset derived chain=bnb phase_offset=N
 discovery live subscription established
 chainlink feed symbol=BNB price=...                                    # × 5 feeds
-token metadata cache built tokens_cached=47
+token metadata cache built tokens_cached=43–47
+skipping Aave AddressesProvider check (fork profile)
 Aave V3 flash-loan adapter ready pool=0x6807...e0cb premium=5
 venus pipeline ready borrower_count=N
 metrics exporter listening bind=127.0.0.1:9091
@@ -290,7 +294,15 @@ block subscription established chain=bnb
 block listener heartbeat chain=bnb block=... cadence_blocks=50
 ```
 
-Cold start typically 2–5 min on a free RPC. Transient HTTP 500 / 429s are retried automatically. If the bot dies with `Aave V3: FLASHLOAN_PREMIUM_TOTAL() failed`, the upstream is throttling — restart anvil with `FORK_CUPS=20` or swap `FORK_RPC` to a different endpoint and rerun from Step 5.
+Notes on the ranges + new lines:
+
+- **`mapped_markets=46–47`** — one Venus vToken's `underlying()` lookup may 429 on free dRPC and get skipped. Both 46 and 47 are healthy outcomes.
+- **`tokens_cached=43–47`** — token-meta build runs concurrently under a 16-permit semaphore (#391); a few tokens may still be dropped to retry exhaustion on a heavily throttled upstream. Each dropped token is logged at `warn` and the profit gate silently skips opportunities priced against it.
+- **`× 5 feeds`** — BTCB sometimes 429s on the first `latestRoundData()` and surfaces as a one-off `chainlink refresh failed` warn before recovering on the next block. The pipeline-ready log's `feed_count=5` is the count to watch; one warn at startup is not a failure.
+- **`scan scheduler phase offset derived`** — per-bot block-modulo offset (#366) so two bots in the same swarm don't burst the public RPC in lockstep.
+- **`skipping Aave AddressesProvider check (fork profile)`** — the `[flashloan.aave_v3_bsc].addresses_provider` startup check (#367) is bypassed under `profile_tag = "fork"`. Mainnet runs do execute the check.
+
+Cold start typically 3–8 min on dRPC free tier; a keyed archive RPC (QuickNode / BlockPi / paid dRPC / Alchemy / Chainstack) lands under 3 min. Transient HTTP 500 / 429s are retried automatically. The first block after startup may emit `per-block pipeline pass timed out … timeout_ms=30000` once on a fresh fork — caches are cold; subsequent blocks complete in well under 50 ms. If the bot dies with `Aave V3: FLASHLOAN_PREMIUM_TOTAL() failed`, the upstream is throttling — restart anvil with `FORK_CUPS=20` or swap `FORK_RPC` to a different endpoint and rerun from Step 5.
 
 ### Step 9 — Pane C: verify metrics + dashboard
 
