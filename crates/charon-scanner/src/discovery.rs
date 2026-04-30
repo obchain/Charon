@@ -23,6 +23,8 @@ use rand::Rng as _;
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
+use charon_core::DiscoveryConfig;
+
 use crate::token_meta::is_transient;
 
 /// `keccak256("Borrow(address,uint256,uint256,uint256)")` — the Compound /
@@ -46,27 +48,11 @@ pub const MAX_LOG_CHUNK_BLOCKS: u64 = 9_500;
 /// subscription.
 pub const DISCOVERY_CHANNEL_CAPACITY: usize = 1_024;
 
-/// Inter-chunk pacing for [`backfill_borrowers`] — small sleep between
-/// `eth_getLogs` requests to keep free-tier RPC throttlers from rejecting
-/// the burst. 50 ms across ~22 chunks adds ~1 s to startup, which is
-/// invisible next to the WS subscription handshake.
-const BACKFILL_INTER_CHUNK_PACING: Duration = Duration::from_millis(50);
-
-/// Per-chunk retry budget for [`backfill_borrowers`]. Free-tier RPCs
-/// occasionally return a 5xx / `-32603` "temporary internal error" on a
-/// single chunk while the next chunk succeeds, so a one-shot failure used
-/// to leave the borrower set empty until the next live `Borrow` event —
-/// during which window the bot misses any pre-existing liquidatable
-/// account. Retry transient classes only (see [`is_transient`]); a
-/// genuinely permanent error (range too large, malformed filter) still
-/// surfaces immediately so the operator notices.
-const BACKFILL_CHUNK_MAX_ATTEMPTS: u32 = 4;
-
-/// Initial backoff between chunk retries; doubles up to a 5 s cap. Worst
-/// case latency added per failing chunk is `0.5 + 1 + 2 + 4 = 7.5 s`,
-/// bounded by `BACKFILL_CHUNK_MAX_ATTEMPTS`.
-const BACKFILL_CHUNK_INITIAL_BACKOFF: Duration = Duration::from_millis(500);
-const BACKFILL_CHUNK_MAX_BACKOFF: Duration = Duration::from_secs(5);
+// Backfill pacing / retry knobs are now sourced from
+// `charon_core::DiscoveryConfig` (see `[chain.<name>.discovery]` in
+// `config/default.toml`). The previous module-level consts have moved
+// to `DiscoveryConfig::default()` so the same values keep applying when
+// the operator omits the `[discovery]` block.
 
 /// Reconnect-backoff ceiling for [`run_discovery_live_with_reconnect`].
 /// Mirrors `BlockListener::run`'s 30 s cap so a long upstream outage
@@ -153,13 +139,17 @@ async fn get_logs_with_retry(
     filter: &Filter,
     from_block: u64,
     to_block: u64,
+    cfg: &DiscoveryConfig,
 ) -> Result<Vec<Log>, alloy::transports::RpcError<alloy::transports::TransportErrorKind>> {
-    let mut backoff = BACKFILL_CHUNK_INITIAL_BACKOFF;
-    for attempt in 1..=BACKFILL_CHUNK_MAX_ATTEMPTS {
+    let max_attempts = cfg.chunk_max_attempts.max(1);
+    let initial = Duration::from_millis(cfg.chunk_initial_backoff_ms);
+    let cap = Duration::from_millis(cfg.chunk_max_backoff_ms);
+    let mut backoff = initial;
+    for attempt in 1..=max_attempts {
         match provider.get_logs(filter).await {
             Ok(logs) => return Ok(logs),
             Err(err) => {
-                if !is_transient(&err) || attempt == BACKFILL_CHUNK_MAX_ATTEMPTS {
+                if !is_transient(&err) || attempt == max_attempts {
                     return Err(err);
                 }
                 warn!(
@@ -171,7 +161,7 @@ async fn get_logs_with_retry(
                     "discovery backfill: transient eth_getLogs failure — retrying",
                 );
                 tokio::time::sleep(backoff).await;
-                backoff = backoff.saturating_mul(2).min(BACKFILL_CHUNK_MAX_BACKOFF);
+                backoff = backoff.saturating_mul(2).min(cap);
             }
         }
     }
@@ -193,6 +183,30 @@ pub async fn backfill_borrowers(
     from_block: u64,
     to_block: u64,
 ) -> Result<usize> {
+    backfill_borrowers_with_config(
+        provider,
+        vtokens,
+        set,
+        from_block,
+        to_block,
+        &DiscoveryConfig::default(),
+    )
+    .await
+}
+
+/// Same as [`backfill_borrowers`] but with an explicit
+/// [`DiscoveryConfig`] driving chunk size, pacing, and retry budget.
+/// New code should call this directly so operators can tune cold-start
+/// behaviour from `[chain.<name>.discovery]` (#365); the legacy
+/// constants-only entry point is kept as a thin wrapper.
+pub async fn backfill_borrowers_with_config(
+    provider: &RootProvider<PubSubFrontend>,
+    vtokens: Vec<Address>,
+    set: &BorrowerSet,
+    from_block: u64,
+    to_block: u64,
+    cfg: &DiscoveryConfig,
+) -> Result<usize> {
     if vtokens.is_empty() {
         return Ok(0);
     }
@@ -200,17 +214,19 @@ pub async fn backfill_borrowers(
         return Ok(0);
     }
 
+    let chunk_span = cfg.log_chunk_blocks.max(1);
+    let pacing = Duration::from_millis(cfg.inter_chunk_pacing_ms);
     let mut new_count: usize = 0;
     let topic = FixedBytes::<32>::from(BORROW_TOPIC0.0);
     let mut cursor = from_block;
     while cursor <= to_block {
         // Saturating arithmetic — the chunk window is bounded by
-        // `MAX_LOG_CHUNK_BLOCKS` and clamped to `to_block`, so an
-        // overflow here would already mean the input range was
-        // pathological. Use `saturating_*` to satisfy the workspace's
+        // `chunk_span` and clamped to `to_block`, so an overflow here
+        // would already mean the input range was pathological. Use
+        // `saturating_*` to satisfy the workspace's
         // `arithmetic_side_effects` lint without changing behaviour.
         let chunk_end = cursor
-            .saturating_add(MAX_LOG_CHUNK_BLOCKS)
+            .saturating_add(chunk_span)
             .saturating_sub(1)
             .min(to_block);
         let filter = Filter::new()
@@ -218,7 +234,7 @@ pub async fn backfill_borrowers(
             .to_block(chunk_end)
             .address(vtokens.clone())
             .event_signature(topic);
-        let logs = get_logs_with_retry(provider, &filter, cursor, chunk_end)
+        let logs = get_logs_with_retry(provider, &filter, cursor, chunk_end, cfg)
             .await
             .with_context(|| format!("eth_getLogs {}..{}", cursor, chunk_end))?;
         debug!(
@@ -242,9 +258,10 @@ pub async fn backfill_borrowers(
             break;
         }
         // Inter-chunk pacing — only sleep when there is another chunk
-        // to fetch, so a single-chunk backfill stays instant.
-        if cursor <= to_block {
-            tokio::time::sleep(BACKFILL_INTER_CHUNK_PACING).await;
+        // to fetch, so a single-chunk backfill stays instant. Skip the
+        // sleep when pacing is zero (paid RPCs).
+        if cursor <= to_block && !pacing.is_zero() {
+            tokio::time::sleep(pacing).await;
         }
     }
     info!(
