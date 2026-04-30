@@ -153,8 +153,7 @@ pub mod names {
     /// observed in the mempool (#350). Surfaces "which selector is
     /// active right now" so a ResilientOracle migration that retires
     /// `updatePrice` and ships a replacement is visible at a glance.
-    pub const MEMPOOL_VENUS_ORACLE_WRITES_TOTAL: &str =
-        "charon_mempool_venus_oracle_writes_total";
+    pub const MEMPOOL_VENUS_ORACLE_WRITES_TOTAL: &str = "charon_mempool_venus_oracle_writes_total";
 
     // Gas oracle (issue #301). Latest EIP-1559 base fee, priority
     // fee used on the last submission attempt, and resulting
