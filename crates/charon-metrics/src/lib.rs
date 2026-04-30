@@ -142,6 +142,15 @@ pub mod names {
     pub const EXECUTOR_PROFIT_USD_CENTS: &str = "charon_executor_profit_usd_cents";
     pub const EXECUTOR_QUEUE_DEPTH: &str = "charon_executor_queue_depth";
 
+    /// Top-level "opportunities seen" / "opportunities dropped"
+    /// counters with a `reason` label (#368). Companions to the older
+    /// `EXECUTOR_OPPS_DROPPED_TOTAL` (`stage` label) which is kept for
+    /// dashboard back-compat: `stage` describes *where* in the
+    /// pipeline the drop happened, `reason` describes *why* (and is
+    /// the surface alerts and capacity planning queries should use).
+    pub const OPPORTUNITIES_SEEN_TOTAL: &str = "charon_opportunities_seen_total";
+    pub const OPPORTUNITIES_DROPPED_TOTAL: &str = "charon_opportunities_dropped_total";
+
     // Mempool monitor (issue #300). Counts pending oracle updates
     // observed in the mempool, oracle updates drained at block
     // boundaries, and upstream websocket reconnect attempts — the
@@ -198,6 +207,39 @@ pub mod drop_stage {
     pub const PROFIT: &str = "profit";
     pub const SIMULATION: &str = "simulation";
     pub const BUILD: &str = "build";
+}
+
+/// Drop-reason label on `charon_opportunities_dropped_total` (#368).
+/// Distinct from [`drop_stage`] — `stage` says *where* (pipeline
+/// section), `reason` says *why* (operator-facing root cause).
+/// Reasons are deliberately coarse so a single Grafana panel can
+/// stack them without exploding cardinality. Add a new variant
+/// before changing an existing one — dashboards and alerts pin the
+/// label values.
+pub mod drop_reason {
+    /// FlashLoanRouter::route returned None — no source could cover
+    /// the (token, amount) borrow this opportunity needs.
+    pub const NO_FLASHLOAN_SOURCE: &str = "no_flashloan_source";
+    /// Profit gate rejected: net profit fell below the configured
+    /// floor, prices/decimals could not be resolved, or the inputs
+    /// could not be normalised. Anything that says "we cannot
+    /// guarantee a positive net" lands here.
+    pub const UNPROFITABLE: &str = "unprofitable";
+    /// `eth_call` simulation reverted, errored, or could not run
+    /// (no signer configured). The opportunity is not safe to
+    /// broadcast against the latest state.
+    pub const SIM_REVERT: &str = "sim_revert";
+    /// `bot.max_gas_wei` ceiling exceeded by the current EIP-1559
+    /// max-fee. The bot deliberately skips broadcasting at this gas
+    /// price to preserve economics.
+    pub const GAS_CEILING: &str = "gas_ceiling";
+    /// Queue TTL expired — the opportunity sat in the priority
+    /// queue past the configured age and was discarded as stale.
+    pub const TTL_EXPIRED: &str = "ttl_expired";
+    /// Build / sign / `eth_sendRawTransaction` failed. The
+    /// opportunity passed every earlier gate but the broadcast
+    /// stage rejected it.
+    pub const SUBMIT_FAILED: &str = "submit_failed";
 }
 
 /// Endpoint-kind label used on every RPC metric (issue #302).
@@ -518,6 +560,32 @@ pub fn record_opportunity_dropped(chain: &str, stage: &str) {
     .increment(1);
 }
 
+/// Record one opportunity entering the pipeline. The matching drop /
+/// queue counters answer "what fraction made it to broadcast?" —
+/// without a `seen` baseline a stage drop count is unreadable. See
+/// [`drop_reason`] for the reasons attached to drops.
+pub fn record_opportunity_seen(chain: &str) {
+    counter!(
+        names::OPPORTUNITIES_SEEN_TOTAL,
+        "chain" => chain.to_owned(),
+    )
+    .increment(1);
+}
+
+/// Record one opportunity dropped, labelled by *root-cause* `reason`.
+/// Companion to [`record_opportunity_dropped`] (which uses a `stage`
+/// label) — call sites should call both at every drop point so the
+/// stage-based dashboard keeps working while `reason`-based panels and
+/// alerts come online. See [`drop_reason`] for the allowed values.
+pub fn record_opportunity_dropped_reason(chain: &str, reason: &str) {
+    counter!(
+        names::OPPORTUNITIES_DROPPED_TOTAL,
+        "chain" => chain.to_owned(),
+        "reason" => reason.to_owned(),
+    )
+    .increment(1);
+}
+
 /// Update the queue-depth gauge.
 pub fn set_queue_depth(depth: u64) {
     gauge!(names::EXECUTOR_QUEUE_DEPTH).set(depth as f64);
@@ -823,6 +891,27 @@ mod tests {
         init(bogus).await.expect("third init must also be a no-op");
     }
 
+    /// Pin the public surface of the drop-reason / opportunities-seen
+    /// metrics introduced by #368. Dashboards and alerts hard-code
+    /// these strings; renaming a constant must trip this test.
+    #[test]
+    fn opportunities_drop_reason_names_are_stable() {
+        assert_eq!(
+            names::OPPORTUNITIES_SEEN_TOTAL,
+            "charon_opportunities_seen_total"
+        );
+        assert_eq!(
+            names::OPPORTUNITIES_DROPPED_TOTAL,
+            "charon_opportunities_dropped_total"
+        );
+        assert_eq!(drop_reason::NO_FLASHLOAN_SOURCE, "no_flashloan_source");
+        assert_eq!(drop_reason::UNPROFITABLE, "unprofitable");
+        assert_eq!(drop_reason::SIM_REVERT, "sim_revert");
+        assert_eq!(drop_reason::GAS_CEILING, "gas_ceiling");
+        assert_eq!(drop_reason::TTL_EXPIRED, "ttl_expired");
+        assert_eq!(drop_reason::SUBMIT_FAILED, "submit_failed");
+    }
+
     /// Typed helpers must not panic when called — this exercises every
     /// label combination that call sites use so metric-name typos
     /// surface at `cargo test` time, not in prod.
@@ -842,6 +931,13 @@ mod tests {
         record_opportunity_dropped("bnb", drop_stage::PROFIT);
         record_opportunity_dropped("bnb", drop_stage::SIMULATION);
         record_opportunity_dropped("bnb", drop_stage::BUILD);
+        record_opportunity_seen("bnb");
+        record_opportunity_dropped_reason("bnb", drop_reason::NO_FLASHLOAN_SOURCE);
+        record_opportunity_dropped_reason("bnb", drop_reason::UNPROFITABLE);
+        record_opportunity_dropped_reason("bnb", drop_reason::SIM_REVERT);
+        record_opportunity_dropped_reason("bnb", drop_reason::GAS_CEILING);
+        record_opportunity_dropped_reason("bnb", drop_reason::TTL_EXPIRED);
+        record_opportunity_dropped_reason("bnb", drop_reason::SUBMIT_FAILED);
         set_queue_depth(3);
         set_build_info("0.1.0", "deadbeef");
 
