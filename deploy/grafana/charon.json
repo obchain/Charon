@@ -395,13 +395,50 @@
         {
           "datasource": { "type": "prometheus", "uid": "${datasource}" },
           "editorMode": "code",
-          "expr": "sum by (stage) (rate(charon_executor_opportunities_dropped_total{instance=~\"$instance\",chain=~\"$chain\",job=~\"$job\"}[$__rate_interval])) * 60",
+          "expr": "sum by (stage) (rate(charon_executor_opportunities_dropped_total{instance=~\"$instance\",chain=~\"$chain\",job=~\"$job\",stage!=\"\"}[$__rate_interval])) * 60",
           "legendFormat": "{{stage}}",
           "range": true,
           "refId": "B"
         }
       ],
       "title": "Executor — opportunities queued vs dropped",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "description": "Drops broken out by root-cause reason label (issue #368 + #402). Distinguishes 'sim_revert' (the liquidation logic reverted) from 'liquidator_not_deployed' (no code at the configured CharonLiquidator address) so a misconfigured fork or a runtime self-destruct surfaces as its own series rather than collapsing into a generic SIM_REVERT.",
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": {
+            "axisLabel": "opps / min",
+            "drawStyle": "bars",
+            "fillOpacity": 80,
+            "lineWidth": 1,
+            "showPoints": "never",
+            "stacking": { "group": "A", "mode": "normal" }
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 24 },
+      "id": 12,
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true },
+        "tooltip": { "mode": "multi", "sort": "none" }
+      },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "editorMode": "code",
+          "expr": "sum by (reason) (rate(charon_opportunities_dropped_total{instance=~\"$instance\",chain=~\"$chain\",job=~\"$job\"}[$__rate_interval])) * 60",
+          "legendFormat": "{{reason}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Executor — drops by reason",
       "type": "timeseries"
     },
     {

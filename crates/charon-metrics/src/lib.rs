@@ -270,6 +270,14 @@ pub mod drop_reason {
     /// opportunity passed every earlier gate but the broadcast
     /// stage rejected it.
     pub const SUBMIT_FAILED: &str = "submit_failed";
+    /// Simulation reverted with the well-known "no code at address"
+    /// payload — the configured CharonLiquidator address has empty
+    /// bytecode on the connected chain, distinct from the liquidation
+    /// logic itself reverting (#402). The startup gate added in
+    /// #399 catches this at boot for chains with a router config;
+    /// this counter covers the runtime self-destruct edge case and
+    /// any scan-only / replay path that bypasses the startup gate.
+    pub const LIQUIDATOR_NOT_DEPLOYED: &str = "liquidator_not_deployed";
 }
 
 /// Issue #397: outcome label on `EXECUTOR_BROADCASTS_TOTAL`. Mirrors
@@ -1034,6 +1042,10 @@ mod tests {
         assert_eq!(drop_reason::GAS_CEILING, "gas_ceiling");
         assert_eq!(drop_reason::TTL_EXPIRED, "ttl_expired");
         assert_eq!(drop_reason::SUBMIT_FAILED, "submit_failed");
+        assert_eq!(
+            drop_reason::LIQUIDATOR_NOT_DEPLOYED,
+            "liquidator_not_deployed"
+        );
     }
 
     /// Issue #397: pin the public surface of the broadcast / inclusion
@@ -1088,6 +1100,7 @@ mod tests {
         record_opportunity_dropped_reason("bnb", drop_reason::GAS_CEILING);
         record_opportunity_dropped_reason("bnb", drop_reason::TTL_EXPIRED);
         record_opportunity_dropped_reason("bnb", drop_reason::SUBMIT_FAILED);
+        record_opportunity_dropped_reason("bnb", drop_reason::LIQUIDATOR_NOT_DEPLOYED);
         // Issue #397: broadcast / inclusion / realised-profit
         record_broadcast("bnb", broadcast_result::SUBMITTED);
         record_broadcast("bnb", broadcast_result::TIMEOUT);
