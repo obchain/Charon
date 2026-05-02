@@ -532,9 +532,7 @@ where
              this chain — do not redeploy on mainnet without confirming the configured \
              address is wrong"
         };
-        bail!(
-            "liquidator contract not deployed at {liquidator} on chain '{chain_name}': {hint}"
-        );
+        bail!("liquidator contract not deployed at {liquidator} on chain '{chain_name}': {hint}");
     }
     info!(
         chain = %chain_name,
@@ -3360,7 +3358,9 @@ mod verify_liquidator_deployed_tests {
         let server = MockServer::start_async().await;
         let _m = server
             .mock_async(|when, then| {
-                when.method(POST).path("/").body_contains(r#""eth_getCode""#);
+                when.method(POST)
+                    .path("/")
+                    .body_contains(r#""eth_getCode""#);
                 then.status(200)
                     .header("content-type", "application/json")
                     .body(r#"{"jsonrpc":"2.0","id":0,"result":"0x"}"#);
@@ -3392,7 +3392,9 @@ mod verify_liquidator_deployed_tests {
         let server = MockServer::start_async().await;
         let _m = server
             .mock_async(|when, then| {
-                when.method(POST).path("/").body_contains(r#""eth_getCode""#);
+                when.method(POST)
+                    .path("/")
+                    .body_contains(r#""eth_getCode""#);
                 then.status(200)
                     .header("content-type", "application/json")
                     .body(r#"{"jsonrpc":"2.0","id":0,"result":"0x"}"#);
@@ -3422,7 +3424,9 @@ mod verify_liquidator_deployed_tests {
         let server = MockServer::start_async().await;
         let _m = server
             .mock_async(|when, then| {
-                when.method(POST).path("/").body_contains(r#""eth_getCode""#);
+                when.method(POST)
+                    .path("/")
+                    .body_contains(r#""eth_getCode""#);
                 then.status(200)
                     .header("content-type", "application/json")
                     .body(r#"{"jsonrpc":"2.0","id":0,"result":"0x6080604052"}"#);
