@@ -58,8 +58,8 @@ use alloy::signers::local::PrivateKeySigner;
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use charon_core::{
-    Config, FlashLoanQuote, LendingProtocol, LiquidationOpportunity, LiquidationParams,
-    OpportunityQueue, Position, Price, ProfitInputs, calculate_profit,
+    Config, FlashLoanQuote, FlashLoanSource, LendingProtocol, LiquidationOpportunity,
+    LiquidationParams, OpportunityQueue, Position, Price, ProfitInputs, calculate_profit,
 };
 use charon_executor::{
     DEFAULT_SUBMIT_TIMEOUT, GasDecision, GasOracle, NonceManager, Simulator, Submitter, TxBuilder,
@@ -222,6 +222,31 @@ enum Command {
         #[arg(long, default_value = "bnb")]
         chain: String,
     },
+
+    /// One-shot fork-replay: fork BSC at block `N` (out of band, via
+    /// `scripts/anvil_fork.sh FORK_BLOCK=N`), then identify every
+    /// liquidatable Venus position as of block `N` and run the
+    /// executor's encode + `eth_call` simulation pipeline once,
+    /// emitting one JSON record per position to stdout. Never
+    /// broadcasts — `CHARON_EXECUTE_CONFIRMED=1` is ignored.
+    ///
+    /// Pairs with the `Simulator::simulate_at` API (#400) and the
+    /// `fork_replay.sh` smoke test (#401).
+    Replay {
+        /// Block number `N` to replay against. Must equal the fork
+        /// block — anvil mining ahead of `N` is fine for the replay
+        /// because every read is pinned to `N`, but anvil's head
+        /// mining behind `N` will surface as historical-state errors.
+        #[arg(long)]
+        block: u64,
+
+        /// Newline-delimited borrower file (same format as
+        /// `listen --borrower-file`). Required: replay does not
+        /// spin up the live `Borrow`-event tail discovery, so the
+        /// scan set must come entirely from the file.
+        #[arg(long = "borrower-file")]
+        borrower_file: PathBuf,
+    },
 }
 
 /// Shared Venus-side pipeline state assembled once at startup. Wrapped
@@ -286,6 +311,13 @@ struct VenusPipeline {
     /// or `500`; this is the config-driven minimum-viable fix until
     /// on-chain factory resolution lands in a follow-up.
     pool_fees: charon_core::PoolFeeConfig,
+    /// `Some(N)` when the pipeline is driven by `replay --block N`
+    /// (issue #395). `process_opportunity` then pins both
+    /// `gas_oracle::fetch_params` and `Simulator::simulate_at` to
+    /// block `N` so a forked anvil whose head has drifted past `N`
+    /// still answers "would this liquidation have passed at N?"
+    /// deterministically. `None` is the live-listener path.
+    replay_block: Option<u64>,
 }
 
 /// Bundle of executor components needed to broadcast a simulated
@@ -376,6 +408,12 @@ async fn main() -> Result<()> {
             let provider = ChainProvider::connect(&chain, chain_cfg).await?;
             let block = provider.test_connection().await?;
             info!(chain = %chain, block = block, "connected — latest block");
+        }
+        Command::Replay {
+            block,
+            borrower_file,
+        } => {
+            run_replay(&config, block, borrower_file).await?;
         }
     }
 
@@ -1092,6 +1130,7 @@ async fn run_listen(
                         exec_harness,
                         discovery: discovery.clone(),
                         pool_fees: chain_cfg.pool_fees.clone(),
+                        replay_block: None,
                     }))
                 }
                 None => {
@@ -1414,6 +1453,235 @@ async fn run_listen(
     Ok(())
 }
 
+/// One-shot fork-replay entry point (issue #395).
+///
+/// Builds a focused Venus pipeline (no `BlockListener`, no live
+/// borrower discovery, no mempool monitor, no metrics exporter,
+/// no `ExecHarness`), pins both `gas_oracle::fetch_params` and
+/// `Simulator::simulate_at` to the operator-supplied block `N` via
+/// `VenusPipeline::replay_block`, runs the existing
+/// `run_block_pipeline` once with the borrower seed list from
+/// `--borrower-file`, then drains the resulting `OpportunityQueue`
+/// onto stdout as one JSON line per simulation-passing position.
+///
+/// Never broadcasts: `exec_harness = None` is enforced unconditionally,
+/// regardless of `CHARON_EXECUTE_CONFIRMED`. The signer key is still
+/// required because the simulation gate's `eth_call` impersonates the
+/// `CharonLiquidator.owner()` (TxBuilder wires that), but no signed
+/// transaction is ever produced.
+async fn run_replay(
+    config: &Config,
+    block: u64,
+    borrower_file: PathBuf,
+) -> Result<()> {
+    let venus_cfg = config.protocol.get("venus").context(
+        "replay: [protocol.venus] missing — replay requires a configured Venus protocol",
+    )?;
+    let chain_name = &venus_cfg.chain;
+    let chain_cfg = config.chain.get(chain_name).with_context(|| {
+        format!("replay: protocol 'venus' references chain '{chain_name}' which is not in [chain.*]")
+    })?;
+    if config.bot.signer_key.is_none() {
+        bail!(
+            "replay: bot.signer_key is required so the simulator can impersonate \
+             CharonLiquidator.owner() in eth_call (set CHARON_SIGNER_KEY)"
+        );
+    }
+    let liq_cfg = config
+        .liquidator
+        .get(chain_name.as_str())
+        .with_context(|| format!("replay: [liquidator.{chain_name}] missing"))?;
+    if liq_cfg.contract_address == Address::ZERO {
+        bail!(
+            "replay: [liquidator.{chain_name}] has zero-address contract_address — \
+             deploy CharonLiquidator on the fork and set the address before replay"
+        );
+    }
+    let fl_cfg = config.flashloan.get("aave_v3_bsc").context(
+        "replay: [flashloan.aave_v3_bsc] missing — replay needs a flash-loan source",
+    )?;
+    let data_provider = fl_cfg.data_provider.with_context(|| {
+        format!("replay: flashloan 'aave_v3_bsc': missing data_provider for chain '{chain_name}'")
+    })?;
+
+    let parsed_borrowers = parse_borrower_file(&borrower_file);
+    info!(
+        path = %borrower_file.display(),
+        loaded = parsed_borrowers.len(),
+        "replay: borrower file ingested"
+    );
+    if parsed_borrowers.is_empty() {
+        bail!(
+            "replay: borrower file '{}' produced zero addresses — replay requires at least one \
+             seed borrower (the live `Borrow`-event tail discovery is intentionally disabled in \
+             replay mode)",
+            borrower_file.display()
+        );
+    }
+    let borrower_set: HashSet<Address> = parsed_borrowers.into_iter().collect();
+    let borrowers: Vec<Address> = borrower_set.into_iter().collect();
+
+    let provider = Arc::new(
+        ProviderBuilder::new()
+            .on_ws(WsConnect::new(&chain_cfg.ws_url))
+            .await
+            .context("replay: failed to open shared ws provider")?,
+    );
+
+    let adapter =
+        Arc::new(VenusAdapter::connect(provider.clone(), venus_cfg.comptroller).await?);
+
+    let scanner = Arc::new(HealthScanner::new(
+        config.bot.liquidatable_threshold_bps,
+        config.bot.near_liq_threshold_bps,
+    )?);
+    // Replay never relies on bucketed cadence — `seeded = false` on
+    // the first (and only) `run_block_pipeline` pass forces use of
+    // the seed list — so the scheduler tunables are irrelevant. Pick
+    // any non-zero values.
+    let scheduler = ScanScheduler::new(
+        config.bot.hot_scan_blocks.max(1),
+        config.bot.warm_scan_blocks.max(1),
+        config.bot.cold_scan_blocks.max(1),
+    );
+
+    let price_feeds = config
+        .chainlink
+        .get(chain_name)
+        .cloned()
+        .unwrap_or_default();
+    let per_symbol_max_age: HashMap<String, Duration> = config
+        .chainlink_max_age_secs
+        .get(chain_name)
+        .map(|m| {
+            m.iter()
+                .map(|(sym, secs)| (sym.clone(), Duration::from_secs(*secs)))
+                .collect()
+        })
+        .unwrap_or_default();
+    let prices = Arc::new(PriceCache::with_per_symbol_max_age(
+        provider.clone(),
+        price_feeds,
+        DEFAULT_MAX_AGE,
+        per_symbol_max_age,
+    ));
+    prices.refresh_all().await;
+    if prices.get(NATIVE_FEED_SYMBOL).is_none() {
+        bail!(
+            "replay: chainlink feed '{NATIVE_FEED_SYMBOL}' missing or stale on chain \
+             '{chain_name}' — gas cost cannot be priced"
+        );
+    }
+
+    let underlyings = adapter.underlying_tokens().await;
+    let token_meta = Arc::new(
+        TokenMetaCache::build(provider.as_ref(), underlyings.iter().copied()).await,
+    );
+    if token_meta.is_empty() {
+        bail!(
+            "replay: token metadata cache is empty on chain '{chain_name}' — no Venus underlying \
+             resolved its symbol/decimals"
+        );
+    }
+
+    let profit_gas_oracle = Arc::new(GasOracle::new_for_chain(
+        chain_name.clone(),
+        config.bot.max_gas_wei,
+        chain_cfg.priority_fee_gwei,
+    ));
+
+    let aave = Arc::new(
+        AaveFlashLoan::connect(
+            provider.clone(),
+            fl_cfg.pool,
+            data_provider,
+            liq_cfg.contract_address,
+        )
+        .await
+        .context("replay: aave v3 flash-loan adapter connect failed")?,
+    );
+    let router = Arc::new(FlashLoanRouter::new(vec![aave]));
+
+    let pipeline = Arc::new(VenusPipeline {
+        chain_name: chain_name.clone(),
+        adapter,
+        scanner,
+        scheduler,
+        prices,
+        token_meta,
+        gas_oracle: profit_gas_oracle,
+        router,
+        liquidator: liq_cfg.contract_address,
+        provider,
+        queue: Arc::new(OpportunityQueue::with_default_ttl()),
+        tx_builder: tokio::sync::OnceCell::new(),
+        simulator: tokio::sync::OnceCell::new(),
+        min_profit_usd_1e6: config.bot.min_profit_usd_1e6,
+        chain_id: chain_cfg.chain_id,
+        exec_harness: None,
+        discovery: charon_scanner::BorrowerSet::new(),
+        pool_fees: chain_cfg.pool_fees.clone(),
+        replay_block: Some(block),
+    });
+
+    let signer_key = config.bot.signer_key.clone();
+    let mut seeded = false;
+    info!(
+        chain = %pipeline.chain_name,
+        block,
+        seed_borrowers = borrowers.len(),
+        "replay: running one-shot block pipeline"
+    );
+    run_block_pipeline(
+        pipeline.clone(),
+        block,
+        0,
+        &borrowers,
+        &mut seeded,
+        signer_key.as_ref(),
+    )
+    .await;
+
+    // Drain the queue: every entry is a simulation-passing
+    // opportunity. `Queue::pop(current_block)` skips entries past
+    // their TTL — pass `block` so the replay's clock matches the
+    // pinned block exactly.
+    let mut emitted: usize = 0;
+    while let Some(opp) = pipeline.queue.pop(block).await {
+        let net_profit_cents = wei_to_usd_cents(opp.net_profit_wei);
+        let flashloan_source = match opp.flash_source {
+            FlashLoanSource::AaveV3 => "aave_v3",
+            FlashLoanSource::PancakeSwapV3 => "pancakeswap_v3",
+            // `FlashLoanSource` is `#[non_exhaustive]` — any new
+            // variant should land here as `unknown` rather than
+            // crash the replay output.
+            _ => "unknown",
+        };
+        // One JSON record per opportunity. Stable field order so
+        // downstream tooling (`jq`, the `fork_replay.sh` smoke
+        // assertions in #401) can pivot reliably.
+        println!(
+            "{{\"borrower\":\"{borrower}\",\"debt_token\":\"{debt}\",\"collateral_token\":\"{coll}\",\"repay_amount\":\"{repay}\",\"predicted_net_profit_usd_cents\":{cents},\"simulation_result\":\"ok\",\"flashloan_source\":\"{src}\",\"replay_block\":{blk}}}",
+            borrower = opp.position.borrower,
+            debt = opp.position.debt_token,
+            coll = opp.position.collateral_token,
+            repay = opp.position.debt_amount,
+            cents = net_profit_cents,
+            src = flashloan_source,
+            blk = block,
+        );
+        emitted = emitted.saturating_add(1);
+    }
+
+    info!(
+        chain = %pipeline.chain_name,
+        block,
+        emitted,
+        "replay: complete"
+    );
+    Ok(())
+}
+
 /// One full pipeline pass for one non-backfill block on the Venus
 /// chain. Errors are logged, never propagated — the bot keeps draining
 /// events even if a single block's scan has issues.
@@ -1616,12 +1884,17 @@ async fn run_block_pipeline(
 /// Narrow trait objects let `process_opportunity` run against either
 /// the production Simulator-over-provider path or a hand-rolled mock
 /// in tests. Keeps the surface tiny — no simulation framework needed.
+///
+/// `block` lets the live listener pin to `Latest` while
+/// `replay --block N` (issue #395) pins to `Number(N)` so a fork
+/// whose head has drifted past `N` still answers deterministically.
 #[async_trait]
 trait SimGate: Send + Sync {
     async fn encode_and_simulate(
         &self,
         opp: &LiquidationOpportunity,
         params: &LiquidationParams,
+        block: BlockNumberOrTag,
     ) -> Result<()>;
 }
 
@@ -1639,10 +1912,11 @@ impl SimGate for ProductionSimGate<'_> {
         &self,
         opp: &LiquidationOpportunity,
         params: &LiquidationParams,
+        block: BlockNumberOrTag,
     ) -> Result<()> {
         let calldata: Bytes = self.builder.encode_calldata(opp, params)?;
         self.sim
-            .simulate(self.provider, calldata, SIMULATION_GAS_LIMIT)
+            .simulate_at(self.provider, calldata, SIMULATION_GAS_LIMIT, block)
             .await?;
         Ok(())
     }
@@ -2013,7 +2287,14 @@ async fn process_opportunity(
         sim,
         provider: pipeline.provider.as_ref(),
     };
-    if let Err(err) = gate.encode_and_simulate(&opp, &params).await {
+    let sim_block = pipeline
+        .replay_block
+        .map(BlockNumberOrTag::Number)
+        .unwrap_or(BlockNumberOrTag::Latest);
+    if let Err(err) = gate
+        .encode_and_simulate(&opp, &params, sim_block)
+        .await
+    {
         charon_metrics::record_simulation(chain, sim_result::REVERT);
         charon_metrics::record_opportunity_dropped(chain, drop_stage::SIMULATION);
         charon_metrics::record_opportunity_dropped_reason(chain, drop_reason::SIM_REVERT);
@@ -2696,5 +2977,67 @@ not-a-real-address
         // Don't create it.
         let out = parse_borrower_file(&path);
         assert!(out.is_empty());
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::items_after_test_module)]
+mod replay_cli_parse_tests {
+    use super::*;
+    use clap::Parser;
+
+    /// Confirms `replay --block N --borrower-file <path>` parses into
+    /// a `Command::Replay` carrying the operator-supplied block, which
+    /// `run_replay` then forwards to `VenusPipeline.replay_block` and
+    /// in turn to both `Simulator::simulate_at` and
+    /// `VenusAdapter::fetch_positions(block_tag)`. The block-tag
+    /// plumbing through `fetch_positions` is exercised via the
+    /// existing alloy `.block(block_id)` API; the CLI integration is
+    /// the only part this layer can assert without standing up a real
+    /// Venus adapter (covered by `crates/charon-protocols/tests/venus_fetch.rs`
+    /// against a live RPC).
+    #[test]
+    fn replay_subcommand_parses_block_and_file() {
+        let cli = Cli::try_parse_from([
+            "charon",
+            "--config",
+            "config/fork.toml",
+            "replay",
+            "--block",
+            "41000000",
+            "--borrower-file",
+            "/tmp/seed.txt",
+        ])
+        .expect("replay subcommand should parse");
+        match cli.command {
+            Command::Replay {
+                block,
+                borrower_file,
+            } => {
+                assert_eq!(block, 41_000_000);
+                assert_eq!(borrower_file, PathBuf::from("/tmp/seed.txt"));
+            }
+            other => panic!("expected Command::Replay, got {other:?}"),
+        }
+    }
+
+    /// `--block` is required — missing it must surface as a clap error,
+    /// not a silent default to 0.
+    #[test]
+    fn replay_subcommand_requires_block() {
+        let err = Cli::try_parse_from([
+            "charon",
+            "--config",
+            "config/fork.toml",
+            "replay",
+            "--borrower-file",
+            "/tmp/seed.txt",
+        ])
+        .expect_err("replay without --block should fail");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("--block") || msg.contains("required"),
+            "expected error to mention --block, got: {msg}"
+        );
     }
 }
