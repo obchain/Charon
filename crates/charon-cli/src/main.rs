@@ -2349,6 +2349,44 @@ async fn process_opportunity(
         sim,
         provider: pipeline.provider.as_ref(),
     };
+
+    // Issue #402: probe `eth_getCode` at the liquidator address before
+    // the simulation gate. If empty, label the drop
+    // `liquidator_not_deployed` and return early; otherwise fall
+    // through to `encode_and_simulate` whose Err arm now genuinely
+    // means the liquidation logic reverted (`sim_revert`).
+    match pipeline
+        .provider
+        .as_ref()
+        .get_code_at(pipeline.liquidator)
+        .block_id(alloy::eips::BlockId::latest())
+        .await
+    {
+        Ok(code) if code.is_empty() => {
+            charon_metrics::record_opportunity_dropped(chain, drop_stage::SIMULATION);
+            charon_metrics::record_opportunity_dropped_reason(
+                chain,
+                drop_reason::LIQUIDATOR_NOT_DEPLOYED,
+            );
+            warn!(
+                chain,
+                liquidator = %pipeline.liquidator,
+                borrower = %pos.borrower,
+                "liquidator contract has empty bytecode at head — opportunity dropped"
+            );
+            return Ok(false);
+        }
+        Ok(_) => {}
+        Err(err) => {
+            debug!(
+                chain,
+                liquidator = %pipeline.liquidator,
+                error = ?err,
+                "liquidator bytecode probe failed; deferring to simulator"
+            );
+        }
+    }
+
     let sim_block = pipeline
         .replay_block
         .map(BlockNumberOrTag::Number)
