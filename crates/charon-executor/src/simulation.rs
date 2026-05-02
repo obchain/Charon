@@ -1,16 +1,21 @@
 //! `eth_call` simulation gate.
 //!
-//! Run a candidate liquidation against the latest block state without
-//! sending a transaction. If the call would revert on-chain, the
-//! simulation surfaces it as [`SimulationError::Reverted`] carrying
-//! the 4-byte selector + full revert payload, and the caller drops
-//! the opportunity. If the call succeeds, the gate is open — the
-//! caller is expected to broadcast next.
+//! Run a candidate liquidation against chain state without sending a
+//! transaction. The default entry point [`Simulator::simulate`] pins
+//! to `latest`; [`Simulator::simulate_at`] lets the operator target a
+//! specific historical block (used by `replay --block N` and
+//! deterministic regression tests on a forked node whose head drifts
+//! past `N`). If the call would revert on-chain, the simulation
+//! surfaces it as [`SimulationError::Reverted`] carrying the 4-byte
+//! selector + full revert payload, and the caller drops the
+//! opportunity. If the call succeeds, the gate is open — the caller
+//! is expected to broadcast next.
 //!
 //! Zero gas spent on simulation. The hard rule, enforced by the
 //! pipeline (not by this module), is **no broadcast without a
 //! passing `simulate()`**.
 
+use alloy::eips::{BlockId, BlockNumberOrTag};
 use alloy::hex;
 use alloy::network::TransactionBuilder;
 use alloy::primitives::{Address, Bytes};
@@ -93,9 +98,10 @@ impl Simulator {
         self.liquidator
     }
 
-    /// Run an `eth_call` against the latest block. Returns `Ok` when
-    /// the call would succeed, [`SimulationError::Reverted`] with
-    /// the decoded selector + raw payload otherwise. The caller
+    /// Run an `eth_call` against the latest block. Thin wrapper over
+    /// [`Self::simulate_at`] with `BlockNumberOrTag::Latest`. Returns
+    /// `Ok` when the call would succeed, [`SimulationError::Reverted`]
+    /// with the decoded selector + raw payload otherwise. The caller
     /// drops the opportunity on `Err`.
     ///
     /// `gas_limit` must match (or exceed) what the real broadcast
@@ -112,11 +118,40 @@ impl Simulator {
         P: Provider<T>,
         T: alloy::transports::Transport + Clone,
     {
+        self.simulate_at(provider, calldata, gas_limit, BlockNumberOrTag::Latest)
+            .await
+    }
+
+    /// Run an `eth_call` against an operator-supplied block. Used by
+    /// the `replay --block N` sub-command and any deterministic
+    /// regression test that needs to ask "would this liquidation have
+    /// passed at historical block N?" without depending on the
+    /// fork's drifting head.
+    ///
+    /// Passing `BlockNumberOrTag::Latest` is semantically identical
+    /// to [`Self::simulate`]. Note that on the wire this always
+    /// serialises the block tag explicitly (`"latest"` or `"0x..."`
+    /// as the second `eth_call` argument), so the request body is
+    /// 2-element rather than 1-element; every JSON-RPC EVM node
+    /// treats both forms equivalently.
+    pub async fn simulate_at<P, T>(
+        &self,
+        provider: &P,
+        calldata: Bytes,
+        gas_limit: u64,
+        block: BlockNumberOrTag,
+    ) -> Result<(), SimulationError>
+    where
+        P: Provider<T>,
+        T: alloy::transports::Transport + Clone,
+    {
         let req = TransactionRequest::default()
             .with_from(self.sender)
             .with_to(self.liquidator)
             .with_input(calldata)
             .with_gas_limit(gas_limit);
+
+        let block_id = BlockId::Number(block);
 
         // `time_rpc` owns the latency histogram sample; the error
         // branch below classifies rejections/timeouts separately so
@@ -129,7 +164,7 @@ impl Simulator {
         let outcome = charon_metrics::time_rpc(
             charon_metrics::rpc_method::ETH_CALL,
             charon_metrics::endpoint_kind::PUBLIC,
-            async { provider.call(&req).await },
+            async { provider.call(&req).block(block_id).await },
         )
         .await;
 
@@ -234,6 +269,18 @@ fn format_revert(bytes: &Bytes) -> (String, String) {
 mod tests {
     use super::*;
     use alloy::primitives::address;
+    use alloy::providers::{ProviderBuilder, RootProvider};
+    use alloy::rpc::client::ClientBuilder;
+    use alloy::transports::BoxTransport;
+    use alloy::transports::http::Http;
+    use httpmock::prelude::*;
+
+    fn boxed_http_provider(url: &str) -> RootProvider<BoxTransport> {
+        let parsed: url::Url = url.parse().expect("valid http url");
+        let http = Http::with_client(reqwest::Client::new(), parsed);
+        let rpc_client = ClientBuilder::default().transport(http, false);
+        ProviderBuilder::new().on_client(rpc_client.boxed())
+    }
 
     #[test]
     fn simulator_holds_addresses() {
@@ -276,5 +323,80 @@ mod tests {
             Address::ZERO,
             address!("2222222222222222222222222222222222222222"),
         );
+    }
+
+    /// Verifies the JSON-RPC `eth_call` second argument carries the
+    /// pinned block tag (`"0x123abc"`), so `simulate_at(.., Number(N))`
+    /// actually reaches the node as a historical call rather than
+    /// silently downgrading to `latest`. Negative-asserts on `"latest"`
+    /// to catch a regression where both tags leak into the same body.
+    #[tokio::test]
+    async fn simulate_at_forwards_block_number() {
+        let server = MockServer::start_async().await;
+        let _m = server
+            .mock_async(|when, then| {
+                when.method(POST)
+                    .path("/")
+                    .body_contains(r#""eth_call""#)
+                    .body_contains(r#""0x123abc""#)
+                    .matches(|req| {
+                        let body = req
+                            .body
+                            .as_ref()
+                            .map(|b| String::from_utf8_lossy(b).into_owned())
+                            .unwrap_or_default();
+                        !body.contains("\"latest\"")
+                    });
+                then.status(200)
+                    .header("content-type", "application/json")
+                    .body(r#"{"jsonrpc":"2.0","id":0,"result":"0x"}"#);
+            })
+            .await;
+
+        let provider = boxed_http_provider(&server.url("/"));
+        let sim = Simulator::new(
+            address!("1111111111111111111111111111111111111111"),
+            address!("2222222222222222222222222222222222222222"),
+        );
+        sim.simulate_at(
+            &provider,
+            Bytes::from_static(&[0xde, 0xad, 0xbe, 0xef]),
+            8_000_000,
+            BlockNumberOrTag::Number(0x123abc),
+        )
+        .await
+        .expect("mock returns ok");
+    }
+
+    /// `simulate(..)` is shorthand for `simulate_at(.., Latest)`. The
+    /// JSON-RPC second arg must be `"latest"` so a misconfigured fork
+    /// can still observe scan-time queries against the head block.
+    #[tokio::test]
+    async fn simulate_defaults_to_latest_block_tag() {
+        let server = MockServer::start_async().await;
+        let _m = server
+            .mock_async(|when, then| {
+                when.method(POST)
+                    .path("/")
+                    .body_contains(r#""eth_call""#)
+                    .body_contains(r#""latest""#);
+                then.status(200)
+                    .header("content-type", "application/json")
+                    .body(r#"{"jsonrpc":"2.0","id":0,"result":"0x"}"#);
+            })
+            .await;
+
+        let provider = boxed_http_provider(&server.url("/"));
+        let sim = Simulator::new(
+            address!("1111111111111111111111111111111111111111"),
+            address!("2222222222222222222222222222222222222222"),
+        );
+        sim.simulate(
+            &provider,
+            Bytes::from_static(&[0xde, 0xad, 0xbe, 0xef]),
+            8_000_000,
+        )
+        .await
+        .expect("mock returns ok");
     }
 }
