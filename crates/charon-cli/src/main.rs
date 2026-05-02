@@ -207,7 +207,11 @@ enum Command {
         ///   * every chain with a `[liquidator.<chain>]` section has
         ///     a non-zero `contract_address`,
         ///   * every chain has either `private_rpc_url` configured or
-        ///     `allow_public_mempool = true` (dev only), and
+        ///     `allow_public_mempool = true` (dev only) — in the
+        ///     latter case the submitter falls back to
+        ///     `[chain.<chain>].http_url`. The fork profile also
+        ///     accepts an absent `private_rpc_url` and falls back to
+        ///     the loopback `http_url` (issue #396), and
         ///   * `CHARON_EXECUTE_CONFIRMED=1` in the environment.
         ///
         /// Any gate failing aborts startup — `--execute` is an
@@ -478,6 +482,42 @@ fn parse_borrower_file(path: &std::path::Path) -> Vec<Address> {
     out
 }
 
+/// Issue #398: pick the URL the `--execute` submitter connects to so
+/// that the startup gate at the top of `run_listen` and the harness
+/// build cannot disagree.
+///
+/// Precedence:
+/// 1. `private_rpc_url` when set — preferred on every profile.
+/// 2. `chain.http_url` when `allow_public_mempool = true` (dev /
+///    mainnet over public RPC; the gate already accepted the
+///    config) **or** the operator is on the fork profile (anvil
+///    loopback, issue #396).
+/// 3. Bail with a message that lists every recognised remediation.
+///
+/// The `allow_loopback` flag passed to `Submitter::connect` is the
+/// caller's responsibility — it stays tied to the fork profile only,
+/// because public-mempool fallback over a non-loopback URL must still
+/// require https/wss (no plaintext on any non-fork path).
+fn resolve_execute_submit_url(
+    private_rpc_url: Option<&SecretString>,
+    http_url: &str,
+    is_fork: bool,
+    allow_public_mempool: bool,
+    chain_name: &str,
+) -> Result<SecretString> {
+    if let Some(url) = private_rpc_url {
+        return Ok(url.clone());
+    }
+    if is_fork || allow_public_mempool {
+        return Ok(SecretString::from(http_url.to_string()));
+    }
+    bail!(
+        "--execute: chain '{chain_name}' has no private_rpc_url and no applicable fallback. \
+         Set [chain.{chain_name}].private_rpc_url, or set allow_public_mempool = true to \
+         fall back to [chain.{chain_name}].http_url, or run under the fork profile."
+    )
+}
+
 /// Long-running listener entry point. Spawns one `BlockListener` per
 /// configured chain, drains the shared `ChainEvent` channel, and exits
 /// cleanly on SIGINT or SIGTERM so the Docker `stop` → SIGTERM →
@@ -573,13 +613,23 @@ async fn run_listen(
                 );
             }
         }
-        for (chain_name, chain_cfg) in &config.chain {
-            if chain_cfg.private_rpc_url.is_none() && !chain_cfg.allow_public_mempool {
-                bail!(
-                    "--execute refuses to start: chain '{chain_name}' has no private_rpc_url \
-                     and allow_public_mempool is false — liquidation txs must not leak to the \
-                     public mempool"
-                );
+        // Mirror the contract enforced by `resolve_execute_submit_url`
+        // and `Config::validate()`: the fork profile bypasses the
+        // private-RPC requirement because its loopback gate already
+        // confines submission to the local anvil. Without this carve-out
+        // the gate here would refuse a `config/fork.toml` that the
+        // helper and validate() both accept, re-introducing the
+        // gate/harness asymmetry issue #398 fixes.
+        let is_fork_profile = config.bot.profile_tag.as_deref() == Some("fork");
+        if !is_fork_profile {
+            for (chain_name, chain_cfg) in &config.chain {
+                if chain_cfg.private_rpc_url.is_none() && !chain_cfg.allow_public_mempool {
+                    bail!(
+                        "--execute refuses to start: chain '{chain_name}' has no private_rpc_url \
+                         and allow_public_mempool is false — liquidation txs must not leak to the \
+                         public mempool"
+                    );
+                }
             }
         }
         let confirmed = std::env::var(EXECUTE_CONFIRMATION_ENV)
@@ -1067,35 +1117,25 @@ async fn run_listen(
                         let signer_address = signer.address();
                         drop(signer);
 
-                        // Under `profile_tag = "fork"` the operator's
-                        // anvil endpoint is `http://127.0.0.1:8545`,
-                        // which the submitter rejects by default. Issue
-                        // #396: allow loopback http/ws under fork only,
-                        // and fall back to the chain's `http_url` when
-                        // `private_rpc_url` is None — operators should
-                        // not have to duplicate the anvil URL into a
-                        // separate config field for the fork demo.
                         let is_fork = config.bot.profile_tag.as_deref() == Some("fork");
-                        let owned_fork_url: Option<SecretString> =
-                            if is_fork && chain_cfg.private_rpc_url.is_none() {
-                                Some(SecretString::from(chain_cfg.http_url.clone()))
-                            } else {
-                                None
-                            };
-                        let private_url = match (
+                        let allow_public_mempool = chain_cfg.allow_public_mempool;
+                        let chosen_url = resolve_execute_submit_url(
                             chain_cfg.private_rpc_url.as_ref(),
-                            owned_fork_url.as_ref(),
-                        ) {
-                            (Some(u), _) => u,
-                            (None, Some(u)) => u,
-                            (None, None) => bail!(
-                                "--execute: chain has no private_rpc_url (under the fork profile \
-                                 the bot falls back to chain.http_url; on mainnet a dedicated \
-                                 private RPC is required)"
-                            ),
-                        };
+                            &chain_cfg.http_url,
+                            is_fork,
+                            allow_public_mempool,
+                            chain_name,
+                        )?;
+                        if allow_public_mempool && !is_fork {
+                            warn!(
+                                chain = %chain_name,
+                                "allow_public_mempool = true: --execute will broadcast signed \
+                                 calldata to the chain's http_url, which is dev-only. Production \
+                                 deployments must set private_rpc_url to a private-relay endpoint."
+                            );
+                        }
                         let submitter = Submitter::connect(
-                            private_url,
+                            &chosen_url,
                             chain_cfg.private_rpc_auth.as_ref(),
                             chain_cfg.chain_id,
                             DEFAULT_SUBMIT_TIMEOUT,
@@ -3135,16 +3175,6 @@ mod replay_cli_parse_tests {
     use super::*;
     use clap::Parser;
 
-    /// Confirms `replay --block N --borrower-file <path>` parses into
-    /// a `Command::Replay` carrying the operator-supplied block, which
-    /// `run_replay` then forwards to `VenusPipeline.replay_block` and
-    /// in turn to both `Simulator::simulate_at` and
-    /// `VenusAdapter::fetch_positions(block_tag)`. The block-tag
-    /// plumbing through `fetch_positions` is exercised via the
-    /// existing alloy `.block(block_id)` API; the CLI integration is
-    /// the only part this layer can assert without standing up a real
-    /// Venus adapter (covered by `crates/charon-protocols/tests/venus_fetch.rs`
-    /// against a live RPC).
     #[test]
     fn replay_subcommand_parses_block_and_file() {
         let cli = Cli::try_parse_from([
@@ -3170,8 +3200,6 @@ mod replay_cli_parse_tests {
         }
     }
 
-    /// `--block` is required — missing it must surface as a clap error,
-    /// not a silent default to 0.
     #[test]
     fn replay_subcommand_requires_block() {
         let err = Cli::try_parse_from([
@@ -3187,6 +3215,73 @@ mod replay_cli_parse_tests {
         assert!(
             msg.contains("--block") || msg.contains("required"),
             "expected error to mention --block, got: {msg}"
+        );
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::items_after_test_module)]
+mod resolve_execute_submit_url_tests {
+    use super::*;
+
+    fn sec(s: &str) -> SecretString {
+        SecretString::from(s.to_string())
+    }
+
+    #[test]
+    fn private_rpc_url_takes_precedence() {
+        let private = sec("https://private.example/relay");
+        let chosen = resolve_execute_submit_url(
+            Some(&private),
+            "http://127.0.0.1:8545",
+            false,
+            false,
+            "bnb",
+        )
+        .expect("Some(private) is always accepted");
+        assert_eq!(chosen.expose_secret(), "https://private.example/relay");
+
+        let chosen =
+            resolve_execute_submit_url(Some(&private), "http://127.0.0.1:8545", true, true, "bnb")
+                .expect("Some(private) is always accepted");
+        assert_eq!(chosen.expose_secret(), "https://private.example/relay");
+    }
+
+    #[test]
+    fn fork_profile_falls_back_to_http_url() {
+        let chosen = resolve_execute_submit_url(None, "http://127.0.0.1:8545", true, false, "bnb")
+            .expect("fork + None should fall back");
+        assert_eq!(chosen.expose_secret(), "http://127.0.0.1:8545");
+    }
+
+    #[test]
+    fn allow_public_mempool_falls_back_to_http_url() {
+        let chosen = resolve_execute_submit_url(
+            None,
+            "https://bsc-dataseed.binance.org",
+            false,
+            true,
+            "bnb",
+        )
+        .expect("allow_public_mempool + None should fall back");
+        assert_eq!(chosen.expose_secret(), "https://bsc-dataseed.binance.org");
+    }
+
+    #[test]
+    fn no_fallback_path_bails() {
+        let err = resolve_execute_submit_url(
+            None,
+            "https://bsc-dataseed.binance.org",
+            false,
+            false,
+            "bnb",
+        )
+        .expect_err("None + non-fork + allow_public_mempool=false must bail");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("'bnb'"), "expected chain name in error: {msg}");
+        assert!(
+            msg.contains("private_rpc_url") && msg.contains("allow_public_mempool"),
+            "expected remediation hints in error: {msg}"
         );
     }
 }
