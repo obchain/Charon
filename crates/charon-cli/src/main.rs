@@ -1037,13 +1037,12 @@ async fn run_listen(
                         // not have to duplicate the anvil URL into a
                         // separate config field for the fork demo.
                         let is_fork = config.bot.profile_tag.as_deref() == Some("fork");
-                        let owned_fork_url: Option<SecretString> = if is_fork
-                            && chain_cfg.private_rpc_url.is_none()
-                        {
-                            Some(SecretString::from(chain_cfg.http_url.clone()))
-                        } else {
-                            None
-                        };
+                        let owned_fork_url: Option<SecretString> =
+                            if is_fork && chain_cfg.private_rpc_url.is_none() {
+                                Some(SecretString::from(chain_cfg.http_url.clone()))
+                            } else {
+                                None
+                            };
                         let private_url = match (
                             chain_cfg.private_rpc_url.as_ref(),
                             owned_fork_url.as_ref(),

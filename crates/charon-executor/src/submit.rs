@@ -688,7 +688,10 @@ mod tests {
             "http://[2001:db8::1]:8545",
         ] {
             let parsed = url::Url::parse(url).expect("parse");
-            assert!(!is_loopback_host(&parsed), "expected NOT loopback for {url}");
+            assert!(
+                !is_loopback_host(&parsed),
+                "expected NOT loopback for {url}"
+            );
         }
     }
 
