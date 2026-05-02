@@ -164,14 +164,26 @@ impl Submitter {
         auth: Option<&SecretString>,
         expected_chain_id: u64,
         timeout: Duration,
+        allow_loopback: bool,
     ) -> Result<Self, SubmitError> {
         let raw = url.expose_secret();
         let parsed = url::Url::parse(raw)
             .map_err(|e| SubmitError::InvalidEndpoint(format!("invalid URL: {e}")))?;
 
         let scheme = parsed.scheme();
-        if scheme != "https" && scheme != "wss" {
-            return Err(SubmitError::InsecureScheme(scheme.to_string()));
+        // The default safety invariant — plaintext schemes are
+        // refused — still holds for every mainnet-bound submitter.
+        // `allow_loopback` is a fork-only escape hatch (issue #396):
+        // it tolerates `http://127.0.0.1` / `ws://127.0.0.1` /
+        // `http://localhost` / `ws://localhost` so the bot can
+        // broadcast into a local anvil endpoint, but explicitly
+        // refuses non-loopback hosts even when the flag is set so a
+        // misconfigured fork profile cannot leak signed calldata to
+        // a public mempool.
+        match scheme {
+            "https" | "wss" => {}
+            "http" | "ws" if allow_loopback && is_loopback_host(&parsed) => {}
+            _ => return Err(SubmitError::InsecureScheme(scheme.to_string())),
         }
 
         // Host-only label for logging — hides API keys that vendors
@@ -185,16 +197,23 @@ impl Submitter {
         };
 
         let inner = match scheme {
-            "https" => {
+            "https" | "http" => {
+                // alloy's `is_local` flag controls the RPC client's
+                // poll-interval (250 ms when local, 7 s otherwise).
+                // The only path that reaches `http` here is the
+                // loopback-anvil fork escape hatch, so the shorter
+                // interval is the right knob — pending-tx and filter
+                // pollers reflect anvil's mined blocks immediately
+                // instead of every 7 s.
+                let is_local = scheme == "http";
                 let client = build_reqwest_client(auth)?;
                 let http = Http::with_client(client, parsed);
-                let is_local = false;
                 let rpc_client = ClientBuilder::default().transport(http, is_local);
                 let provider: RootProvider<BoxTransport> =
                     ProviderBuilder::new().on_client(rpc_client.boxed());
                 Inner::Http(provider)
             }
-            "wss" => {
+            "wss" | "ws" => {
                 let mut connect = WsConnect::new(raw.to_string());
                 if let Some(a) = auth {
                     connect = connect.with_auth(Authorization::bearer(a.expose_secret()));
@@ -371,6 +390,35 @@ impl Submitter {
     }
 }
 
+/// `true` only when the URL's host resolves to a syntactic loopback
+/// — IPv4 `127.0.0.0/8`, IPv6 `::1`, or the literal `localhost` —
+/// so the fork-mode escape hatch in [`Submitter::connect`] cannot
+/// silently accept a non-loopback http/ws endpoint.
+///
+/// Trust boundary: this function reads `parsed.host()`, the
+/// authority-component host that the WHATWG URL parser already
+/// canonicalised. Hostile inputs that try to confuse a hand-rolled
+/// substring matcher do not reach the matcher: e.g.
+/// `http://127.0.0.1.evil.com` parses to `Domain("127.0.0.1.evil.com")`
+/// (rejected), `http://example.com#127.0.0.1` parses to
+/// `Domain("example.com")` (rejected), and
+/// `http://user:pass@127.0.0.1@evil.com` parses to `Domain("evil.com")`
+/// (rejected). The IPv4-mapped IPv6 form `::ffff:127.0.0.1` is
+/// deliberately rejected too — `Ipv6Addr::is_loopback` returns false
+/// for it, and conflating it with `::1` would weaken the invariant.
+fn is_loopback_host(parsed: &url::Url) -> bool {
+    use std::net::IpAddr;
+    match parsed.host() {
+        Some(url::Host::Domain(d)) => d.eq_ignore_ascii_case("localhost"),
+        Some(url::Host::Ipv4(addr)) => {
+            // IpAddr::is_loopback covers 127.0.0.0/8 (RFC 1122).
+            IpAddr::V4(addr).is_loopback()
+        }
+        Some(url::Host::Ipv6(addr)) => IpAddr::V6(addr).is_loopback(),
+        None => false,
+    }
+}
+
 /// 2 s budget for the connect-time `eth_chainId` probe. More than
 /// enough for any healthy endpoint; bounded so a hung TCP cannot
 /// block startup indefinitely.
@@ -485,6 +533,7 @@ mod tests {
             None,
             56,
             DEFAULT_SUBMIT_TIMEOUT,
+            false,
         )
         .await
         .expect_err("http:// must be rejected");
@@ -498,6 +547,7 @@ mod tests {
             None,
             56,
             DEFAULT_SUBMIT_TIMEOUT,
+            false,
         )
         .await
         .expect_err("ws:// must be rejected");
@@ -506,23 +556,169 @@ mod tests {
 
     #[tokio::test]
     async fn connect_rejects_exotic_scheme() {
-        let err = Submitter::connect(&sec("ftp://example.com/"), None, 56, DEFAULT_SUBMIT_TIMEOUT)
-            .await
-            .expect_err("ftp must be rejected");
+        let err = Submitter::connect(
+            &sec("ftp://example.com/"),
+            None,
+            56,
+            DEFAULT_SUBMIT_TIMEOUT,
+            false,
+        )
+        .await
+        .expect_err("ftp must be rejected");
         assert!(matches!(err, SubmitError::InsecureScheme(ref s) if s == "ftp"));
     }
 
     #[tokio::test]
     async fn connect_rejects_missing_scheme() {
-        let err = Submitter::connect(&sec("example.com/rpc"), None, 56, DEFAULT_SUBMIT_TIMEOUT)
-            .await
-            .expect_err("missing scheme must be rejected");
+        let err = Submitter::connect(
+            &sec("example.com/rpc"),
+            None,
+            56,
+            DEFAULT_SUBMIT_TIMEOUT,
+            false,
+        )
+        .await
+        .expect_err("missing scheme must be rejected");
         // url::Url::parse either fails outright (InvalidEndpoint) or
         // returns a non-http(s) scheme (InsecureScheme). Both are safe.
         assert!(matches!(
             err,
             SubmitError::InvalidEndpoint(_) | SubmitError::InsecureScheme(_)
         ));
+    }
+
+    /// Loopback http is rejected when the fork escape hatch is off
+    /// (mainnet path) — guards against the flag silently being
+    /// promoted to default.
+    #[tokio::test]
+    async fn connect_rejects_loopback_http_when_loopback_disabled() {
+        let err = Submitter::connect(
+            &sec("http://127.0.0.1:8545"),
+            None,
+            56,
+            DEFAULT_SUBMIT_TIMEOUT,
+            false,
+        )
+        .await
+        .expect_err("loopback http must be rejected without allow_loopback");
+        assert!(matches!(err, SubmitError::InsecureScheme(ref s) if s == "http"));
+    }
+
+    /// Non-loopback http is rejected even when the fork escape hatch
+    /// is on — `allow_loopback = true` must never accept a non-loopback
+    /// host. Guards against signed calldata leaking to a public mempool
+    /// from a misconfigured fork profile.
+    #[tokio::test]
+    async fn connect_rejects_nonloopback_http_with_loopback_enabled() {
+        let err = Submitter::connect(
+            &sec("http://example.com/rpc"),
+            None,
+            56,
+            DEFAULT_SUBMIT_TIMEOUT,
+            true,
+        )
+        .await
+        .expect_err("non-loopback http must be rejected even with allow_loopback");
+        assert!(matches!(err, SubmitError::InsecureScheme(ref s) if s == "http"));
+    }
+
+    /// Non-loopback ws is rejected even when the fork escape hatch is
+    /// on — same invariant, ws transport.
+    #[tokio::test]
+    async fn connect_rejects_nonloopback_ws_with_loopback_enabled() {
+        let err = Submitter::connect(
+            &sec("ws://example.com/rpc"),
+            None,
+            56,
+            DEFAULT_SUBMIT_TIMEOUT,
+            true,
+        )
+        .await
+        .expect_err("non-loopback ws must be rejected even with allow_loopback");
+        assert!(matches!(err, SubmitError::InsecureScheme(ref s) if s == "ws"));
+    }
+
+    /// 127.0.0.1, [::1], and `localhost` all resolve as loopback.
+    #[test]
+    fn is_loopback_host_recognises_loopback_variants() {
+        for url in [
+            "http://127.0.0.1:8545",
+            "http://127.255.255.254:1234",
+            "http://[::1]:8545",
+            "http://localhost:8545",
+            "http://LOCALHOST:8545",
+            "ws://127.0.0.1:8545",
+        ] {
+            let parsed = url::Url::parse(url).expect("parse");
+            assert!(is_loopback_host(&parsed), "expected loopback for {url}");
+        }
+    }
+
+    /// Positive path: with `allow_loopback = true` and a loopback
+    /// httpmock endpoint that satisfies `eth_chainId == 56`,
+    /// `Submitter::connect` returns a live submitter. Combined with
+    /// the negative paths above, this proves the fork escape hatch
+    /// (issue #396) accepts loopback http and nothing else.
+    #[tokio::test]
+    async fn connect_accepts_loopback_http_under_fork_profile() {
+        let server = MockServer::start_async().await;
+        let _m = server
+            .mock_async(|when, then| {
+                when.method(POST).path("/");
+                then.status(200)
+                    .header("content-type", "application/json")
+                    .body(r#"{"jsonrpc":"2.0","id":0,"result":"0x38"}"#);
+            })
+            .await;
+
+        let url = sec(&server.url("/"));
+        let submitter = Submitter::connect(&url, None, 56, DEFAULT_SUBMIT_TIMEOUT, true)
+            .await
+            .expect("loopback http must be accepted under allow_loopback=true");
+        assert!(submitter.endpoint().starts_with("http://"));
+    }
+
+    /// Non-loopback hosts are correctly classified.
+    #[test]
+    fn is_loopback_host_rejects_public_hosts() {
+        for url in [
+            "http://example.com",
+            "http://1.2.3.4",
+            "http://10.0.0.1",
+            "http://[2001:db8::1]:8545",
+        ] {
+            let parsed = url::Url::parse(url).expect("parse");
+            assert!(!is_loopback_host(&parsed), "expected NOT loopback for {url}");
+        }
+    }
+
+    /// Adversarial inputs that try to smuggle "127.0.0.1" past a
+    /// substring-matcher. The WHATWG URL parser canonicalises the
+    /// authority before we look at it, so each of these resolves to
+    /// a non-loopback host and is rejected. This pins the boundary
+    /// so a future refactor that introduces a `host_str.contains(..)`
+    /// shortcut would fail this test loudly.
+    #[test]
+    fn is_loopback_host_rejects_smuggled_loopback_strings() {
+        for url in [
+            "http://127.0.0.1.evil.com",
+            "http://example.com#127.0.0.1",
+            "http://user:pass@127.0.0.1@evil.com",
+            "http://127.0.0.1@evil.com",
+            "http://localhost.evil.com",
+            "http://evil.com/?h=127.0.0.1",
+            // IPv4-mapped IPv6: deliberately not classified as
+            // loopback by std (Ipv6Addr::is_loopback).
+            "http://[::ffff:127.0.0.1]",
+            // INADDR_ANY is not loopback.
+            "http://0.0.0.0",
+        ] {
+            let parsed = url::Url::parse(url).expect("parse");
+            assert!(
+                !is_loopback_host(&parsed),
+                "smuggled-loopback URL {url} must NOT match"
+            );
+        }
     }
 
     #[test]
