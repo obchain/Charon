@@ -75,7 +75,7 @@ use charon_scanner::{
 use clap::{Parser, Subcommand};
 use futures_util::StreamExt;
 use futures_util::stream::FuturesUnordered;
-use secrecy::ExposeSecret;
+use secrecy::{ExposeSecret, SecretString};
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 use tracing_subscriber::EnvFilter;
@@ -1066,15 +1066,39 @@ async fn run_listen(
                         let signer_address = signer.address();
                         drop(signer);
 
-                        let private_url = chain_cfg.private_rpc_url.as_ref().context(
-                            "--execute: chain has no private_rpc_url (allow_public_mempool \
-                             is dev-only and is not supported by the Submitter)",
-                        )?;
+                        // Under `profile_tag = "fork"` the operator's
+                        // anvil endpoint is `http://127.0.0.1:8545`,
+                        // which the submitter rejects by default. Issue
+                        // #396: allow loopback http/ws under fork only,
+                        // and fall back to the chain's `http_url` when
+                        // `private_rpc_url` is None — operators should
+                        // not have to duplicate the anvil URL into a
+                        // separate config field for the fork demo.
+                        let is_fork = config.bot.profile_tag.as_deref() == Some("fork");
+                        let owned_fork_url: Option<SecretString> =
+                            if is_fork && chain_cfg.private_rpc_url.is_none() {
+                                Some(SecretString::from(chain_cfg.http_url.clone()))
+                            } else {
+                                None
+                            };
+                        let private_url = match (
+                            chain_cfg.private_rpc_url.as_ref(),
+                            owned_fork_url.as_ref(),
+                        ) {
+                            (Some(u), _) => u,
+                            (None, Some(u)) => u,
+                            (None, None) => bail!(
+                                "--execute: chain has no private_rpc_url (under the fork profile \
+                                 the bot falls back to chain.http_url; on mainnet a dedicated \
+                                 private RPC is required)"
+                            ),
+                        };
                         let submitter = Submitter::connect(
                             private_url,
                             chain_cfg.private_rpc_auth.as_ref(),
                             chain_cfg.chain_id,
                             DEFAULT_SUBMIT_TIMEOUT,
+                            is_fork,
                         )
                         .await
                         .context("--execute: failed to connect private-RPC submitter")?;
