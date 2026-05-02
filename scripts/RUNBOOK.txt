@@ -1,0 +1,175 @@
+CHARON FORK-REPLAY RUNBOOK
+==========================
+Goal: fork BSC at any block N -> bot finds borrowers -> liquidates ->
+profit visible on Grafana.
+
+Run each block in a separate VS Code terminal, in order.
+
+
+PREREQ (one-time)
+-----------------
+0.0  Install foundryup + foundry: anvil, cast, forge.
+       curl -L https://foundry.paradigm.xyz | bash
+       foundryup
+0.1  Install jq + curl. Standard package managers.
+0.2  Confirm rust toolchain matches rust-toolchain.toml.
+       rustup show
+0.3  cd into repo.
+       cd ~/Desktop/charon\ 2
+
+
+TERMINAL A — anvil fork at block N
+----------------------------------
+A.1  Pick block N.
+       export FORK_BLOCK=41000000
+
+A.2  Boot fork. Pinned dRPC archive upstream is the default; override
+     FORK_RPC if needed. anvil_fork.sh runs the chainlink keep-alive
+     mine loop and resets dev-0 nonce so the liquidator deploy lands
+     at the address baked into config/fork.toml.
+       ./scripts/anvil_fork.sh
+
+     Leave this terminal alive. Output should end with:
+       "fork ready ... block=41000000"
+
+
+TERMINAL B — deploy CharonLiquidator
+------------------------------------
+B.1  Sanity-check the fork responds.
+       cast block-number --rpc-url http://127.0.0.1:8545
+
+B.2  Deploy with anvil dev-0 (publicly published; never use on a live chain).
+       export DEV0_KEY=0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80
+       forge create \
+         --rpc-url http://127.0.0.1:8545 \
+         --private-key "$DEV0_KEY" \
+         --json \
+         contracts/src/CharonLiquidator.sol:CharonLiquidator
+
+     Expect deployedTo to equal the [liquidator.bnb].contract_address
+     in config/fork.toml. The startup gate (#399) refuses to start if
+     they disagree.
+
+
+TERMINAL C — Prometheus + Grafana
+---------------------------------
+C.1  Boot the observability stack.
+       docker compose -f deploy/docker-compose.yml up
+
+C.2  Open Grafana on http://localhost:3000.
+       Default login: admin / admin.
+       Dashboard: Charon liquidation bot.
+
+     Panels populate once the bot starts emitting metrics on :9091.
+
+
+TERMINAL D — bot in execute mode
+--------------------------------
+D.1  Set required env. CHARON_EXECUTE_CONFIRMED is the second
+     confirmation gate; --execute will refuse without it.
+       export CHARON_SIGNER_KEY=0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80
+       export CHARON_EXECUTE_CONFIRMED=1
+
+D.2  Run.
+       cargo run --bin charon --release -- \
+         --config config/fork.toml \
+         listen --execute
+
+     What happens:
+     1. Bot connects to anvil ws on http://127.0.0.1:8545.
+     2. eth_getCode probe asserts CharonLiquidator deployed (#399).
+     3. eth_getLogs backfill enumerates Venus Borrow events; populates
+        BorrowerSet.
+     4. Per anvil head: fetch_positions(borrowers, latest) -> bucket
+        by HF -> liquidatable list.
+     5. Per liquidatable: profit calc -> simulate -> broadcast via
+        loopback http (#396). If no code at the liquidator address at
+        head, drop with reason liquidator_not_deployed (#402).
+     6. After Submitter::submit Ok: spawn receipt-poll task (#397).
+        On confirmed receipt: emit charon_executor_inclusions_total
+        {result=confirmed} + record_realised_profit. On revert:
+        result=reverted. On 36s timeout: result=dropped.
+
+     Grafana panels that should move:
+       - Scanner — blocks per second
+       - Pipeline — block latency p50/p95
+       - Scanner — positions by bucket (red=liquidatable)
+       - Queue depth
+       - Profit (predicted, selected range)
+       - Profit (realised, selected range)
+       - Liquidations broadcast / confirmed / reverted
+       - Executor — drops by reason
+
+
+ALTERNATIVE: ONE-SHOT REPLAY (no broadcast, JSON output)
+--------------------------------------------------------
+Use when you only want the bot's decision at exact block N without
+broadcasting. Acceptance from #395.
+
+R.1  In Terminal A: ./scripts/anvil_fork.sh as above.
+R.2  In Terminal B: forge create as above.
+R.3  In a new terminal:
+       echo "0xBORROWER_ADDR_FROM_BSCSCAN" > /tmp/seed.txt
+       export CHARON_SIGNER_KEY=0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80
+       cargo run --bin charon --release -- \
+         --config config/fork.toml \
+         replay --block "$FORK_BLOCK" --borrower-file /tmp/seed.txt
+
+     Stdout: one JSON record per simulation-passing borrower with
+     predicted_net_profit_usd_cents, simulation_result, flashloan_source.
+     No broadcast, no realised profit metric.
+
+
+END-TO-END SMOKE (#401)
+-----------------------
+Single-command wrapper around the above. CI-style. Asserts
+realised-profit metric is exposed on /metrics.
+       echo "0xBORROWER_ADDR_FROM_BSCSCAN" > /tmp/seed.txt
+       ./scripts/fork_replay.sh "$FORK_BLOCK" /tmp/seed.txt
+
+
+TROUBLESHOOTING
+---------------
+T.1  "liquidator contract not deployed at <addr> on chain 'bnb'"
+       The forge create deploy address didn't match
+       [liquidator.bnb].contract_address. Causes:
+         - CHARON_SKIP_DEV0_NONCE_RESET=1 was set.
+         - Different signer used for forge create.
+         - Earlier deploy in this fork session bumped dev-0 nonce.
+       Fix: tear anvil, re-run scripts/anvil_fork.sh (resets dev-0
+       nonce), redeploy.
+
+T.2  "chainlink feed 'BNB' missing or stale"
+       Keep-alive mine loop in anvil_fork.sh is disabled or anvil
+       was forked at latest (no historical timestamp anchor). Set
+       FORK_BLOCK=<concrete N> instead of latest, or
+       FORK_MINE_INTERVAL_SECS to a small value.
+
+T.3  "missing trie node" on a historical eth_call
+       FORK_RPC pointed at a non-archive provider (PublicNode is not
+       archive). Use dRPC default or set FORK_RPC=<your-archive-url>.
+
+T.4  "--execute refuses to start: chain has no private_rpc_url..."
+       Either set [chain.bnb].private_rpc_url, or set
+       allow_public_mempool = true (dev only), or run under the fork
+       profile (config/fork.toml already does). See #398.
+
+T.5  No realised-profit panel data after a confirmed liquidation.
+       Receipt-poll task budget is 36s. If anvil's keep-alive cadence
+       is slow (FORK_MINE_INTERVAL_SECS large) the receipt may not
+       appear in time. Lower the interval to 3-5s.
+
+T.6  Borrower not picked up by auto-discovery.
+       DEFAULT_BACKFILL_BLOCKS window is finite. For old positions,
+       supply --borrower-file with the address explicitly.
+
+
+NOTES
+-----
+- replay path does NOT broadcast, by design. Use listen --execute on
+  the fork for end-to-end profit signal.
+- listen runs against anvil's head, not exact block N. With
+  --block-time 3 and the keep-alive loop, head sits at N + small drift.
+- Cold wallet sweep + broadcast realised PnL parsing from on-chain
+  LiquidationProfit event are follow-up work; v1 realised metric is
+  the queue-time predicted profit emitted on confirmation.
