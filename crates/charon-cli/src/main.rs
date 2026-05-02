@@ -3110,27 +3110,16 @@ mod resolve_execute_submit_url_tests {
         .expect("Some(private) is always accepted");
         assert_eq!(chosen.expose_secret(), "https://private.example/relay");
 
-        let chosen = resolve_execute_submit_url(
-            Some(&private),
-            "http://127.0.0.1:8545",
-            true,
-            true,
-            "bnb",
-        )
-        .expect("Some(private) is always accepted");
+        let chosen =
+            resolve_execute_submit_url(Some(&private), "http://127.0.0.1:8545", true, true, "bnb")
+                .expect("Some(private) is always accepted");
         assert_eq!(chosen.expose_secret(), "https://private.example/relay");
     }
 
     #[test]
     fn fork_profile_falls_back_to_http_url() {
-        let chosen = resolve_execute_submit_url(
-            None,
-            "http://127.0.0.1:8545",
-            true,
-            false,
-            "bnb",
-        )
-        .expect("fork + None should fall back");
+        let chosen = resolve_execute_submit_url(None, "http://127.0.0.1:8545", true, false, "bnb")
+            .expect("fork + None should fall back");
         assert_eq!(chosen.expose_secret(), "http://127.0.0.1:8545");
     }
 
@@ -3144,10 +3133,7 @@ mod resolve_execute_submit_url_tests {
             "bnb",
         )
         .expect("allow_public_mempool + None should fall back");
-        assert_eq!(
-            chosen.expose_secret(),
-            "https://bsc-dataseed.binance.org"
-        );
+        assert_eq!(chosen.expose_secret(), "https://bsc-dataseed.binance.org");
     }
 
     #[test]
