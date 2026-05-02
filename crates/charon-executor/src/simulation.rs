@@ -271,8 +271,8 @@ mod tests {
     use alloy::primitives::address;
     use alloy::providers::{ProviderBuilder, RootProvider};
     use alloy::rpc::client::ClientBuilder;
-    use alloy::transports::http::Http;
     use alloy::transports::BoxTransport;
+    use alloy::transports::http::Http;
     use httpmock::prelude::*;
 
     fn boxed_http_provider(url: &str) -> RootProvider<BoxTransport> {

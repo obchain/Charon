@@ -1469,17 +1469,15 @@ async fn run_listen(
 /// required because the simulation gate's `eth_call` impersonates the
 /// `CharonLiquidator.owner()` (TxBuilder wires that), but no signed
 /// transaction is ever produced.
-async fn run_replay(
-    config: &Config,
-    block: u64,
-    borrower_file: PathBuf,
-) -> Result<()> {
+async fn run_replay(config: &Config, block: u64, borrower_file: PathBuf) -> Result<()> {
     let venus_cfg = config.protocol.get("venus").context(
         "replay: [protocol.venus] missing — replay requires a configured Venus protocol",
     )?;
     let chain_name = &venus_cfg.chain;
     let chain_cfg = config.chain.get(chain_name).with_context(|| {
-        format!("replay: protocol 'venus' references chain '{chain_name}' which is not in [chain.*]")
+        format!(
+            "replay: protocol 'venus' references chain '{chain_name}' which is not in [chain.*]"
+        )
     })?;
     if config.bot.signer_key.is_none() {
         bail!(
@@ -1497,9 +1495,10 @@ async fn run_replay(
              deploy CharonLiquidator on the fork and set the address before replay"
         );
     }
-    let fl_cfg = config.flashloan.get("aave_v3_bsc").context(
-        "replay: [flashloan.aave_v3_bsc] missing — replay needs a flash-loan source",
-    )?;
+    let fl_cfg = config
+        .flashloan
+        .get("aave_v3_bsc")
+        .context("replay: [flashloan.aave_v3_bsc] missing — replay needs a flash-loan source")?;
     let data_provider = fl_cfg.data_provider.with_context(|| {
         format!("replay: flashloan 'aave_v3_bsc': missing data_provider for chain '{chain_name}'")
     })?;
@@ -1528,8 +1527,7 @@ async fn run_replay(
             .context("replay: failed to open shared ws provider")?,
     );
 
-    let adapter =
-        Arc::new(VenusAdapter::connect(provider.clone(), venus_cfg.comptroller).await?);
+    let adapter = Arc::new(VenusAdapter::connect(provider.clone(), venus_cfg.comptroller).await?);
 
     let scanner = Arc::new(HealthScanner::new(
         config.bot.liquidatable_threshold_bps,
@@ -1574,9 +1572,8 @@ async fn run_replay(
     }
 
     let underlyings = adapter.underlying_tokens().await;
-    let token_meta = Arc::new(
-        TokenMetaCache::build(provider.as_ref(), underlyings.iter().copied()).await,
-    );
+    let token_meta =
+        Arc::new(TokenMetaCache::build(provider.as_ref(), underlyings.iter().copied()).await);
     if token_meta.is_empty() {
         bail!(
             "replay: token metadata cache is empty on chain '{chain_name}' — no Venus underlying \
@@ -2291,10 +2288,7 @@ async fn process_opportunity(
         .replay_block
         .map(BlockNumberOrTag::Number)
         .unwrap_or(BlockNumberOrTag::Latest);
-    if let Err(err) = gate
-        .encode_and_simulate(&opp, &params, sim_block)
-        .await
-    {
+    if let Err(err) = gate.encode_and_simulate(&opp, &params, sim_block).await {
         charon_metrics::record_simulation(chain, sim_result::REVERT);
         charon_metrics::record_opportunity_dropped(chain, drop_stage::SIMULATION);
         charon_metrics::record_opportunity_dropped_reason(chain, drop_reason::SIM_REVERT);
