@@ -141,6 +141,18 @@ pub mod names {
     pub const EXECUTOR_OPPS_DROPPED_TOTAL: &str = "charon_executor_opportunities_dropped_total";
     pub const EXECUTOR_PROFIT_USD_CENTS: &str = "charon_executor_profit_usd_cents";
     pub const EXECUTOR_QUEUE_DEPTH: &str = "charon_executor_queue_depth";
+    /// Issue #397: per-broadcast outcome counter, labelled
+    /// `result` ∈ submitted | timeout | rpc_rejected | connection_lost.
+    pub const EXECUTOR_BROADCASTS_TOTAL: &str = "charon_executor_broadcasts_total";
+    /// Issue #397: post-broadcast inclusion outcome, labelled
+    /// `result` ∈ confirmed | reverted | dropped (the receipt-poll
+    /// task gives up before inclusion).
+    pub const EXECUTOR_INCLUSIONS_TOTAL: &str = "charon_executor_inclusions_total";
+    /// Issue #397: realised net-profit histogram populated after the
+    /// receipt is fetched. Distinct metric from the predicted
+    /// `EXECUTOR_PROFIT_USD_CENTS` which records at queue-time.
+    pub const EXECUTOR_REALISED_PROFIT_USD_CENTS: &str =
+        "charon_executor_realised_profit_usd_cents";
 
     /// Top-level "opportunities seen" / "opportunities dropped"
     /// counters with a `reason` label (#368). Companions to the older
@@ -258,6 +270,27 @@ pub mod drop_reason {
     /// opportunity passed every earlier gate but the broadcast
     /// stage rejected it.
     pub const SUBMIT_FAILED: &str = "submit_failed";
+}
+
+/// Issue #397: outcome label on `EXECUTOR_BROADCASTS_TOTAL`. Mirrors
+/// the `SubmitError` variants so dashboards can pivot on the same
+/// split that drives the typed error.
+pub mod broadcast_result {
+    pub const SUBMITTED: &str = "submitted";
+    pub const TIMEOUT: &str = "timeout";
+    pub const RPC_REJECTED: &str = "rpc_rejected";
+    pub const CONNECTION_LOST: &str = "connection_lost";
+}
+
+/// Issue #397: outcome label on `EXECUTOR_INCLUSIONS_TOTAL`.
+/// `confirmed` = receipt status 1; `reverted` = receipt status 0;
+/// `dropped` = the receipt-poll task timed out before any receipt
+/// landed (broadcast may still confirm on a future block, but the
+/// realised-profit signal will not emit for that opportunity).
+pub mod inclusion_result {
+    pub const CONFIRMED: &str = "confirmed";
+    pub const REVERTED: &str = "reverted";
+    pub const DROPPED: &str = "dropped";
 }
 
 /// Endpoint-kind label used on every RPC metric (issue #302).
@@ -602,6 +635,43 @@ pub fn record_opportunity_dropped_reason(chain: &str, reason: &str) {
         "reason" => reason.to_owned(),
     )
     .increment(1);
+}
+
+/// Issue #397: record one broadcast attempt outcome. `result` should
+/// be one of [`broadcast_result::SUBMITTED`],
+/// [`broadcast_result::TIMEOUT`], [`broadcast_result::RPC_REJECTED`],
+/// [`broadcast_result::CONNECTION_LOST`].
+pub fn record_broadcast(chain: &str, result: &str) {
+    counter!(
+        names::EXECUTOR_BROADCASTS_TOTAL,
+        "chain" => chain.to_owned(),
+        "result" => result.to_owned(),
+    )
+    .increment(1);
+}
+
+/// Issue #397: record one inclusion outcome (post-broadcast).
+/// `result` should be one of [`inclusion_result::CONFIRMED`],
+/// [`inclusion_result::REVERTED`], [`inclusion_result::DROPPED`].
+pub fn record_inclusion(chain: &str, result: &str) {
+    counter!(
+        names::EXECUTOR_INCLUSIONS_TOTAL,
+        "chain" => chain.to_owned(),
+        "result" => result.to_owned(),
+    )
+    .increment(1);
+}
+
+/// Issue #397: record realised net profit from a confirmed receipt.
+/// Distinct histogram from the predicted [`record_opportunity_queued`]
+/// metric so Grafana can split predicted vs realised on the same
+/// dashboard.
+pub fn record_realised_profit(chain: &str, profit_usd_cents: i64) {
+    histogram!(
+        names::EXECUTOR_REALISED_PROFIT_USD_CENTS,
+        "chain" => chain.to_owned(),
+    )
+    .record(profit_usd_cents as f64);
 }
 
 /// Update the queue-depth gauge.
@@ -966,6 +1036,32 @@ mod tests {
         assert_eq!(drop_reason::SUBMIT_FAILED, "submit_failed");
     }
 
+    /// Issue #397: pin the public surface of the broadcast / inclusion
+    /// / realised-profit metrics. Dashboards and alerts will hard-code
+    /// these strings; renaming a constant must trip this test.
+    #[test]
+    fn broadcast_inclusion_metric_names_are_stable() {
+        assert_eq!(
+            names::EXECUTOR_BROADCASTS_TOTAL,
+            "charon_executor_broadcasts_total"
+        );
+        assert_eq!(
+            names::EXECUTOR_INCLUSIONS_TOTAL,
+            "charon_executor_inclusions_total"
+        );
+        assert_eq!(
+            names::EXECUTOR_REALISED_PROFIT_USD_CENTS,
+            "charon_executor_realised_profit_usd_cents"
+        );
+        assert_eq!(broadcast_result::SUBMITTED, "submitted");
+        assert_eq!(broadcast_result::TIMEOUT, "timeout");
+        assert_eq!(broadcast_result::RPC_REJECTED, "rpc_rejected");
+        assert_eq!(broadcast_result::CONNECTION_LOST, "connection_lost");
+        assert_eq!(inclusion_result::CONFIRMED, "confirmed");
+        assert_eq!(inclusion_result::REVERTED, "reverted");
+        assert_eq!(inclusion_result::DROPPED, "dropped");
+    }
+
     /// Typed helpers must not panic when called — this exercises every
     /// label combination that call sites use so metric-name typos
     /// surface at `cargo test` time, not in prod.
@@ -992,6 +1088,16 @@ mod tests {
         record_opportunity_dropped_reason("bnb", drop_reason::GAS_CEILING);
         record_opportunity_dropped_reason("bnb", drop_reason::TTL_EXPIRED);
         record_opportunity_dropped_reason("bnb", drop_reason::SUBMIT_FAILED);
+        // Issue #397: broadcast / inclusion / realised-profit
+        record_broadcast("bnb", broadcast_result::SUBMITTED);
+        record_broadcast("bnb", broadcast_result::TIMEOUT);
+        record_broadcast("bnb", broadcast_result::RPC_REJECTED);
+        record_broadcast("bnb", broadcast_result::CONNECTION_LOST);
+        record_inclusion("bnb", inclusion_result::CONFIRMED);
+        record_inclusion("bnb", inclusion_result::REVERTED);
+        record_inclusion("bnb", inclusion_result::DROPPED);
+        record_realised_profit("bnb", 1_234);
+        record_realised_profit("bnb", -45);
         set_queue_depth(3);
         set_build_info("0.1.0", "deadbeef");
 

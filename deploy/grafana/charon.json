@@ -229,8 +229,94 @@
           "refId": "A"
         }
       ],
-      "title": "Profit (selected range)",
+      "title": "Profit (predicted, selected range)",
       "type": "stat"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "description": "Issue #397: realised net profit summed over the selected range. Source histogram is recorded *after* the broadcast tx confirms (status == 1). Distinct from the predicted-profit panel which records at queue-time. Empty when no broadcasts have confirmed in the range.",
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "thresholds" },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null }
+            ]
+          },
+          "unit": "currencyUSD"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 6, "x": 12, "y": 32 },
+      "id": 13,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "textMode": "auto"
+      },
+      "pluginVersion": "10.4.0",
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "editorMode": "code",
+          "expr": "sum(increase(charon_executor_realised_profit_usd_cents_sum{instance=~\"$instance\",chain=~\"$chain\",job=~\"$job\"}[$__range])) / 100",
+          "legendFormat": "realised profit (selected range)",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Profit (realised, selected range)",
+      "type": "stat"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "description": "Issue #397: per-minute broadcast and inclusion outcomes. `submitted` and `*_failed` come from the Submitter outcome; `confirmed` / `reverted` / `dropped` come from the receipt-poll task that runs for ~36 s after each broadcast. A widening gap between submitted and confirmed signals a stuck or replaced tx pipeline.",
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": {
+            "axisLabel": "tx / min",
+            "drawStyle": "bars",
+            "fillOpacity": 80,
+            "lineWidth": 1,
+            "showPoints": "never",
+            "stacking": { "group": "A", "mode": "none" }
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 32 },
+      "id": 14,
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true },
+        "tooltip": { "mode": "multi", "sort": "none" }
+      },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "editorMode": "code",
+          "expr": "sum by (result) (rate(charon_executor_broadcasts_total{instance=~\"$instance\",chain=~\"$chain\",job=~\"$job\"}[$__rate_interval])) * 60",
+          "legendFormat": "broadcast {{result}}",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "editorMode": "code",
+          "expr": "sum by (result) (rate(charon_executor_inclusions_total{instance=~\"$instance\",chain=~\"$chain\",job=~\"$job\"}[$__rate_interval])) * 60",
+          "legendFormat": "inclusion {{result}}",
+          "range": true,
+          "refId": "B"
+        }
+      ],
+      "title": "Liquidations broadcast / confirmed / reverted",
+      "type": "timeseries"
     },
     {
       "datasource": { "type": "prometheus", "uid": "${datasource}" },

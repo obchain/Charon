@@ -34,4 +34,7 @@ pub use gas::{
 };
 pub use nonce::{NonceError, NonceManager};
 pub use simulation::{SimulationError, Simulator};
-pub use submit::{DEFAULT_SUBMIT_TIMEOUT, SubmitError, Submitter};
+pub use submit::{
+    DEFAULT_SUBMIT_TIMEOUT, MAX_REPLACEMENTS_PER_NONCE, REPLACE_AFTER_BLOCKS, REPLACEMENT_BUMP_PCT,
+    SubmitError, Submitter,
+};
