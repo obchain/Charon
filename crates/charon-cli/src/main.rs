@@ -482,22 +482,6 @@ fn parse_borrower_file(path: &std::path::Path) -> Vec<Address> {
     out
 }
 
-/// Issue #398: pick the URL the `--execute` submitter connects to so
-/// that the startup gate at the top of `run_listen` and the harness
-/// build cannot disagree.
-///
-/// Precedence:
-/// 1. `private_rpc_url` when set — preferred on every profile.
-/// 2. `chain.http_url` when `allow_public_mempool = true` (dev /
-///    mainnet over public RPC; the gate already accepted the
-///    config) **or** the operator is on the fork profile (anvil
-///    loopback, issue #396).
-/// 3. Bail with a message that lists every recognised remediation.
-///
-/// The `allow_loopback` flag passed to `Submitter::connect` is the
-/// caller's responsibility — it stays tied to the fork profile only,
-/// because public-mempool fallback over a non-loopback URL must still
-/// require https/wss (no plaintext on any non-fork path).
 fn resolve_execute_submit_url(
     private_rpc_url: Option<&SecretString>,
     http_url: &str,
@@ -516,6 +500,47 @@ fn resolve_execute_submit_url(
          Set [chain.{chain_name}].private_rpc_url, or set allow_public_mempool = true to \
          fall back to [chain.{chain_name}].http_url, or run under the fork profile."
     )
+}
+
+/// Issue #399: cross-check at startup that the address configured
+/// under `[liquidator.<chain>].contract_address` actually has bytecode
+/// on the connected chain.
+async fn verify_liquidator_deployed<P, T>(
+    provider: &P,
+    liquidator: Address,
+    chain_name: &str,
+    profile_tag: Option<&str>,
+) -> Result<()>
+where
+    P: Provider<T>,
+    T: alloy::transports::Transport + Clone,
+{
+    let code: Bytes = provider
+        .get_code_at(liquidator)
+        .block_id(alloy::eips::BlockId::latest())
+        .await
+        .with_context(|| {
+            format!("eth_getCode failed for liquidator {liquidator} on chain '{chain_name}'")
+        })?;
+    if code.is_empty() {
+        let hint = if profile_tag == Some("fork") {
+            "re-run `forge create CharonLiquidator` against the fork with the configured \
+             signer (and confirm the dev-0 nonce was reset), or update \
+             [liquidator.<chain>].contract_address to match the actual CREATE address"
+        } else {
+            "verify [liquidator.<chain>].contract_address matches the deploy receipt for \
+             this chain — do not redeploy on mainnet without confirming the configured \
+             address is wrong"
+        };
+        bail!("liquidator contract not deployed at {liquidator} on chain '{chain_name}': {hint}");
+    }
+    info!(
+        chain = %chain_name,
+        liquidator = %liquidator,
+        bytecode_bytes = code.len(),
+        "liquidator bytecode check passed"
+    );
+    Ok(())
 }
 
 /// Long-running listener entry point. Spawns one `BlockListener` per
@@ -1046,6 +1071,24 @@ async fn run_listen(
                             .context("aave v3: pool address mismatch — refusing to start")?;
                         }
                     }
+                    // Issue #399: refuse to start when the configured
+                    // liquidator address has empty bytecode on the
+                    // connected chain. Otherwise every simulation
+                    // returns a generic Reverted (no code at address)
+                    // and the operator has no signal that the deploy
+                    // and the config disagree — the typical fork-mode
+                    // foot-gun where dev-0 nonce reset was skipped or
+                    // a different signer deployed at a different
+                    // CREATE address.
+                    verify_liquidator_deployed(
+                        provider.as_ref(),
+                        liq_cfg.contract_address,
+                        chain_name.as_str(),
+                        config.bot.profile_tag.as_deref(),
+                    )
+                    .await
+                    .context("liquidator bytecode check failed — refusing to start")?;
+
                     let aave = Arc::new(
                         AaveFlashLoan::connect(
                             provider.clone(),
@@ -3283,5 +3326,140 @@ mod resolve_execute_submit_url_tests {
             msg.contains("private_rpc_url") && msg.contains("allow_public_mempool"),
             "expected remediation hints in error: {msg}"
         );
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::items_after_test_module)]
+mod verify_liquidator_deployed_tests {
+    use super::*;
+    use alloy::primitives::address;
+    use alloy::providers::{ProviderBuilder, RootProvider};
+    use alloy::rpc::client::ClientBuilder;
+    use alloy::transports::BoxTransport;
+    use alloy::transports::http::Http;
+    use httpmock::prelude::*;
+
+    fn boxed_http_provider(url: &str) -> RootProvider<BoxTransport> {
+        let parsed: url::Url = url.parse().expect("valid http url");
+        let http = Http::with_client(reqwest::Client::new(), parsed);
+        let rpc_client = ClientBuilder::default().transport(http, true);
+        ProviderBuilder::new().on_client(rpc_client.boxed())
+    }
+
+    /// Empty bytecode (`"0x"`) on a fork profile ⇒ bail with a
+    /// remediation message that names the address and chain and
+    /// directs the operator at `forge create`. Guards against the
+    /// typical fork foot-gun where dev-0 nonce reset was skipped and
+    /// the deploy landed at a different CREATE address than
+    /// `config/fork.toml` has baked in.
+    #[tokio::test]
+    async fn empty_bytecode_on_fork_aborts_with_forge_hint() {
+        let server = MockServer::start_async().await;
+        let _m = server
+            .mock_async(|when, then| {
+                when.method(POST)
+                    .path("/")
+                    .body_contains(r#""eth_getCode""#);
+                then.status(200)
+                    .header("content-type", "application/json")
+                    .body(r#"{"jsonrpc":"2.0","id":0,"result":"0x"}"#);
+            })
+            .await;
+
+        let provider = boxed_http_provider(&server.url("/"));
+        let liq = address!("5FbDB2315678afecb367f032d93F642f64180aa3");
+        let err = verify_liquidator_deployed(&provider, liq, "bnb", Some("fork"))
+            .await
+            .expect_err("empty bytecode must bail");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("not deployed"), "expected reason in: {msg}");
+        assert!(msg.contains(&liq.to_string()), "expected address in: {msg}");
+        assert!(msg.contains("bnb"), "expected chain in: {msg}");
+        assert!(
+            msg.contains("forge create"),
+            "fork hint must mention forge create, got: {msg}"
+        );
+    }
+
+    /// Empty bytecode on a non-fork profile (mainnet/testnet) ⇒ bail
+    /// with a remediation message that does NOT recommend redeploying.
+    /// On mainnet a missing contract is almost always a config typo;
+    /// telling the operator to "re-run forge create" against mainnet
+    /// would be actively wrong.
+    #[tokio::test]
+    async fn empty_bytecode_on_mainnet_uses_config_hint_not_redeploy() {
+        let server = MockServer::start_async().await;
+        let _m = server
+            .mock_async(|when, then| {
+                when.method(POST)
+                    .path("/")
+                    .body_contains(r#""eth_getCode""#);
+                then.status(200)
+                    .header("content-type", "application/json")
+                    .body(r#"{"jsonrpc":"2.0","id":0,"result":"0x"}"#);
+            })
+            .await;
+
+        let provider = boxed_http_provider(&server.url("/"));
+        let liq = address!("5FbDB2315678afecb367f032d93F642f64180aa3");
+        let err = verify_liquidator_deployed(&provider, liq, "bnb", None)
+            .await
+            .expect_err("empty bytecode must bail");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("not deployed"), "expected reason in: {msg}");
+        assert!(
+            !msg.contains("forge create"),
+            "mainnet hint must not point at forge create, got: {msg}"
+        );
+        assert!(
+            msg.contains("verify") && msg.contains("deploy receipt"),
+            "mainnet hint must point at the deploy receipt, got: {msg}"
+        );
+    }
+
+    /// Non-empty bytecode at the configured address ⇒ Ok.
+    #[tokio::test]
+    async fn non_empty_bytecode_passes() {
+        let server = MockServer::start_async().await;
+        let _m = server
+            .mock_async(|when, then| {
+                when.method(POST)
+                    .path("/")
+                    .body_contains(r#""eth_getCode""#);
+                then.status(200)
+                    .header("content-type", "application/json")
+                    .body(r#"{"jsonrpc":"2.0","id":0,"result":"0x6080604052"}"#);
+            })
+            .await;
+
+        let provider = boxed_http_provider(&server.url("/"));
+        let liq = address!("5FbDB2315678afecb367f032d93F642f64180aa3");
+        verify_liquidator_deployed(&provider, liq, "bnb", Some("fork"))
+            .await
+            .expect("non-empty bytecode must pass");
+    }
+
+    /// Transport / RPC failure ⇒ surface with the same remediation
+    /// hook as a misconfigured deploy address. The startup gate must
+    /// not silently pass on an upstream blip — better to refuse to
+    /// start and let the operator retry than to run the bot blind.
+    #[tokio::test]
+    async fn rpc_error_aborts() {
+        let server = MockServer::start_async().await;
+        let _m = server
+            .mock_async(|when, then| {
+                when.method(POST).path("/");
+                then.status(500).body("upstream error");
+            })
+            .await;
+
+        let provider = boxed_http_provider(&server.url("/"));
+        let liq = address!("5FbDB2315678afecb367f032d93F642f64180aa3");
+        let err = verify_liquidator_deployed(&provider, liq, "bnb", None)
+            .await
+            .expect_err("rpc error must bail");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("eth_getCode"), "expected RPC label in: {msg}");
     }
 }

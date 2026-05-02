@@ -28,5 +28,10 @@ async-trait = { workspace = true }
 futures-util = { workspace = true }
 metrics = { workspace = true }
 
+[dev-dependencies]
+httpmock = "0.7"
+reqwest = { workspace = true }
+url = { workspace = true }
+
 [lints]
 workspace = true

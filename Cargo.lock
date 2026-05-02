@@ -1377,11 +1377,14 @@ dependencies = [
  "clap",
  "dotenvy",
  "futures-util",
+ "httpmock",
  "metrics",
+ "reqwest",
  "secrecy",
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "url",
 ]
 
 [[package]]
