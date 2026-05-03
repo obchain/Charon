@@ -294,8 +294,18 @@ done
 # so the deterministic-CREATE claim in README §Step 7 holds for any
 # upstream the operator picks.
 readonly DEV0_ADDRESS="0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266"
+# Deterministic CREATE slot that `forge create` from dev-0 nonce-0
+# produces (`keccak256(rlp([dev0, 0]))[12:]`). BSC mainnet has
+# unrelated bytecode at this slot today, so even after dev-0 nonce
+# is reset to 0 the first `forge create` reverts with EIP-684
+# `CreateCollision` — the slot is non-empty on the fork because anvil
+# inherits state from upstream. Wipe code+nonce at the slot before the
+# operator runs `forge create`. The slot is never used by anything
+# Charon depends on, so the wipe is a safe no-op for everything except
+# the demo contract we are about to deploy in its place. See #412.
+readonly LIQUIDATOR_ADDRESS="0x5FbDB2315678afecb367f032d93F642f64180aa3"
 if [[ "${CHARON_SKIP_DEV0_NONCE_RESET:-0}" == "1" ]]; then
-    echo "anvil: CHARON_SKIP_DEV0_NONCE_RESET=1 — leaving dev-0 nonce at upstream value; deterministic CharonLiquidator address is NOT guaranteed"
+    echo "anvil: CHARON_SKIP_DEV0_NONCE_RESET=1 — leaving dev-0 nonce and target slot at upstream values; deterministic CharonLiquidator address is NOT guaranteed and forge create may revert with CreateCollision"
 else
     # Quote the nonce as a JSON string so `cast rpc` parses it strictly
     # rather than relying on its bare-token tolerance. Capture stderr
@@ -305,9 +315,23 @@ else
     # silence stdout — we only want the error text.
     set_nonce_err="$(cast rpc --rpc-url "$LOCAL_RPC" anvil_setNonce "$DEV0_ADDRESS" '"0x0"' 2>&1 >/dev/null)" && set_nonce_ok=1 || set_nonce_ok=0
     if [[ "$set_nonce_ok" == "1" ]]; then
-        echo "anvil: dev-0 nonce reset to 0 — first forge create will land at deterministic 0x5FbDB2315678afecb367f032d93F642f64180aa3"
+        echo "anvil: dev-0 nonce reset to 0"
     else
         echo "anvil: WARNING — anvil_setNonce on dev-0 failed (${set_nonce_err}); first forge create may land at a non-deterministic address (update [liquidator.bnb].contract_address in config/fork.toml if so)" >&2
+    fi
+
+    # EIP-684 CREATE collision check: a CREATE reverts unless the
+    # target address has both nonce == 0 AND empty code. anvil_setCode
+    # <addr> 0x clears the bytecode (codeHash → keccak256("")).
+    # anvil_setNonce <addr> 0x0 clears the contract-account nonce.
+    # Both must succeed; partial success leaves a confusing collision
+    # later when forge create runs.
+    wipe_code_err="$(cast rpc --rpc-url "$LOCAL_RPC" anvil_setCode "$LIQUIDATOR_ADDRESS" '0x' 2>&1 >/dev/null)" && wipe_code_ok=1 || wipe_code_ok=0
+    wipe_nonce_err="$(cast rpc --rpc-url "$LOCAL_RPC" anvil_setNonce "$LIQUIDATOR_ADDRESS" '"0x0"' 2>&1 >/dev/null)" && wipe_nonce_ok=1 || wipe_nonce_ok=0
+    if [[ "$wipe_code_ok" == "1" && "$wipe_nonce_ok" == "1" ]]; then
+        echo "anvil: target deploy slot wiped at ${LIQUIDATOR_ADDRESS} — first forge create will land here cleanly (code+nonce zeroed)"
+    else
+        echo "anvil: WARNING — wipe at ${LIQUIDATOR_ADDRESS} failed (code=${wipe_code_err:-ok} nonce=${wipe_nonce_err:-ok}); forge create may revert with CreateCollision against unrelated mainnet bytecode at this slot" >&2
     fi
 fi
 
