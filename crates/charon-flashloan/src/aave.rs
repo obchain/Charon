@@ -293,14 +293,13 @@ impl AaveFlashLoan {
         // source. We only need the leading `configuration` word for
         // the paused/frozen bitmap check anyway, so issue the call
         // ourselves and lift the first 32 bytes. See #419.
-        let configuration =
-            read_uint256_first_word(self.provider.as_ref(), self.data_provider, {
-                IAaveV3DataProvider::getReserveDataCall { asset }
-                    .abi_encode()
-                    .into()
-            })
-            .await
-            .map_err(|e| FlashLoanError::rpc(format!("getReserveData: {e}")))?;
+        let configuration = read_uint256_first_word(self.provider.as_ref(), self.data_provider, {
+            IAaveV3DataProvider::getReserveDataCall { asset }
+                .abi_encode()
+                .into()
+        })
+        .await
+        .map_err(|e| FlashLoanError::rpc(format!("getReserveData: {e}")))?;
         if bitmap_says_paused(configuration) || bitmap_says_frozen(configuration) {
             return Err(FlashLoanError::ReservePaused { asset });
         }
@@ -324,10 +323,7 @@ async fn read_uint256_first_word(
     let tx = TransactionRequest::default()
         .to(target)
         .input(calldata.into());
-    let bytes = provider
-        .call(&tx)
-        .await
-        .context("eth_call failed")?;
+    let bytes = provider.call(&tx).await.context("eth_call failed")?;
     if bytes.len() < 32 {
         anyhow::bail!(
             "expected at least 32 bytes from tuple return, got {} (target={})",
