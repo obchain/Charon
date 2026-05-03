@@ -115,16 +115,34 @@ ETH  = "0x9ef1B8c0E4F7dc8bF5719Ea496883DC6401d5b2e"
 USDT = "0xB97Ad0E74fa7d920791E90258A6E2085088b4320"
 USDC = "0x51597f405303C4377E36123cBc172b13269EA163"
 
-# Per-feed staleness windows (seconds). Stable feeds (USDT/USDC) on BSC
-# are deviation-triggered — heartbeat ~24h. The global 600s default
-# routinely flags them stale and silently drops every position priced
-# against them. Match `default.toml`. See #331.
+# Per-feed staleness windows (seconds) — DEMO PROFILE.
+#
+# `default.toml` uses heartbeat-realistic windows (3600s for volatile
+# feeds, 86400s for deviation-triggered stables) because production
+# must catch a genuinely dead feed. On a pinned anvil fork every
+# feed reads stale relative to anvil's wall-clock: the fork's
+# `block.timestamp` is set to the pin block's mainnet timestamp, the
+# local clock advances at `--block-time 3` plus the keep-alive nudge,
+# and Chainlink rounds inside the forked state reflect whatever was
+# on chain at the pin block (often hours or days behind real time,
+# especially when the pin is older than a day or when an aggregator
+# rotation gap straddles the pin).
+#
+# A demo operator does not need to detect a dead feed — they need
+# the bot to start. Widen every window to 30 days so any pinned
+# block under the documented Notion cheat sheet completes the
+# preflight without operator-facing config gymnastics. The genuine
+# production guarantee lives in `default.toml`. See #414.
+#
+# Operators who want a tighter window for a soak test can re-narrow
+# any single symbol here, or leave this file alone and override the
+# default globally with `CHARON_PRICE_MAX_AGE_SECS=<secs>` (#413).
 [chainlink_max_age_secs.bnb]
-USDT = 86400
-USDC = 86400
-BNB  = 3600
-BTCB = 3600
-ETH  = 3600
+USDT = 2592000
+USDC = 2592000
+BNB  = 2592000
+BTCB = 2592000
+ETH  = 2592000
 
 [liquidator.bnb]
 chain = "bnb"
