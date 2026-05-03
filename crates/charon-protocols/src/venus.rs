@@ -40,6 +40,49 @@ fn one_e18() -> U256 {
     U256::from(10u64).pow(U256::from(18u64))
 }
 
+/// Read a single `uint256` view value from a target contract bypassing
+/// alloy's strict return-tuple decoder.
+///
+/// Several Venus vTokens on BSC are deployed behind upgradeable proxies
+/// that return 96 bytes (3 32-byte words) where the ABI declares a
+/// single `uint256`. The leading word carries the value; the trailing
+/// 64 bytes are zero padding (likely a Diamond fallback or proxy
+/// quirk). `alloy`'s `sol!`-generated decoder is strict — surplus
+/// bytes trigger `SolTypes(ReserveMismatch)` and the entire scan path
+/// drops the borrower with `tracked=N returned=0`, so the bot never
+/// fires on genuinely liquidatable positions on BSC mainnet forks.
+///
+/// Workaround: issue the same `eth_call` ourselves, lift only the
+/// first 32 bytes, decode as `U256`. `cast call ... '(uint256)'`
+/// applies the same lenient policy and recovers the correct value.
+/// See #418.
+async fn read_uint256_view(
+    provider: &RootProvider<PubSubFrontend>,
+    target: Address,
+    calldata: alloy::primitives::Bytes,
+    block_id: BlockId,
+) -> Result<U256> {
+    use alloy::rpc::types::TransactionRequest;
+    let tx = TransactionRequest::default()
+        .to(target)
+        .input(calldata.into());
+    let bytes = provider
+        .call(&tx)
+        .block(block_id)
+        .await
+        .context("eth_call failed")?;
+    if bytes.len() < 32 {
+        anyhow::bail!(
+            "expected at least 32 bytes from uint256 view, got {} (target={})",
+            bytes.len(),
+            target
+        );
+    }
+    let mut buf = [0u8; 32];
+    buf.copy_from_slice(&bytes[..32]);
+    Ok(U256::from_be_bytes(buf))
+}
+
 /// Map any internal `anyhow::Error` produced inside helper paths to the
 /// `LendingProtocolError::Rpc` variant. RPC failures dominate this adapter's
 /// error surface; callers that need finer distinctions should construct
@@ -333,30 +376,52 @@ impl VenusAdapter {
                 warn!(%vtoken, "vToken not in snapshot — skipping (stale snapshot?)");
                 continue;
             };
-            let vt = abi::IVToken::new(*vtoken, self.provider.clone());
-
-            let borrow = match vt
-                .borrowBalanceStored(borrower)
-                .block(block_id)
-                .call()
-                .await
+            // Bypass alloy's strict tuple decoder for these uint256 view
+            // calls — Venus vTokens on BSC return 96 bytes where the ABI
+            // declares 32, which alloy rejects with `ReserveMismatch`.
+            // See `read_uint256_view` and #418.
+            let borrow = match read_uint256_view(
+                self.provider.as_ref(),
+                *vtoken,
+                abi::IVToken::borrowBalanceStoredCall { account: borrower }
+                    .abi_encode()
+                    .into(),
+                block_id,
+            )
+            .await
             {
-                Ok(r) => r._0,
+                Ok(v) => v,
                 Err(err) => {
                     warn!(%vtoken, %borrower, ?err, "borrowBalanceStored failed");
                     continue;
                 }
             };
             // View-only underlying balance: vToken shares × exchangeRate / 1e18.
-            let v_balance = match vt.balanceOf(borrower).block(block_id).call().await {
-                Ok(r) => r._0,
+            let v_balance = match read_uint256_view(
+                self.provider.as_ref(),
+                *vtoken,
+                abi::IVToken::balanceOfCall { owner: borrower }
+                    .abi_encode()
+                    .into(),
+                block_id,
+            )
+            .await
+            {
+                Ok(v) => v,
                 Err(err) => {
                     warn!(%vtoken, %borrower, ?err, "balanceOf failed");
                     continue;
                 }
             };
-            let exchange_rate = match vt.exchangeRateStored().block(block_id).call().await {
-                Ok(r) => r._0,
+            let exchange_rate = match read_uint256_view(
+                self.provider.as_ref(),
+                *vtoken,
+                abi::IVToken::exchangeRateStoredCall {}.abi_encode().into(),
+                block_id,
+            )
+            .await
+            {
+                Ok(v) => v,
                 Err(err) => {
                     warn!(%vtoken, ?err, "exchangeRateStored failed");
                     continue;
