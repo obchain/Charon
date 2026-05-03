@@ -3382,9 +3382,11 @@ mod replay_cli_parse_tests {
             Command::Replay {
                 block,
                 borrower_file,
+                hold_secs,
             } => {
                 assert_eq!(block, 41_000_000);
                 assert_eq!(borrower_file, PathBuf::from("/tmp/seed.txt"));
+                assert_eq!(hold_secs, 0);
             }
             other => panic!("expected Command::Replay, got {other:?}"),
         }
