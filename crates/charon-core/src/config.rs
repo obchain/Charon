@@ -135,10 +135,13 @@ pub struct Config {
     /// Per-feed Chainlink staleness window overrides, keyed by chain
     /// then asset symbol (`chainlink_max_age_secs.bnb.USDT = 86400`).
     /// Stable feeds (USDC/USDT/FDUSD on BSC) update on deviation, not
-    /// heartbeat, so the global 600s default routinely flags them as
-    /// stale even though the price has not moved. Missing entry =
-    /// fall back to the global default (`DEFAULT_MAX_AGE` / the
-    /// `CHARON_PRICE_MAX_AGE_SECS` env override). See #331.
+    /// heartbeat, so the global default routinely flags them as stale
+    /// even though the price has not moved. Missing entry = fall back
+    /// to the global default, which is itself anchored at
+    /// `DEFAULT_MAX_AGE` and may be re-anchored at runtime by the
+    /// `CHARON_PRICE_MAX_AGE_SECS` env override (see #331, #413).
+    /// Per-symbol overrides here always win — the env var only moves
+    /// the floor for symbols that have no per-symbol entry.
     ///
     /// Top-level section (not nested under `[chainlink.<chain>]`)
     /// because the existing `chainlink.<chain>` table is symbol-keyed
