@@ -482,6 +482,47 @@ fn parse_borrower_file(path: &std::path::Path) -> Vec<Address> {
     out
 }
 
+/// Resolve the global Chainlink staleness window from
+/// `CHARON_PRICE_MAX_AGE_SECS`, falling back to the scanner's
+/// `DEFAULT_MAX_AGE` on missing or unparseable values.
+///
+/// Per-symbol overrides in `[chainlink_max_age_secs.<chain>]` always
+/// win over this global default — they are merged on top in the
+/// `PriceCache::with_per_symbol_max_age` call sites. The env var
+/// only re-anchors the floor for symbols that have no per-symbol
+/// override, which is the only case operators actually need on a
+/// fork demo where every feed reads stale relative to wall-clock.
+///
+/// Logs a one-shot info on success, warn on parse failure (so an
+/// operator typo like `CHARON_PRICE_MAX_AGE_SECS=86400s` does not
+/// silently revert to the 600s default). See #413.
+fn resolve_default_price_max_age() -> Duration {
+    const ENV_VAR: &str = "CHARON_PRICE_MAX_AGE_SECS";
+    match std::env::var(ENV_VAR) {
+        Ok(raw) => match raw.trim().parse::<u64>() {
+            Ok(secs) => {
+                let dur = Duration::from_secs(secs);
+                info!(
+                    env_var = ENV_VAR,
+                    secs, "chainlink default staleness window overridden via env"
+                );
+                dur
+            }
+            Err(err) => {
+                warn!(
+                    env_var = ENV_VAR,
+                    raw_value = %raw,
+                    error = ?err,
+                    default_secs = DEFAULT_MAX_AGE.as_secs(),
+                    "CHARON_PRICE_MAX_AGE_SECS unparseable — falling back to DEFAULT_MAX_AGE"
+                );
+                DEFAULT_MAX_AGE
+            }
+        },
+        Err(_) => DEFAULT_MAX_AGE,
+    }
+}
+
 fn resolve_execute_submit_url(
     private_rpc_url: Option<&SecretString>,
     http_url: &str,
@@ -924,7 +965,7 @@ async fn run_listen(
             let prices = Arc::new(PriceCache::with_per_symbol_max_age(
                 provider.clone(),
                 price_feeds,
-                DEFAULT_MAX_AGE,
+                resolve_default_price_max_age(),
                 per_symbol_max_age,
             ));
             // Native-feed preflight with bounded retry. Free-tier
@@ -1668,7 +1709,7 @@ async fn run_replay(config: &Config, block: u64, borrower_file: PathBuf) -> Resu
     let prices = Arc::new(PriceCache::with_per_symbol_max_age(
         provider.clone(),
         price_feeds,
-        DEFAULT_MAX_AGE,
+        resolve_default_price_max_age(),
         per_symbol_max_age,
     ));
     prices.refresh_all().await;
