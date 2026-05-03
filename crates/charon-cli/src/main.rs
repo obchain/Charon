@@ -504,8 +504,7 @@ fn resolve_default_price_max_age() -> Duration {
                 let dur = Duration::from_secs(secs);
                 info!(
                     env_var = ENV_VAR,
-                    secs,
-                    "chainlink default staleness window overridden via env"
+                    secs, "chainlink default staleness window overridden via env"
                 );
                 dur
             }
