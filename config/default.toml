@@ -75,7 +75,12 @@ chain = "bnb"
 pool  = "0x6807dc923806fe8fd134338eabca509979a7e0cb"
 # Aave V3 PoolDataProvider on BSC — resolves aTokens and reserve
 # configuration bitmaps (paused / frozen flags) for the adapter.
-data_provider = "0x41393e5e337606dc3821075Af65AeE84D7688CBD"
+# Sourced from IPoolAddressesProvider.getPoolDataProvider() — the
+# previous baked-in 0x41393e5e337606dc3821075Af65AeE84D7688CBD has no
+# code on BSC mainnet, which made every Aave reserve probe revert with
+# `buffer overrun` and silently disqualified the only flash-loan
+# source. See #419.
+data_provider = "0xc90Df74A7c16245c5F5C5870327Ceb38Fe5d5328"
 # Aave V3 IPoolAddressesProvider on BSC — `getPool()` is called at
 # startup and the result is compared against `pool` above. Mismatch
 # fails the boot before the bot can burn RPC budget on a stale pool.
