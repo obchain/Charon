@@ -251,6 +251,17 @@ enum Command {
         /// scan set must come entirely from the file.
         #[arg(long = "borrower-file")]
         borrower_file: PathBuf,
+
+        /// Hold the metrics exporter open for this many seconds
+        /// after the one-shot pipeline emits. Prometheus's default
+        /// scrape interval is 15s; replay runs in well under a
+        /// second on a warm cache, so without a hold window the
+        /// Grafana dashboard never sees any replay data. Pass
+        /// `--hold-secs 30` (or higher) for a panel-friendly demo;
+        /// keep the default `0` for CI / smoke tests where extra
+        /// process lifetime would just slow the suite. See #422.
+        #[arg(long = "hold-secs", default_value_t = 0)]
+        hold_secs: u64,
     },
 }
 
@@ -417,8 +428,9 @@ async fn main() -> Result<()> {
         Command::Replay {
             block,
             borrower_file,
+            hold_secs,
         } => {
-            run_replay(&config, block, borrower_file).await?;
+            run_replay(&config, block, borrower_file, hold_secs).await?;
         }
     }
 
@@ -1618,7 +1630,47 @@ async fn run_listen(
 /// required because the simulation gate's `eth_call` impersonates the
 /// `CharonLiquidator.owner()` (TxBuilder wires that), but no signed
 /// transaction is ever produced.
-async fn run_replay(config: &Config, block: u64, borrower_file: PathBuf) -> Result<()> {
+async fn run_replay(
+    config: &Config,
+    block: u64,
+    borrower_file: PathBuf,
+    hold_secs: u64,
+) -> Result<()> {
+    // Bring up the metrics exporter early so any counters bumped
+    // during the one-shot pipeline are exposed on /metrics for
+    // Prometheus to scrape during the optional `--hold-secs`
+    // window. Without this the dashboard never sees replay data —
+    // the binary exits in well under one scrape interval (#422).
+    let _metrics_task: Option<tokio::task::JoinHandle<()>> = if config.metrics.enabled {
+        match charon_metrics::install(config.metrics.bind) {
+            Ok(Some(exporter)) => {
+                charon_metrics::set_build_info(
+                    env!("CARGO_PKG_VERSION"),
+                    option_env!("CHARON_GIT_SHA").unwrap_or("unknown"),
+                );
+                info!(
+                    bind = %config.metrics.bind,
+                    "replay: metrics exporter listening on /metrics"
+                );
+                Some(tokio::spawn(async move {
+                    if let Err(err) = exporter.await {
+                        warn!(?err, "replay: metrics exporter task ended");
+                    }
+                }))
+            }
+            Ok(None) => None,
+            Err(err) => {
+                warn!(
+                    ?err,
+                    "replay: metrics exporter install failed — continuing without /metrics"
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     let venus_cfg = config.protocol.get("venus").context(
         "replay: [protocol.venus] missing — replay requires a configured Venus protocol",
     )?;
@@ -1825,6 +1877,22 @@ async fn run_replay(config: &Config, block: u64, borrower_file: PathBuf) -> Resu
         emitted,
         "replay: complete"
     );
+
+    // Hold the metrics exporter open for at least one Prometheus
+    // scrape interval if the operator asked for it. Default 0
+    // (current CI / smoke-test friendly behaviour). Operators
+    // running the local Notion cheat sheet pass `--hold-secs 30`
+    // to let the dashboard show Queue depth / Profit predicted /
+    // simulations-per-minute against the replay's emitted set
+    // (#422).
+    if hold_secs > 0 {
+        info!(
+            hold_secs,
+            bind = %config.metrics.bind,
+            "replay: holding metrics exporter open — Ctrl-C to exit early"
+        );
+        tokio::time::sleep(std::time::Duration::from_secs(hold_secs)).await;
+    }
     Ok(())
 }
 
