@@ -283,16 +283,57 @@ impl AaveFlashLoan {
         }
         // Paused is not exposed via the typed accessor, so read the
         // packed bitmap and check bit 60 ourselves.
-        let data = dp
-            .getReserveData(asset)
-            .call()
-            .await
-            .map_err(|e| FlashLoanError::rpc(format!("getReserveData: {e}")))?;
-        if bitmap_says_paused(data.configuration) || bitmap_says_frozen(data.configuration) {
+        //
+        // Aave V3 BSC's PoolDataProvider returns 12 fields here, not
+        // the 15 our `sol!` ABI declares (newer-Aave fields like
+        // `accruedToTreasury`, `unbacked`, `isolationModeTotalDebt`
+        // are absent on BSC's deploy). The strict typed decoder
+        // reports `buffer overrun while deserializing` on every
+        // quote, which silently disqualifies the only flash-loan
+        // source. We only need the leading `configuration` word for
+        // the paused/frozen bitmap check anyway, so issue the call
+        // ourselves and lift the first 32 bytes. See #419.
+        let configuration = read_uint256_first_word(self.provider.as_ref(), self.data_provider, {
+            IAaveV3DataProvider::getReserveDataCall { asset }
+                .abi_encode()
+                .into()
+        })
+        .await
+        .map_err(|e| FlashLoanError::rpc(format!("getReserveData: {e}")))?;
+        if bitmap_says_paused(configuration) || bitmap_says_frozen(configuration) {
             return Err(FlashLoanError::ReservePaused { asset });
         }
         Ok(())
     }
+}
+
+/// Issue an `eth_call` to `target` with `calldata` and decode the
+/// first 32 bytes of the response as a `U256`. Used to read the
+/// leading word of a tuple return when the on-chain ABI has more or
+/// fewer fields than the workspace's `sol!` declaration would tolerate
+/// — alloy's strict decoder rejects any mismatch with `buffer overrun`
+/// or `ReserveMismatch`, but for paused/frozen-bitmap checks we only
+/// need the first word and can safely drop the tail. See #419.
+async fn read_uint256_first_word(
+    provider: &RootProvider<PubSubFrontend>,
+    target: Address,
+    calldata: alloy::primitives::Bytes,
+) -> Result<U256> {
+    use alloy::rpc::types::TransactionRequest;
+    let tx = TransactionRequest::default()
+        .to(target)
+        .input(calldata.into());
+    let bytes = provider.call(&tx).await.context("eth_call failed")?;
+    if bytes.len() < 32 {
+        anyhow::bail!(
+            "expected at least 32 bytes from tuple return, got {} (target={})",
+            bytes.len(),
+            target
+        );
+    }
+    let mut buf = [0u8; 32];
+    buf.copy_from_slice(&bytes[..32]);
+    Ok(U256::from_be_bytes(buf))
 }
 
 /// Return true when bit `index` is set in the Aave packed
