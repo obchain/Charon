@@ -223,8 +223,8 @@
         {
           "datasource": { "type": "prometheus", "uid": "${datasource}" },
           "editorMode": "code",
-          "expr": "sum(increase(charon_executor_profit_usd_cents_sum{instance=~\"$instance\",chain=~\"$chain\",job=~\"$job\"}[$__range])) / 100",
-          "legendFormat": "profit (selected range)",
+          "expr": "sum(charon_executor_profit_usd_cents_sum{instance=~\"$instance\",chain=~\"$chain\",job=~\"$job\"}) / 100",
+          "legendFormat": "profit (cumulative)",
           "range": true,
           "refId": "A"
         }
@@ -264,8 +264,8 @@
         {
           "datasource": { "type": "prometheus", "uid": "${datasource}" },
           "editorMode": "code",
-          "expr": "sum(increase(charon_executor_realised_profit_usd_cents_sum{instance=~\"$instance\",chain=~\"$chain\",job=~\"$job\"}[$__range])) / 100",
-          "legendFormat": "realised profit (selected range)",
+          "expr": "sum(charon_executor_realised_profit_usd_cents_sum{instance=~\"$instance\",chain=~\"$chain\",job=~\"$job\"}) / 100",
+          "legendFormat": "realised profit (cumulative)",
           "range": true,
           "refId": "A"
         }
@@ -611,6 +611,6 @@
   "timezone": "",
   "title": "Charon Bot",
   "uid": "charon-v0",
-  "version": 1,
+  "version": 3,
   "weekStart": ""
 }
