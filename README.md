@@ -20,6 +20,7 @@ Charon monitors under-collateralized positions across major DeFi lending protoco
 - [Key features](#key-features)
 - [Safety model](#safety-model)
 - [Quick start — clone to running bot on a local BSC fork](#quick-start--clone-to-running-bot-on-a-local-bsc-fork)
+- [Pinned-block replay (deterministic demo)](#pinned-block-replay-deterministic-demo)
 - [Mainnet workflow (real-money path)](#mainnet-workflow-real-money-path)
 - [CLI reference](#cli-reference)
 - [Configuration](#configuration)
@@ -335,6 +336,221 @@ That's it — you have run the full pipeline end-to-end on a local fork.
 
 - `config/fork.toml` carries `profile_tag = "fork"`; `Config::validate` rejects it at startup if any chain's `ws_url` / `http_url` resolves to a non-loopback host. This keeps the intentionally lowered profit gate from ever pointing at mainnet by accident.
 - If `[liquidator.bnb]` is missing from `config/fork.toml`, the pipeline builds without an executor and the listener metrics tick but no scanner gauges fire. Watch for `liquidators=1` in the startup banner — `=0` means the section is missing.
+
+---
+
+## Pinned-block replay (deterministic demo)
+
+The Quick start above runs `listen` against a live-tracking anvil fork — the chain head moves, oracles drift, and there are usually no liquidatable borrowers at any given moment, so Grafana panels stay quiet. There is a second demo flow — `replay --block N` against a **pinned** fork — that exercises the full pipeline against a known-underwater historical block and emits a deterministic profit total. Use this when you want a one-shot, reproducible demo with visible numbers on Grafana (predicted profit ≈ **$39,524** on block 91323624 with four seeded borrowers).
+
+**Why a different command?** A forked chain advances `block.timestamp` without external Chainlink/Pyth pushes, so within ~30 s of fork start Venus's resilient oracle reverts on `getAccountLiquidity`. `replay --block N` reads pinned at block N (frozen state, no drift) and the entire pipeline succeeds. `listen --execute` is the live-mainnet mode and does not model well on a fork — you will see `simulation reverted: venus liquidate failed` on every opportunity.
+
+This section assumes you have already finished Quick start steps 1–4 (prereqs installed, repo cloned, build green, `.env` copied).
+
+### R1 — Get a real archive RPC
+
+The pinned-block flow requires real archive history at the demo block. The default `bsc.drpc.org` is **not** a true archive — historical state at block 91323624 returns `metadata is not found`, and the bot then drops every borrower (`tracked=4 returned=0`).
+
+**Alchemy** offers a free BSC archive that works for the demo:
+
+1. Sign up at https://alchemy.com (no credit card on free tier).
+2. Dashboard → Create new app → Chain: **BNB Smart Chain** → Network: **Mainnet**.
+3. Copy the HTTPS URL — format `https://bnb-mainnet.g.alchemy.com/v2/<YOUR_API_KEY>`.
+
+QuickNode, Chainstack, BlockPi, paid Ankr also work — same shape. Treat the URL as a secret; keep it in your shell rc or password manager, never in the repo.
+
+### R2 — Demo block + borrower seed
+
+Block `91323624` ships with four known liquidatable Venus borrowers. Combined predicted net profit ≈ **$39,524.48**.
+
+| Borrower | Predicted net profit (USD) |
+|---|---|
+| `0xa322166c6758d69cc3c6c0fe6ce7c2e82ffa99cf` | $37,154.59 |
+| `0x73af7a95dea7902122bd0459ed6e6e608ef65536` | $1,752.28 |
+| `0x957de158d059c955b0befbddaf800d15c0f0bac4` | $525.40 |
+| `0x257bff71ceee8e86ca27d442878f102de03a2248` | $92.21 |
+
+Write the seed file:
+
+```sh
+cat > /tmp/seed.txt <<'EOF'
+0xa322166c6758d69cc3c6c0fe6ce7c2e82ffa99cf
+0x73af7a95dea7902122bd0459ed6e6e608ef65536
+0x957de158d059c955b0befbddaf800d15c0f0bac4
+0x257bff71ceee8e86ca27d442878f102de03a2248
+EOF
+```
+
+### R3 — Pane A: anvil fork pinned at the demo block
+
+```sh
+export FORK_RPC='https://bnb-mainnet.g.alchemy.com/v2/<YOUR_API_KEY>'
+export FORK_BLOCK=91323624
+./scripts/anvil_fork.sh
+```
+
+Wait for, in order:
+
+```
+anvil: forking chain 56 from https://bnb-mainnet.g.alchemy.com/v2/...
+anvil: pinning at block 91323624
+Listening on 127.0.0.1:8545
+anvil: dev-0 nonce reset to 0
+anvil: target deploy slot wiped at 0x5FbDB2315678afecb367f032d93F642f64180aa3 — first forge create will land here cleanly
+anvil: keep-alive enabled — mining 1 extra block every 30s
+```
+
+Leave Pane A running. Ctrl-C tears down anvil + the keep-alive mine loop together via the script's trap.
+
+### R4 — Pane B: deploy `CharonLiquidator`
+
+Same `forge create` as Quick start Step 7 — deploys deterministically to `0x5FbDB2315678afecb367f032d93F642f64180aa3`, which is already the `contract_address` baked into `config/fork.toml`.
+
+```sh
+export DEV0_KEY=0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80
+
+forge create \
+  --rpc-url http://127.0.0.1:8545 \
+  --private-key "$DEV0_KEY" \
+  --json \
+  --broadcast \
+  contracts/src/CharonLiquidator.sol:CharonLiquidator \
+  --constructor-args \
+    0x6807dc923806fE8Fd134338EABCA509979a7e0cB \
+    0x13f4EA83D0bd40E75C8222255bc855a974568Dd4 \
+    0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266
+```
+
+`deployedTo` MUST equal `[liquidator.bnb].contract_address` in `config/fork.toml`. The startup gate refuses to run if they disagree. Pane B is now idle.
+
+### R5 — Pane C: Prometheus + Grafana via docker-compose
+
+For the replay demo a self-contained docker stack is simpler than the host-side Prometheus/Grafana wiring from Quick start Step 6:
+
+```sh
+docker compose -f deploy/compose/local-stack.yml up
+```
+
+Wait for both lines (may interleave):
+
+```
+prometheus  | Server is ready to receive web requests.
+grafana     | HTTP Server Listen address=[::]:3000
+```
+
+Open http://127.0.0.1:3000/d/charon-v0/charon-bot — anonymous Admin is enabled on the loopback-only port mapping, no login screen. Bookmark it.
+
+> Do **not** use `deploy/compose/docker-compose.yml` for the local demo. That file is the production deploy target (containerised charon + Grafana Alloy → Grafana Cloud) and requires a `.env` with cloud creds. The local demo uses `deploy/compose/local-stack.yml`, a Prometheus + Grafana pair that scrapes the host-side bot via `host.docker.internal:9091`.
+
+### R6 — Pane D: bot in `replay --hold-secs` mode
+
+Open a fourth terminal in the project root.
+
+```sh
+export CHARON_SIGNER_KEY=0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80
+
+CARGO_TARGET_DIR=/tmp/charon-target cargo run --bin charon --release -- \
+  --config config/fork.toml \
+  replay --block 91323624 --borrower-file /tmp/seed.txt --hold-secs 300
+```
+
+`--hold-secs 300` keeps the metrics endpoint alive for 5 min after the one-shot pipeline emits, so Prometheus has time to scrape and the dashboard populates. Without it, replay exits in <1 s and the dashboard stays `No data` (#422).
+
+`CARGO_TARGET_DIR=/tmp/charon-target` keeps the build out of `./target` so VS Code's rust-analyzer (which holds the in-tree target dir for incremental `cargo check`) cannot block your build.
+
+Expected stdout:
+
+```
+charon starting up
+config loaded chains=1 protocols=1 flashloan_sources=1 liquidators=1
+replay: borrower file ingested path=/tmp/seed.txt loaded=4
+Venus adapter connected ... market_count=48 mapped_markets=47
+Aave V3 flash-loan adapter ready ...
+replay: metrics exporter listening on /metrics bind=127.0.0.1:9091
+replay: running one-shot block pipeline chain=bnb block=91323624 seed_borrowers=4
+venus scan chain=bnb block=91323624 tracked=4 returned=4 healthy=0 near_liq=0 liquidatable=4 queued=4 queue_len=4
+{"borrower":"0xA322...","predicted_net_profit_usd_cents":3715459, ...}
+{"borrower":"0x73aF...","predicted_net_profit_usd_cents":175228, ...}
+{"borrower":"0x957d...","predicted_net_profit_usd_cents":52540, ...}
+{"borrower":"0x257b...","predicted_net_profit_usd_cents":9221, ...}
+replay: complete chain=bnb block=91323624 emitted=4
+replay: holding metrics exporter open — Ctrl-C to exit early hold_secs=300 bind=127.0.0.1:9091
+```
+
+`liquidatable=4 queued=4 emitted=4` is the success criterion. Sum of `predicted_net_profit_usd_cents` ≈ 3,952,448 → **$39,524.48**.
+
+### R7 — What to expect on Grafana
+
+Refresh the dashboard tab once Pane D has emitted its four JSON records. Time picker → **Last 5 minutes**, refresh **5 s**.
+
+> **Replay vs listen.** `replay` is a one-shot run. Of the dashboard's panels, only the **three gauge-based** ones populate immediately: positions-by-bucket, queue depth, profit-cumulative. The four `rate()` / `histogram_quantile()` panels (blocks-per-second, pipeline-latency p50/p95, simulations-per-minute, dropped-by-reason) need ≥ 2 scrapes' worth of continuous deltas to compute a derivative — they go green on `listen --execute` against live mainnet, not on a one-shot replay. By design.
+
+| Panel | Reading on the demo block |
+|---|---|
+| Scanner — positions by bucket | red bar `liquidatable=4` |
+| Queue depth | 4 |
+| Profit (predicted, cumulative) | $39,524.48 |
+| Executor — simulations per minute | 4× `result=ok` |
+| Executor — opportunities queued vs dropped | 4× `simulation` queued, 0 dropped |
+| Per-opportunity profit distribution | 4 entries in heatmap, range $92 – $37,154 |
+| Profit (realised, cumulative) | 0 — by design, replay does not broadcast |
+| Build info | shows version + git SHA |
+
+CLI cross-check while in the hold window:
+
+```sh
+curl -s http://127.0.0.1:9091/metrics | grep -E '^charon_executor_(profit_usd_cents_sum|queue_depth|opportunities_queued_total)'
+```
+
+Expected:
+
+```
+charon_executor_profit_usd_cents_sum{chain="bnb"} 3952448
+charon_executor_queue_depth 4
+charon_executor_opportunities_queued_total{chain="bnb",simulated="true"} 4
+```
+
+3,952,448 cents = $39,524.48 — same number the dashboard shows.
+
+### R8 — Tear-down
+
+```sh
+# Pane D
+Ctrl-C
+
+# Pane A
+Ctrl-C   # script's trap kills anvil + the mine loop together
+
+# Pane C
+Ctrl-C
+docker compose -f deploy/compose/local-stack.yml down
+```
+
+To start fresh: redo Pane A → B → D in order. Pane C can stay up between runs (the dashboard is stateful via the `grafana_data` volume).
+
+### Picking a different demo block
+
+For any block N other than 91323624:
+
+1. BscScan → Venus comptroller `0xfD36E2c2a6789Db23113685031d7F16329158384` → filter event log for `LiquidateBorrow(...)`.
+2. Pick a row whose block height has the state you want; copy the `borrower` arg.
+3. Set `FORK_BLOCK=<that block - 1>` so the borrower is still underwater (the next block is when they got liquidated upstream).
+4. Replace `/tmp/seed.txt` with that borrower (one address per line; multiple addresses allowed).
+5. Restart from Pane A.
+
+Predicted profit varies per block.
+
+### Replay-specific troubleshooting
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| `metadata is not found, <block>` from RPC | Non-archive upstream (dRPC free, PublicNode, free LlamaRPC). | Set `FORK_RPC` to your Alchemy / QuickNode / Chainstack archive URL. |
+| `forge create` reverts with `EVM error CreateCollision` | Pane A didn't run the slot wipe (older script). | `git pull`. Main carries #412's wipe of `0x5FbDB...0aa3` on every boot. |
+| Bot exits with `feed 'BNB' missing or stale` | `DEFAULT_MAX_AGE` (10 min) too tight for a stale fork. | `export CHARON_PRICE_MAX_AGE_SECS=2592000` (#413), or pick a more recent `FORK_BLOCK`. The fork profile already widens per-symbol windows to 30 d (#414). |
+| Grafana panels stay flat after replay completes | Replay exited before Prometheus scraped. | Re-run with `--hold-secs 300` (#422). |
+| `cargo run` hangs at compile, no rustc subprocesses spawn | VS Code rust-analyzer holds `./target`. | Either close VS Code or build with `CARGO_TARGET_DIR=/tmp/charon-target`. |
+| Profit panel shows `$0` on a fresh clone, queue depth + bucket panel populate but every other chain-filtered panel is empty | Pre-#425 dashboard. The `$chain` template variable was sourced from `charon_listener_blocks_received_total` — only emits in `listen` mode — so in `replay` it stayed empty. | `git pull` to land #425, then `docker compose -f deploy/compose/local-stack.yml down -v && docker compose -f deploy/compose/local-stack.yml up` to wipe the `grafana_data` volume so the new dashboard JSON is re-provisioned. |
+| Dashboard shows `queue=0, simulations all reverted, drops=sim_revert` | Ran `listen --execute` instead of `replay`. | Switch to the `replay --hold-secs` command in R6. |
 
 ---
 
